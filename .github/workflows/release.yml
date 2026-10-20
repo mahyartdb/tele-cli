@@ -262,6 +262,8 @@ jobs:
           rm -rf npm/bin/tele-* npm/bin/telecli-* 2>/dev/null || true
           cp -r npm-bin-staging/* pkg-main/bin/
           cp npm/bin/tele.js pkg-main/bin/tele.js
+          cp npm/README.md pkg-main/README.md
+          cp LICENSE pkg-main/LICENSE
           jq --arg v "$VERSION" '.version = $v' npm/package.json > pkg-main/package.json
 
       - name: Publish to npm

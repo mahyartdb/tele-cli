@@ -17,6 +17,10 @@
     "type": "git",
     "url": "git+https://github.com/mahyartdb/tele-cli.git"
   },
+  "homepage": "https://github.com/mahyartdb/tele-cli#readme",
+  "bugs": {
+    "url": "https://github.com/mahyartdb/tele-cli/issues"
+  },
   "engines": {
     "node": ">=18"
   },
