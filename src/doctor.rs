@@ -249,6 +249,18 @@ mod tests {
         dir
     }
 
+    // session_check only reports ok when the session file is private, so the
+    // fixtures must be owner-only. The default umask leaves group/other bits
+    // set, which is what a real session file never has.
+    fn write_private_session(path: &std::path::Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn credential_presence_empty_dir_reports_both_missing() {
         let _guard = lock_env();
@@ -357,7 +369,7 @@ mod tests {
     fn session_check_stale_lock_file_is_not_reported_as_locked() {
         let dir = temp_dir("sessstale");
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
-        std::fs::write(dir.join("sessions").join("work.session"), vec![1u8; 32]).unwrap();
+        write_private_session(&dir.join("sessions").join("work.session"), &[1u8; 32]);
         std::fs::write(dir.join("sessions").join("work.session.lock"), b"").unwrap();
         let check = session_check(&dir, "work");
         assert!(check.ok);
@@ -373,7 +385,7 @@ mod tests {
     fn session_check_held_lock_is_reported_as_locked() {
         let dir = temp_dir("sessheld");
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
-        std::fs::write(dir.join("sessions").join("work.session"), vec![1u8; 32]).unwrap();
+        write_private_session(&dir.join("sessions").join("work.session"), &[1u8; 32]);
         let lock_path = dir.join("sessions").join("work.session.lock");
         std::fs::write(&lock_path, b"").unwrap();
         let holder = std::fs::OpenOptions::new()
