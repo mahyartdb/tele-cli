@@ -1,0 +1,56 @@
+name: Feature request
+description: Suggest a command, flag, or capability
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Command surface is tracked in [docs/capabilities.md](../docs/capabilities.md).
+        If your request maps to a `want` row, link it instead of opening a new issue.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that tele cannot do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed command or flag
+      description: A sketch of the CLI surface you would expect
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface does this affect?
+      options:
+        - CLI only
+        - CLI and `--json` contract
+        - MCP server
+        - serve (JSONL duplex)
+        - Agent skill
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you have used, or other tools that solve this
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked docs/capabilities.md for an existing row
+          required: true
+        - label: This is a breaking change to the JSON contract
+          required: false

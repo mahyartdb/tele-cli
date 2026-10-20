@@ -1,0 +1,81 @@
+name: Bug report
+description: Something in tele behaves incorrectly
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please read [docs/security.md](../docs/security.md)
+        first — do not paste session files, `.env` contents, phone numbers, 2FA
+        passwords, or login codes. Redact before you paste.
+
+  - type: input
+    id: version
+    attributes:
+      label: tele version
+      description: Output of `tele --version`
+      placeholder: "0.14.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran
+      placeholder: "tele msg send --chat me --text hello"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the error message and the exit code
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: json
+    attributes:
+      label: JSON output
+      description: If you ran with `--json`, paste the envelope here
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of `TELE_LOG=debug tele ...`
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this one
+          required: true
+        - label: I reproduced this on the latest release
+          required: false

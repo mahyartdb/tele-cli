@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/mahyartdb/tele-cli/security/advisories/new
+    about: Report a security issue privately. Never open a public issue for one.
+  - name: Documentation
+    url: https://github.com/mahyartdb/tele-cli#documentation
+    about: Setup, recipes, the machine-API contract, and the threat model.

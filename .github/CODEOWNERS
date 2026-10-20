@@ -1,0 +1,11 @@
+# Default owners for everything in the repo.
+* @mahyartdb
+
+# Release-critical paths: the release workflow and the npm packaging.
+# A change here can publish or break a shipped binary.
+/.github/workflows/release.yml @mahyartdb
+/npm/ @mahyartdb
+
+# The machine-API contract and the capability matrix are public promises.
+/docs/cli-contract.md @mahyartdb
+/docs/capabilities.md @mahyartdb
