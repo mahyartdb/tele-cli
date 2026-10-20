@@ -211,7 +211,7 @@ Key rules for agents:
 
 ## Release process
 
-See [release.md](release.md) for the full process. Summary:
+See [docs/release.md](docs/release.md) for the full process. Summary:
 
 1. Confirm `main` is green (ci workflow passes).
 2. Confirm `docs/capabilities.md` has no `want` rows.

@@ -180,7 +180,7 @@ See [docs/security.md](docs/security.md) for the threat model.
 | [Architecture](docs/architecture.md) | Codebase structure and data flow |
 | [Security](docs/security.md) | Threat model and trust boundaries |
 | [Capabilities](docs/capabilities.md) | Feature matrix with Telegram API mapping |
-| [Contributing](docs/CONTRIBUTING.md) | Adding commands, conventions, testing |
+| [Contributing](CONTRIBUTING.md) | Adding commands, conventions, testing |
 | [Observability](docs/observability.md) | Logging and output streams |
 | [Release](docs/release.md) | Build targets and publishing |
 | [Decisions](docs/decisions/) | Architecture decision records |

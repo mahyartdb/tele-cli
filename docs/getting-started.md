@@ -208,4 +208,4 @@ tele -vv msg send --chat me --text "test"
 
 - Read the [CLI Contract](cli-contract.md) for the full machine API reference
 - Check [Security](security.md) for the threat model
-- See [Contributing](CONTRIBUTING.md) if you want to add features
+- See [Contributing](../CONTRIBUTING.md) if you want to add features
