@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.15.0] - 2026-10-20
+
 Review-remediation slice: validators, cores, dry-run planners, and docs brought back into agreement. All machine-API changes are additive (new JSON keys on existing rows only); no renamed keys, removed commands, or exit-code changes.
 
 Hardening slice: eight deliberate exposures tightened. Machine shapes stay additive (new optional flags and JSON keys only), but new fail-closed acks may turn previously-accepted invocations into exit 1 with guidance — the sanctioned posture-ack exception in the Stability rule.
@@ -20,6 +24,8 @@ Hardening slice: eight deliberate exposures tightened. Machine shapes stay addit
 - MCP `--groups` scoping extended to resources (`tele://profile` needs group `profile`, `tele://dialogs` needs group `dialog`; `tele://skill` stays public).
 - Short service codes (3–6 digits) redacted in code/OTP contexts; FTS5 update trigger keeping the message-cache index in sync on UPDATE.
 - Docs: supply-chain pin-review cadence (`docs/security.md`), offline measurement baselines and budget protocol (`docs/perf-baselines.md`), scope ADR-009.
+- Root `SECURITY.md` (reporting route and threat-model pointer), a `docs/README.md` documentation index, `.editorconfig`, GitHub issue forms, a pull-request template, and `CODEOWNERS`. `CONTRIBUTING.md` moved to the repository root, where GitHub renders it.
+- `npm/package.json` now declares `homepage` and `bugs`.
 
 ### Changed
 
@@ -28,6 +34,9 @@ Hardening slice: eight deliberate exposures tightened. Machine shapes stay addit
 - Docs resynced with the implementation: 93 routed ops (96 `ops.list` entries), 35 read-only, 9 destructive ops including `raw`, registry 25; noforwards behavior rewritten; posture acks (`--allow-raw`, `--allow-insecure-app-dir`, `--allow-trace`), `--redact-phones`, and MCP resource `--groups` scoping documented; contract gate now parses escaped pipes and asserts exact flag and registry counts.
 - Dry-run truthfulness: chat-settings previews include `noforwards`; `account sessions` dry-runs are fully offline `would` previews; pin/typing/click previews validate before rendering; `--fields` now projects `listen` streaming rows instead of being silently ignored.
 - `chat stats` on basic groups, bad `topic list` chat targets, and topic close/reopen/delete with `--unpin` now fail as usage errors.
+- Every repository URL in the project pointed at `github.com/QMahyar/tele-cli`, which does not exist; the published npm package and the README release and CI badges linked to that dead location. `Cargo.toml`, `npm/package.json`, the CLI help footer, the README, and the docs now point at `github.com/mahyartdb/tele-cli`.
+- The GitHub repository is public and carries a description, topics, secret scanning with push protection, Dependabot security updates, and private vulnerability reporting.
+- `.gitignore` is grouped by purpose and covers Rust output, credentials and sessions, release and npm artifacts, agent scratch, editors, OS cruft, logs, and coverage. `.gitattributes` normalizes every text file to LF.
 
 ### Fixed
 
@@ -36,6 +45,9 @@ Hardening slice: eight deliberate exposures tightened. Machine shapes stay addit
 - Session lifecycle: logout/delete close before removing files and report removal failure; exports checkpoint before snapshot; staged-login failures leave no phantom pending state; expired codes stay distinct from invalid codes across datacenter migration.
 - Secret and file hygiene: pending auth material created private atomically; credential cache keyed on content hash; short numbers stay redacted; passwords held in zeroizing wrappers.
 - Cache sync acquires rate budget per page; message-cache writes are transactional; serve dedupe keys on update-sourced pts; oversized serve frames and duplicate request ids rejected explicitly; `--count 0` emits zero rows.
+- CI could not clone the repository. The workflow declared `permissions: {}`, which strips every permission from `GITHUB_TOKEN`, so `actions/checkout` failed with `fatal: repository not found` on all five jobs and the suite had been red since it was added. The workflow now grants `contents: read`.
+- Two `doctor` tests failed on Linux only. `session_check` reports ok just when the session file is owner-only, and the fixtures were created with the default umask, so `doctor` correctly reported "world-accessible" and the assertions failed. The fixtures now set mode 0600, matching a real session file.
+- The published npm package shipped no README and no LICENSE, so npm rendered `ERROR: No README data found!` on the package page. The release job now stages both into the package root.
 
 ## [0.14.0] - 2026-09-18
 

@@ -266,6 +266,19 @@ jobs:
           cp LICENSE pkg-main/LICENSE
           jq --arg v "$VERSION" '.version = $v' npm/package.json > pkg-main/package.json
 
+      - name: Check npm for an existing version
+        id: npmcheck
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if npm view "@qmahyar/telecli@${VERSION}" version >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "@qmahyar/telecli@${VERSION} is already on the registry - skipping the publish"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish to npm
+        if: steps.npmcheck.outputs.already_published != 'true'
         working-directory: pkg-main
         run: npm publish --access public
