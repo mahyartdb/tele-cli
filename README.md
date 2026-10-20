@@ -170,6 +170,17 @@ Add `--read-only` to hide destructive tools, or `--groups msg,dialog` to filter 
 
 See [docs/security.md](docs/security.md) for the threat model.
 
+## Repository layout
+
+```
+src/           Rust source: kernel (config, session, client, executor, output) + commands/
+tests/         contract.rs (CLI surface), selection.rs (account selection)
+tl/api.tl      Vendored Telegram TL schema, checked for drift against grammers
+npm/           npm package: JS launcher + package.json (binaries are bundled at publish time)
+docs/          Documentation, ADRs, and specs
+.github/       CI, release, and issue/PR templates
+```
+
 ## Documentation
 
 | Document | Purpose |
@@ -184,6 +195,7 @@ See [docs/security.md](docs/security.md) for the threat model.
 | [Observability](docs/observability.md) | Logging and output streams |
 | [Release](docs/release.md) | Build targets and publishing |
 | [Decisions](docs/decisions/) | Architecture decision records |
+| [All docs](docs/README.md) | Full documentation index |
 | [Changelog](CHANGELOG.md) | What's new in each release |
 
 ## License
