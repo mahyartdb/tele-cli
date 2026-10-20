@@ -48,7 +48,7 @@ npm install -g @qmahyar/telecli && tele --version
 4. Verify build provenance and inspect the SBOM (GitHub CLI v2.61+):
 
 ```bash
-gh attestation verify --repo QMahyar/tele-cli tele-<version>-x86_64-pc-windows-msvc.zip
+gh attestation verify --repo mahyartdb/tele-cli tele-<version>-x86_64-pc-windows-msvc.zip
 # inspect the dependency inventory:
 jq '.packages[].name' tele-<version>-x86_64-pc-windows-msvc.sbom.spdx.json
 ```

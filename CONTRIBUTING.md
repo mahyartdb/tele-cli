@@ -41,7 +41,7 @@ docs/            specs, contract, security, architecture decisions
 ## Getting started
 
 ```bash
-git clone https://github.com/QMahyar/tele-cli.git
+git clone https://github.com/mahyartdb/tele-cli.git
 cd tele-cli
 cargo build
 cargo test                    # all offline, no network

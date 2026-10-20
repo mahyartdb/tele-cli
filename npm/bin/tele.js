@@ -90,7 +90,7 @@ function pickExeAndSpawn() {
   console.error(
     `[tele] no runnable binary bundled for ${platform}-${arch}` +
       (candidates.length ? ` (tried: ${candidates.join(", ")})` : "") +
-      ". Download from https://github.com/QMahyar/tele-cli/releases"
+      ". Download from https://github.com/mahyartdb/tele-cli/releases"
   );
   process.exit(1);
 }

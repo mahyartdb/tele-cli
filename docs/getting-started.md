@@ -27,14 +27,14 @@ tele --version
 
 ### Option B: binary download
 
-Download a binary from [Releases](https://github.com/QMahyar/tele-cli/releases) for your platform.
+Download a binary from [Releases](https://github.com/mahyartdb/tele-cli/releases) for your platform.
 
 ### Option C: build from source
 
 Requires [Rust 1.89+](https://www.rust-lang.org/tools/install).
 
 ```bash
-git clone https://github.com/QMahyar/tele-cli.git
+git clone https://github.com/mahyartdb/tele-cli.git
 cd tele-cli
 cargo build --release
 target/release/tele --version

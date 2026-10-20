@@ -3264,7 +3264,7 @@ fn no_input_violation_emits_machine_envelope() {
     );
 }
 
-const ISSUE_URL: &str = "https://github.com/QMahyar/tele-cli/issues";
+const ISSUE_URL: &str = "https://github.com/mahyartdb/tele-cli/issues";
 
 #[test]
 fn long_help_advertises_issue_url() {

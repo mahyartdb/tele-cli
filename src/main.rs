@@ -30,7 +30,7 @@ const MAIN_RUNTIME_STACK_SIZE: usize = 64 * 1024 * 1024;
     name = "tele",
     version,
     about = "Telegram user-account CLI",
-    long_about = "Telegram user-account CLI\n\nReport bugs at: https://github.com/QMahyar/tele-cli/issues"
+    long_about = "Telegram user-account CLI\n\nReport bugs at: https://github.com/mahyartdb/tele-cli/issues"
 )]
 struct Cli {
     #[arg(
@@ -381,7 +381,7 @@ struct UsageCtx {
     dry_run: bool,
 }
 
-pub(crate) const ISSUE_URL: &str = "https://github.com/QMahyar/tele-cli/issues";
+pub(crate) const ISSUE_URL: &str = "https://github.com/mahyartdb/tele-cli/issues";
 
 fn bug_report_footer() {
     let _ = writeln!(std::io::stderr(), "report bugs at {ISSUE_URL}",);

@@ -9,9 +9,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/QMahyar/tele-cli/releases"><img src="https://img.shields.io/github/v/release/QMahyar/tele-cli" alt="Release"></a>
+  <a href="https://github.com/mahyartdb/tele-cli/releases"><img src="https://img.shields.io/github/v/release/mahyartdb/tele-cli" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
-  <a href="https://github.com/QMahyar/tele-cli/actions"><img src="https://img.shields.io/github/actions/workflow/status/QMahyar/tele-cli/ci.yml?branch=main" alt="CI"></a>
+  <a href="https://github.com/mahyartdb/tele-cli/actions"><img src="https://img.shields.io/github/actions/workflow/status/mahyartdb/tele-cli/ci.yml?branch=main" alt="CI"></a>
   <img src="https://img.shields.io/badge/rust-1.89+-orange" alt="Rust">
 </p>
 
@@ -25,12 +25,12 @@
 npm install -g @qmahyar/telecli
 ```
 
-**Binary:** download from [Releases](https://github.com/QMahyar/tele-cli/releases) — 13 targets including a static `linux-arm64-musl` build for Termux/Android.
+**Binary:** download from [Releases](https://github.com/mahyartdb/tele-cli/releases) — 13 targets including a static `linux-arm64-musl` build for Termux/Android.
 
 **From source** (Rust 1.89+):
 
 ```bash
-git clone https://github.com/QMahyar/tele-cli.git
+git clone https://github.com/mahyartdb/tele-cli.git
 cd tele-cli
 cargo build --release
 ```
@@ -188,4 +188,4 @@ See [docs/security.md](docs/security.md) for the threat model.
 
 ## License
 
-[MIT](LICENSE). Built by [QMahyar](https://github.com/QMahyar). Powered by [grammers](https://github.com/LonamiWebs/grammers).
+[MIT](LICENSE). Built by [QMahyar](https://github.com/mahyartdb). Powered by [grammers](https://github.com/LonamiWebs/grammers).
