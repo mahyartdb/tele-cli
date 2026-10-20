@@ -55,11 +55,41 @@ jq '.packages[].name' tele-<version>-x86_64-pc-windows-msvc.sbom.spdx.json
 
 ## Handle an npm failure
 
-Publishing authenticates through npm trusted publishing (OIDC). The `@qmahyar/telecli` package on npmjs.com must list this repository and the `release` workflow as its trusted publisher. OIDC tokens are short lived, so there is no secret to set or rotate. When publish fails, fix the trusted-publisher configuration on npmjs.com, then rerun the failed job:
+Publishing authenticates through npm trusted publishing (OIDC). The `@qmahyar/telecli` package on npmjs.com must list this repository and the `release` workflow as its trusted publisher. OIDC tokens are short lived, so there is no secret to set or rotate.
+
+The trusted publisher on npmjs.com is a separate record from the `repository` field in `package.json`. It has to name the repository the workflow actually runs in. Configure it under **npmjs.com → `@qmahyar/telecli` → Settings → Trusted Publisher** with exactly:
+
+| Field | Value |
+|---|---|
+| Provider | GitHub Actions |
+| Organization or user | `mahyartdb` |
+| Repository | `tele-cli` |
+| Workflow filename | `release.yml` |
+| Environment name | `npm` |
+| Allowed actions | `npm publish` (and `npm stage publish`) |
+
+The environment name matters: the publish job declares `environment: npm`, so the OIDC subject is `repo:mahyartdb/tele-cli:environment:npm`. A configuration that names a different owner, repository, or environment is rejected at the token exchange, and npm reports it as a publish failure rather than a permission error:
+
+```
+npm error code E404
+npm error 404 Not Found - PUT https://registry.npmjs.org/@qmahyar%2ftelecli - Not found
+```
+
+That 404 means "no trusted publisher matched this OIDC token", not "the package does not exist". Fix the trusted publisher on npmjs.com, then rerun the failed job:
 
 ```bash
 gh run rerun <run-id> --job <npm-job-id>
 ```
+
+npm CLI 12 can do the same from a terminal with a granular access token, which avoids the web form:
+
+```bash
+npm trust list @qmahyar/telecli
+npm trust revoke --id <id> @qmahyar/telecli
+npm trust github @qmahyar/telecli --repo mahyartdb/tele-cli --env npm --allow-publish --yes
+```
+
+The registry allows only one trusted publisher per package, so revoke the stale one before adding the new. Classic `npm_` tokens are rejected for both publishing and trust management; use a granular access token instead.
 
 The GitHub Release ships even when npm fails. Do **not** run `npm publish` from the repo's `npm/` directory: it contains only the JS launcher, no binaries, and a package published from there always fails at spawn with "no binary bundled". The publish job builds the real package by downloading the 13 build artifacts and staging every binary into `pkg-main/bin/` before invoking npm. To publish by hand instead, reproduce those steps with your own npm login:
 
@@ -69,11 +99,23 @@ mkdir -p pkg-main/bin
 # stage every platform binary from the workflow artifacts (tele-<version>-<triple>.tar.gz / .zip):
 #   extract each archive's tele (or tele.exe) to pkg-main/bin/tele-<triple>[.exe]
 cp npm/bin/tele.js pkg-main/bin/tele.js
+cp npm/README.md pkg-main/README.md
+cp LICENSE pkg-main/LICENSE
 jq --arg v "$VERSION" '.version = $v' npm/package.json > pkg-main/package.json
 cd pkg-main && npm publish --access=public
 ```
 
 Prefer rerunning the failed job (`gh run rerun <run-id> --job <npm-job-id>`) so the OIDC attestation chain stays intact.
+
+The publish job checks the registry before it publishes and skips the step when the tag version is already there, so re-running a release is safe and does not fail with "cannot publish over previously published version".
+
+## Verify build provenance
+
+```bash
+gh attestation verify --repo mahyartdb/tele-cli tele-<version>-x86_64-pc-windows-msvc.zip
+```
+
+The attestation carries SLSA v1 provenance and names the source repository, the workflow, and the tag. It resolves for every release published from the current history. Releases published before the October 2026 history rewrite reference pre-rewrite commit hashes that no longer exist, so their provenance cannot be verified against this repository; only releases from `v0.15.0` onward carry a resolvable attestation.
 
 ## Order crates.io separately
 

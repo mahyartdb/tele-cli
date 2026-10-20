@@ -6,7 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- Transitive `hickory-resolver` bumped from 0.26.1 to 0.26.3, clearing three Dependabot advisories: GHSA-6w6g-hm98-mhgm (high, unbounded TC-retry DoS), GHSA-5j98-2g5x-46v6 (high, obscured DNSSEC validation failures), and GHSA-6f2x-v7q7-m7m5 (medium, irrelevant CNAME following). The dependency arrives through `grammers-mtsender`; all three are fixed upstream in 0.26.2.
 
 ## [0.15.0] - 2026-10-20
 
