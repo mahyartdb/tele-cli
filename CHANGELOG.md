@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- npm trusted publishing recovered after the repository move: the v0.15.0 npm job failed with `E404 Not Found - PUT @qmahyar%2ftelecli` because the trusted publisher on npmjs.com was still bound to the pre-move `QMahyar/tele-cli` location. A new record naming `mahyartdb/tele-cli`, workflow `release.yml`, environment `npm` was registered and the failed job rerun; `@qmahyar/telecli@0.15.0` is live with SLSA provenance and the corrected repository URL. `docs/release.md` documents the 2-day first-publish expiry, the edit-by-recreate rule, the 10-record limit, the token-disallow hardening step, and this incident as the worked example of the 404.
+
 - Transitive `hickory-resolver` bumped from 0.26.1 to 0.26.3, clearing three Dependabot advisories: GHSA-6w6g-hm98-mhgm (high, unbounded TC-retry DoS), GHSA-5j98-2g5x-46v6 (high, obscured DNSSEC validation failures), and GHSA-6f2x-v7q7-m7m5 (medium, irrelevant CNAME following). The dependency arrives through `grammers-mtsender`; all three are fixed upstream in 0.26.2.
 
 ## [0.15.0] - 2026-10-20

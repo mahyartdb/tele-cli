@@ -55,9 +55,9 @@ jq '.packages[].name' tele-<version>-x86_64-pc-windows-msvc.sbom.spdx.json
 
 ## Handle an npm failure
 
-Publishing authenticates through npm trusted publishing (OIDC). The `@qmahyar/telecli` package on npmjs.com must list this repository and the `release` workflow as its trusted publisher. OIDC tokens are short lived, so there is no secret to set or rotate.
+Publishing authenticates through npm trusted publishing (OIDC). The `@qmahyar/telecli` package on npmjs.com must list this repository and the `release` workflow as its trusted publisher. OIDC tokens are short lived, so there is no secret to set or rotate. Provenance is minted automatically on every publish (SLSA v1, visible on the package page and via `dist.attestations`) — no `--provenance` flag involved.
 
-The trusted publisher on npmjs.com is a separate record from the `repository` field in `package.json`. It has to name the repository the workflow actually runs in. Configure it under **npmjs.com → `@qmahyar/telecli` → Settings → Trusted Publisher** with exactly:
+The trusted publisher on npmjs.com is a separate record from the `repository` field in `package.json`. It has to name the repository the workflow actually runs in — the GitHub account that owns the repo, which is unrelated to the npm account name. Configure it under **npmjs.com → `@qmahyar/telecli` → Settings → Trusted Publisher** with exactly:
 
 | Field | Value |
 |---|---|
@@ -66,30 +66,34 @@ The trusted publisher on npmjs.com is a separate record from the `repository` fi
 | Repository | `tele-cli` |
 | Workflow filename | `release.yml` |
 | Environment name | `npm` |
-| Allowed actions | `npm publish` (and `npm stage publish`) |
+| Allowed actions | `npm publish` |
 
-The environment name matters: the publish job declares `environment: npm`, so the OIDC subject is `repo:mahyartdb/tele-cli:environment:npm`. A configuration that names a different owner, repository, or environment is rejected at the token exchange, and npm reports it as a publish failure rather than a permission error:
+Two registration rules: a newly created record must complete a successful publish within 2 days or it expires (delete and recreate), and the record cannot be edited after creation — the provider and required fields are fixed; changing one means deleting and re-adding. A record that names a different owner, repository, or environment is rejected at the token exchange, and npm reports it as a publish failure rather than a permission error:
 
 ```
 npm error code E404
 npm error 404 Not Found - PUT https://registry.npmjs.org/@qmahyar%2ftelecli - Not found
 ```
 
-That 404 means "no trusted publisher matched this OIDC token", not "the package does not exist". Fix the trusted publisher on npmjs.com, then rerun the failed job:
+That 404 means "no trusted publisher matched this OIDC token", not "the package does not exist". This happened in practice when the repository moved from `QMahyar/tele-cli` to `mahyartdb/tele-cli`: releases through v0.14.0 published fine under the old record, then v0.15.0 failed with this exact 404 until a new trusted publisher was registered for the new location and the failed job rerun. Fix the trusted publisher on npmjs.com, then rerun the failed job:
 
 ```bash
 gh run rerun <run-id> --job <npm-job-id>
 ```
 
-npm CLI 12 can do the same from a terminal with a granular access token, which avoids the web form:
+Only the npm job needs the rerun — the 13 build artifacts survive, and the publish job skips itself when the tag version is already on the registry. Rerunning the job also keeps the OIDC attestation chain intact.
+
+A terminal with a granular access token can manage trust records without the web form (npm CLI >= 11.15.0, 2FA required on the account):
 
 ```bash
 npm trust list @qmahyar/telecli
 npm trust revoke --id <id> @qmahyar/telecli
-npm trust github @qmahyar/telecli --repo mahyartdb/tele-cli --env npm --allow-publish --yes
+npm trust github @qmahyar/telecli --repo mahyartdb/tele-cli --file release.yml --env npm --allow-publish --yes
 ```
 
-The registry allows only one trusted publisher per package, so revoke the stale one before adding the new. Classic `npm_` tokens are rejected for both publishing and trust management; use a granular access token instead.
+A package can hold up to 10 trusted publisher records at once (useful while migrating between repositories); revoke stale ones so only the intended workflow can publish. Classic `npm_` tokens are rejected for both publishing and trust management; use a granular access token instead.
+
+Once trusted publishing is proven green, harden the package: **npmjs.com → `@qmahyar/telecli` → Settings → Publishing access → "Require two-factor authentication and disallow tokens"**. Token-based publishing then dies entirely while the OIDC path keeps working.
 
 The GitHub Release ships even when npm fails. Do **not** run `npm publish` from the repo's `npm/` directory: it contains only the JS launcher, no binaries, and a package published from there always fails at spawn with "no binary bundled". The publish job builds the real package by downloading the 13 build artifacts and staging every binary into `pkg-main/bin/` before invoking npm. To publish by hand instead, reproduce those steps with your own npm login:
 
@@ -104,10 +108,6 @@ cp LICENSE pkg-main/LICENSE
 jq --arg v "$VERSION" '.version = $v' npm/package.json > pkg-main/package.json
 cd pkg-main && npm publish --access=public
 ```
-
-Prefer rerunning the failed job (`gh run rerun <run-id> --job <npm-job-id>`) so the OIDC attestation chain stays intact.
-
-The publish job checks the registry before it publishes and skips the step when the tag version is already there, so re-running a release is safe and does not fail with "cannot publish over previously published version".
 
 ## Verify build provenance
 
