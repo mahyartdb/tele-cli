@@ -64,7 +64,7 @@ Set-Content "$env:APPDATA\tele\.env" "TELE_API_ID=1234567`nTELE_API_HASH=YOUR_AP
 tele account add --name work
 ```
 
-This registers the account entry in config.toml (no prompt). Then login, which prompts for the phone number:
+This registers the account entry in config.toml (no prompt). Then login, which requires the phone number up front (`--phone` or `TELE_PHONE`; there is no interactive phone prompt) and prompts for the login code:
 
 ```bash
 # Code login (SMS); prefer TELE_PHONE over --phone so the number stays
@@ -192,7 +192,7 @@ Run `tele account login --name NAME` to re-authenticate.
 
 ### "FLOOD_WAIT"
 
-Telegram is rate-limiting. tele handles this automatically with exponential backoff. Wait the specified seconds.
+Telegram is rate-limiting. tele honors the wait the server specifies (grammers' AutoSleep policy sleeps through waits under the configured `flood_sleep_threshold`, default 60s) and retries once. Larger waits surface as an error with `error.seconds`; wait that long before retrying.
 
 ### Verbose logging
 

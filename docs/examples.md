@@ -290,7 +290,7 @@ tele profile emoji-status --remove
 ```bash
 tele privacy get --key phone_number
 tele privacy get --key profile_photo
-tele privacy set --key phone_number --allow all
+tele privacy set --key phone_number --allow @trustedfriend
 tele privacy set --key forwards --deny @spammer
 ```
 
@@ -541,7 +541,7 @@ tele cache sync --account work --chat @team --limit 500
 # Offline search (no network)
 tele cache search --account work --query "deploy"
 tele cache search --account work --query "" --limit 20   # list recent
-tele cache search --account work --query "release" --chat-id=-1001234
+tele cache search --account work --query "release" --chat-id=1234
 
 # Cache info and cleanup
 tele cache stats --account work

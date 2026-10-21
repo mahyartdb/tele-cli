@@ -39,9 +39,10 @@ function isMusl() {
   }
 }
 
-// Spawn the first existing candidate; on spawn failure (broken/missing binary
-// despite the existsSync probe) fall through to the remaining candidates
-// instead of dying on the first miss.
+// Spawn the first existing candidate; on spawn failure (broken/undecodable
+// binary despite the existsSync probe) fall through to the remaining
+// candidates instead of dying on the first miss. Spawn errors surface
+// asynchronously on the child's "error" event, so the retry lives there.
 function pickExeAndSpawn() {
   const platform = process.platform;
   const arch = process.arch;
@@ -68,29 +69,48 @@ function pickExeAndSpawn() {
   if (platform === "linux" && arch === "ppc64") candidates.push("powerpc64le-unknown-linux-gnu");
   if (platform === "linux" && arch === "riscv64") candidates.push("riscv64gc-unknown-linux-gnu");
 
+  const attempts = [];
   for (const prefix of prefixes) {
     for (const triple of candidates) {
-      const p = path.join(__dirname, `${prefix}${triple}${ext}`);
-      if (!fs.existsSync(p)) continue;
-      try {
-        const child = spawn(p, process.argv.slice(2), { stdio: "inherit" });
-        child.on("error", (err) => {
-          console.error(`[tele] failed to start ${p}: ${err.message}`);
-          process.exit(1);
-        });
-        child.on("exit", (code) => {
-          process.exit(code ?? 1);
-        });
-        return;
-      } catch (err) {
-        console.error(`[tele] spawn failed for ${p}: ${err.message}; trying next candidate`);
-      }
+      attempts.push(path.join(__dirname, `${prefix}${triple}${ext}`));
     }
   }
-  console.error(
-    `[tele] no runnable binary bundled for ${platform}-${arch}` +
-      (candidates.length ? ` (tried: ${candidates.join(", ")})` : "") +
-      ". Download from https://github.com/mahyartdb/tele-cli/releases"
-  );
-  process.exit(1);
+  const existing = attempts.filter((p) => fs.existsSync(p));
+  if (existing.length === 0) {
+    console.error(
+      `[tele] no runnable binary bundled for ${platform}-${arch}` +
+        (candidates.length ? ` (tried: ${candidates.join(", ")})` : "") +
+        ". Download from https://github.com/mahyartdb/tele-cli/releases"
+    );
+    process.exit(1);
+  }
+
+  let index = 0;
+  function tryNext() {
+    if (index >= existing.length) {
+      console.error(
+        `[tele] no runnable binary for ${platform}-${arch}: every candidate failed to start ` +
+          `(tried: ${existing.join(", ")}). ` +
+          "Reinstall the package, or download from https://github.com/mahyartdb/tele-cli/releases"
+      );
+      process.exit(1);
+    }
+    const p = existing[index++];
+    let child;
+    try {
+      child = spawn(p, process.argv.slice(2), { stdio: "inherit" });
+    } catch (err) {
+      console.error(`[tele] failed to start ${p}: ${err.message}; trying next candidate`);
+      tryNext();
+      return;
+    }
+    child.on("error", (err) => {
+      console.error(`[tele] failed to start ${p}: ${err.message}; trying next candidate`);
+      tryNext();
+    });
+    child.on("exit", (code) => {
+      process.exit(code ?? 1);
+    });
+  }
+  tryNext();
 }

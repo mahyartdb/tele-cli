@@ -60,7 +60,7 @@ Tests never touch Telegram. They run in isolated temp dirs with fake configs. No
 
 ## Adding a new command
 
-The pattern is the same across all 16 command groups. Here is the minimal recipe using `contact.rs` as a reference.
+The pattern is the same across all 20 command groups. Here is the minimal recipe using `contact.rs` as a reference.
 
 ### 1. Define the subcommand enum and args
 

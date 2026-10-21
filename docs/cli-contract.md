@@ -20,7 +20,7 @@ Globals (root callback, inherited):
   --config PATH
 ```
 
-Per-account runtime budget (CLI fan-out): each account task gets a 300s deadline; on expiry the task is **aborted** (not left running) and the row reports a `Timeout` failure (exit 3). `msg download`, `msg export`, `story send`, and `takeout export` are the documented no-budget lanes: they run to completion exactly like the serve lane table below, because a 5-minute kill mid-transfer contradicts "streams until completion".
+Per-account runtime budget (CLI fan-out): each account task gets a 300s deadline; on expiry the account's work is cancelled (dropped mid-await, never left running) and the row reports a `Timeout` failure (exit 3). `msg download`, `msg export`, `story send`, and `takeout export` are the documented no-budget lanes: they run to completion exactly like the serve lane table below, because a 5-minute kill mid-transfer contradicts "streams until completion".
 
 An empty account selection (no `--account`, no `--tag`) is a usage error for mutating commands, `tele listen`, and takeout — they call `require_explicit_selection` and exit 1. Read-only commands (`msg get`, `msg search`, `profile get`, `account status`, and the list/read-back commands under dialog/contact/chat/sticker/story, `privacy get`, and `raw`) instead fan out across every session by default. `tele serve` with no selection serves every account, validated to 1..=32. Exceptions that never require a selection: `tele account list` and `tele account add`.
 
@@ -1117,7 +1117,7 @@ tele skill print
 tele skill install [--dir PATH] [--force]
 ```
 
-`tele skill` (and `tele skill print`) writes the embedded agent skill — an `SKILL.md` following the [Agent Skills](https://agentskills.io) spec (YAML frontmatter `name`/`description`/`license`/`compatibility`, markdown body) — to stdout and exits 0. The body carries the usage rules for driving tele: JSON-only parsing, exit codes, account/chat targeting, the 17 command groups (completions, the 18th command, is intentionally out of scope), the output envelope, and recipes. No account selection or network is involved. Stdout carries the skill bytes exactly (no added trailing newline); stderr stays empty on success. A broken stdout pipe maps to exit 0.
+`tele skill` (and `tele skill print`) writes the embedded agent skill — an `SKILL.md` following the [Agent Skills](https://agentskills.io) spec (YAML frontmatter `name`/`description`/`license`/`compatibility`, markdown body) — to stdout and exits 0. The body carries the usage rules for driving tele: JSON-only parsing, exit codes, account/chat targeting, the command groups, the output envelope, and recipes. No account selection or network is involved. Stdout carries the skill bytes exactly (no added trailing newline); stderr stays empty on success. A broken stdout pipe maps to exit 0.
 
 With `--json`/`--jsonl`, stdout carries the standard one-shot envelope instead of the raw markdown: one `local`-account row whose `data` holds `{"skill": "<SKILL.md text>"}`. A `--dry-run` machine row adds `dry_run: true` and `would: "print agent skill to stdout"` alongside the same keys.
 

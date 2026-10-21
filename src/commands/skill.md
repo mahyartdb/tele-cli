@@ -14,7 +14,7 @@ compatibility: tele 0.15.0+ (generated; do not hand-edit - the binary stamps thi
 3. Run destructive commands with `--dry-run` first, then for real.
 4. Exit codes: `0` ok, `1` usage (fix the command, do not retry), `2` partial, `3` all failed, `4` auth (run `tele account login --name NAME`), `130` interrupted.
 5. One process per account. `session is in use` means another tele process holds the account's session lock; wait for it or stop it. Never share or copy session files between machines.
-6. Secrets (api_hash, phone numbers, 2FA passwords) never appear in output. Do not read or echo session file contents.
+6. Phone numbers can appear in output (`contact list`, `profile get --show-phone`, `takeout export`); pass `--redact-phones` when the transcript leaves your machine, and strip them from pasted output. api_hash and 2FA passwords never appear in output. Do not read or echo session file contents.
 7. Destructive commands (`msg delete`, `chat kick`, `chat leave`, `dialog delete`, `account delete`, `topic delete`, `story delete`, `sticker remove`, `contact remove`) refuse to run without an explicit `--account` or `--tag`.
 
 ## Targeting

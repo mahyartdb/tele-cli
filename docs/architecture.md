@@ -66,7 +66,7 @@ src/
     ├── takeout.rs       start, export, finish
     ├── listen.rs        JSONL streaming
     ├── raw.rs           Typed TL registry (25 methods)
-    ├── completions.rs   bash, zsh, fish, powershell
+    ├── completions.rs   bash, zsh, fish, powershell, man
     ├── stickers.rs      list, search, show, install, remove
     ├── stories.rs       send, list, read, delete, pin, unpin
     ├── serve.rs         JSONL server over stdin/stdout
