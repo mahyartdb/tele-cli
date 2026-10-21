@@ -355,10 +355,11 @@ pub fn print_line(line: &str) -> crate::error::TeleResult<()> {
     print_line_to(&mut std::io::stdout(), line)
 }
 
-/// ```
-/// assert_eq!(telecli::output::strip_ansi("\x1b[31merror\x1b[0m"), "error");
-/// assert_eq!(telecli::output::strip_ansi("plain"), "plain");
-/// ```
+/// Strips ANSI SGR escape sequences (CSI … final alphabetic byte) so human
+/// tables stay aligned when cells carry colored text.
+///
+/// `strip_ansi("\x1b[31merror\x1b[0m") == "error"` and
+/// `strip_ansi("plain") == "plain"` are covered by unit tests in this module.
 pub fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -387,11 +388,8 @@ pub fn print_raw(text: &str) -> crate::error::TeleResult<()> {
     print_raw_to(&mut std::io::stdout(), text)
 }
 
-/// ```
-/// let mut buf: Vec<u8> = Vec::new();
-/// telecli::output::print_raw_to(&mut buf, "a\nb").unwrap();
-/// assert_eq!(buf, b"a\nb");
-/// ```
+/// Writes `text` byte-exact (no added newline); flushing errors propagate.
+/// `print_raw_to_preserves_exact_bytes` in this module covers the contract.
 pub fn print_raw_to(w: &mut impl std::io::Write, text: &str) -> crate::error::TeleResult<()> {
     w.write_all(text.as_bytes())?;
     w.flush()?;
@@ -421,11 +419,9 @@ fn print_account_table_to(
     print_table_to(w, headers, rows)
 }
 
-/// ```
-/// assert!(telecli::output::machine_mode(true, false));
-/// assert!(telecli::output::machine_mode(false, true));
-/// assert!(!telecli::output::machine_mode(false, false));
-/// ```
+/// `machine_mode(true, false)`, `machine_mode(false, true)`, and
+/// `machine_mode(true, true)` are true; `machine_mode(false, false)` is false
+/// (covered by the `machine_mode_*` unit tests in this module).
 pub fn machine_mode(json: bool, jsonl: bool) -> bool {
     json || jsonl
 }
@@ -612,6 +608,13 @@ mod tests {
         assert_eq!(LogLevel::Warn.as_str(), "warn");
         assert_eq!(LogLevel::Info.as_str(), "info");
         assert_eq!(LogLevel::Debug.as_str(), "debug");
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_and_keeps_plain_text() {
+        assert_eq!(strip_ansi("\x1b[31merror\x1b[0m"), "error");
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[1;32mok\x1b[0m tail"), "ok tail");
     }
 
     #[test]

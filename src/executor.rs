@@ -58,6 +58,8 @@ pub async fn run_fanout(
     let parallel = effective_parallel(flags.parallel, cfg.parallel_max)? as usize;
     let semaphore = Arc::new(Semaphore::new(parallel));
     let handler = Arc::new(handler);
+    let budgeted = !is_unbudgeted_command(&flags.command);
+    let budget = Duration::from_secs(ACCOUNT_TIMEOUT_SECS);
     let mut handles: Vec<(String, tokio::task::JoinHandle<TeleResult<AccountOutcome>>)> =
         Vec::new();
     for name in names {
@@ -68,15 +70,15 @@ pub async fn run_fanout(
             tokio::task::spawn(async move {
                 let permit = semaphore.acquire_owned().await;
                 let future = handler(name.clone());
-                run_one(name, permit, future).await
+                if budgeted {
+                    run_one_budgeted(name, permit, future, budget).await
+                } else {
+                    run_one(name, permit, future).await
+                }
             }),
         ));
     }
-    let outcomes = if is_unbudgeted_command(&flags.command) {
-        collect_outcomes_unbudgeted(&mut handles).await
-    } else {
-        collect_outcomes(&mut handles).await
-    };
+    let outcomes = collect_outcomes(&mut handles).await;
     for o in &outcomes {
         if let Some(line) = outcome_error_line(o) {
             log_line("error", &line);
@@ -137,10 +139,36 @@ async fn run_one(
     }
 }
 
+/// Per-account budget: the clock starts when the account actually runs (after
+/// its semaphore permit), so queued accounts are never aborted before they
+/// start — the documented contract in docs/cli-contract.md.
+async fn run_one_budgeted(
+    name: String,
+    permit: Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>,
+    future: impl std::future::Future<Output = TeleResult<serde_json::Value>>,
+    budget: Duration,
+) -> TeleResult<AccountOutcome> {
+    let _permit = permit.map_err(|e| TeleError::Other(format!("internal semaphore error: {e}")))?;
+    match tokio::time::timeout(budget, future).await {
+        Ok(Ok(data)) => Ok(AccountOutcome {
+            account: name,
+            ok: true,
+            error: None,
+            data: Some(data),
+            exit_code: None,
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(TeleError::Timeout(format!(
+            "account task exceeded {}s deadline",
+            budget.as_secs()
+        ))),
+    }
+}
+
 async fn collect_outcomes(
     handles: &mut Vec<(String, tokio::task::JoinHandle<TeleResult<AccountOutcome>>)>,
 ) -> Vec<AccountOutcome> {
-    collect_outcomes_with_budget(handles, Duration::from_secs(ACCOUNT_TIMEOUT_SECS)).await
+    collect_outcomes_unbudgeted(handles).await
 }
 
 fn join_error_outcome(name: String, e: tokio::task::JoinError) -> AccountOutcome {
@@ -184,41 +212,6 @@ async fn collect_outcomes_unbudgeted(
     let _abort_guard = AbortOnDrop(handles);
     for (name, handle) in _abort_guard.0.iter_mut() {
         outcomes.push(fold_join(name, handle.await));
-    }
-    sort_outcomes(&mut outcomes);
-    outcomes
-}
-
-async fn collect_outcomes_with_budget(
-    handles: &mut Vec<(String, tokio::task::JoinHandle<TeleResult<AccountOutcome>>)>,
-    budget: Duration,
-) -> Vec<AccountOutcome> {
-    let mut outcomes: Vec<AccountOutcome> = Vec::new();
-    {
-        let _abort_guard = AbortOnDrop(handles);
-        // One shared deadline for every account: each task runs concurrently
-        // from spawn, so per-account budgets must share wall time instead of
-        // stacking sequentially (N accounts x budget).
-        let deadline = tokio::time::Instant::now() + budget;
-        for (name, handle) in _abort_guard.0.iter_mut() {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let outcome = match tokio::time::timeout(remaining, &mut *handle).await {
-                Ok(joined) => fold_join(name, joined),
-                Err(_) => {
-                    // The task lost the race with the budget; stop it now so
-                    // it cannot linger on the shared runtime after we return.
-                    handle.abort();
-                    failed_outcome(
-                        name.clone(),
-                        TeleError::Timeout(format!(
-                            "account task exceeded {}s deadline",
-                            budget.as_secs()
-                        )),
-                    )
-                }
-            };
-            outcomes.push(outcome);
-        }
     }
     sort_outcomes(&mut outcomes);
     outcomes
@@ -985,107 +978,110 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hung_account_task_times_out_into_failed_outcome() {
-        let hang = tokio::task::spawn(async {
-            run_one("a".to_string(), permit().await, async {
-                let _ = std::future::pending::<()>().await;
-                unreachable!()
-            })
-            .await
-        });
-        let healthy = tokio::task::spawn(async {
-            run_one("b".to_string(), permit().await, async { ok_data() }).await
-        });
-        let outcomes = collect_outcomes_with_budget(
-            &mut vec![("a".to_string(), hang), ("b".to_string(), healthy)],
-            Duration::from_millis(50),
-        )
-        .await;
-        assert_eq!(outcomes.len(), 2, "healthy sibling still collected");
-        let hung = &outcomes[0];
-        assert_eq!(hung.account, "a");
-        assert!(!hung.ok);
-        let error = hung.error.as_ref().unwrap();
-        assert_eq!(error["type"], "Timeout");
-        assert!(
-            error["message"].as_str().unwrap().contains("deadline"),
-            "err: {error}"
-        );
-        assert_eq!(hung.exit_code, Some(EXIT_ALL_FAILED));
-        assert!(outcomes[1].ok);
+    async fn hung_account_budget_times_out_into_failed_outcome() {
+        let outcomes = [
+            run_one_budgeted(
+                "a".to_string(),
+                permit().await,
+                async {
+                    let _ = std::future::pending::<()>().await;
+                    unreachable!()
+                },
+                Duration::from_millis(50),
+            )
+            .await,
+            run_one_budgeted(
+                "b".to_string(),
+                permit().await,
+                async { ok_data() },
+                Duration::from_millis(50),
+            )
+            .await,
+        ];
+        assert!(!outcomes[0].is_ok(), "hung budget is an error");
+        let err = outcomes[0].as_ref().unwrap_err();
+        assert_eq!(err.exit_code(), EXIT_ALL_FAILED);
+        assert!(err.message().contains("deadline"), "err: {err}");
+        assert!(outcomes[1].is_ok(), "healthy sibling unaffected");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timeout_budget_greater_than_task_runs_to_completion() {
-        let handle = tokio::task::spawn(async {
-            run_one("a".to_string(), permit().await, async {
+    async fn budget_greater_than_task_runs_to_completion() {
+        let outcome = run_one_budgeted(
+            "a".to_string(),
+            permit().await,
+            async {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 ok_data()
-            })
-            .await
-        });
-        let outcomes = collect_outcomes_with_budget(
-            &mut vec![("a".to_string(), handle)],
+            },
             Duration::from_secs(300),
         )
-        .await;
-        assert!(outcomes[0].ok, "task finishing inside budget is ok");
-    }
-    #[tokio::test]
-    async fn timed_out_task_is_aborted_not_left_running() {
-        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = Arc::clone(&finished);
-        let handle = tokio::task::spawn(async move {
-            run_one("a".to_string(), permit().await, async {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                ok_data()
-            })
-            .await
-        });
-        let outcomes = collect_outcomes_with_budget(
-            &mut vec![("a".to_string(), handle)],
-            Duration::from_millis(50),
-        )
-        .await;
-        assert!(!outcomes[0].ok, "timeout is a failure");
-        assert_eq!(outcomes[0].error.as_ref().unwrap()["type"], "Timeout");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !finished.load(std::sync::atomic::Ordering::SeqCst),
-            "timed-out task must be aborted, not left running"
-        );
+        .await
+        .unwrap();
+        assert!(outcome.ok, "task finishing inside budget is ok");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn concurrent_timeouts_share_budget_not_sum() {
-        let hang_a = tokio::task::spawn(async {
-            run_one("a".to_string(), permit().await, async {
-                let _ = std::future::pending::<()>().await;
-                unreachable!()
-            })
-            .await
-        });
-        let hang_b = tokio::task::spawn(async {
-            run_one("b".to_string(), permit().await, async {
-                let _ = std::future::pending::<()>().await;
-                unreachable!()
-            })
-            .await
-        });
+    async fn budgets_apply_per_account_not_shared_wall_time() {
+        // Three sequential hung accounts under --parallel 1 semantics: each
+        // gets its own full budget, so total elapsed is 3x budget, not 1x.
         let start = tokio::time::Instant::now();
-        let outcomes = collect_outcomes_with_budget(
-            &mut vec![("a".to_string(), hang_a), ("b".to_string(), hang_b)],
-            Duration::from_millis(100),
-        )
-        .await;
+        for name in ["a", "b", "c"] {
+            let err = run_one_budgeted(
+                name.to_string(),
+                permit().await,
+                async {
+                    let _ = std::future::pending::<()>().await;
+                    unreachable!()
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.message().contains("deadline"));
+        }
         let elapsed = start.elapsed();
-        assert_eq!(outcomes.len(), 2);
-        assert!(outcomes.iter().all(|o| !o.ok));
         assert!(
-            elapsed < Duration::from_millis(150),
-            "two concurrent budgets must share wall time, elapsed: {elapsed:?}"
+            elapsed >= Duration::from_millis(300),
+            "each account gets its own budget, elapsed: {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn budgeted_queue_never_times_out_accounts_that_have_not_started() {
+        // The contract regression this guards: under --parallel 1, account b
+        // queued behind a hung a must not be reported as a Timeout before it
+        // runs. The budget clock now starts per account, so b still runs.
+        let semaphore = Arc::new(Semaphore::new(1));
+        let sem = Arc::clone(&semaphore);
+        let hung = tokio::task::spawn(async move {
+            let permit = sem.acquire_owned().await;
+            run_one_budgeted(
+                "a".to_string(),
+                permit,
+                async {
+                    let _ = std::future::pending::<()>().await;
+                    unreachable!()
+                },
+                Duration::from_millis(50),
+            )
+            .await
+        });
+        let sem = Arc::clone(&semaphore);
+        let queued = tokio::task::spawn(async move {
+            let permit = sem.acquire_owned().await;
+            run_one_budgeted(
+                "b".to_string(),
+                permit,
+                async { ok_data() },
+                Duration::from_millis(50),
+            )
+            .await
+        });
+        let hung = hung.await.unwrap();
+        assert!(hung.is_err(), "hung account times out");
+        let queued = queued.await.unwrap().unwrap();
+        assert!(queued.ok, "queued account still ran after the hang");
     }
 
     #[test]
