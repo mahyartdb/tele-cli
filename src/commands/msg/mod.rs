@@ -1130,6 +1130,9 @@ pub(crate) async fn get_watch_core(
             None,
         ));
     }
+    let chat =
+        entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.chat).await?;
+    let chat_ref = entities::peer_ref(&chat).await.map_err(tele_invocation)?;
     loop {
         let elapsed = start.elapsed();
         if elapsed >= timeout {
@@ -1147,31 +1150,51 @@ pub(crate) async fn get_watch_core(
                 params.timeout_secs
             )));
         }
-        let current = get_core(shares, params.clone()).await?;
+        let current = watch_fetch(shares, chat_ref, target).await?;
         let current_edit = extract_edit_date(&current);
-        if current_edit != initial_edit {
+        if current_edit.is_some() && current_edit != initial_edit {
             return Ok(current);
         }
-        let latest_params = GetParams {
-            chat: params.chat.clone(),
-            id: None,
-            ids: Vec::new(),
-            limit: 1,
-            offset_id: None,
-            last: true,
-            dry_run: false,
-            watch: false,
-            timeout_secs: params.timeout_secs,
-            poll_interval: params.poll_interval,
-            replied: false,
-        };
-        let latest = get_core(shares, latest_params).await?;
-        if let Some(max_id) = extract_max_id(&latest) {
-            if max_id > target {
-                return Ok(latest);
+        if current_edit.is_none() {
+            let latest = watch_latest(shares, chat_ref).await?;
+            if let Some(max_id) = extract_max_id(&latest) {
+                if max_id > target {
+                    return Ok(latest);
+                }
             }
         }
     }
+}
+
+async fn watch_fetch(
+    shares: &crate::client::ServeShares,
+    chat_ref: grammers_session::types::PeerRef,
+    target: i32,
+) -> TeleResult<serde_json::Value> {
+    shares.rate_limiter.acquire().await;
+    let fetched = shares
+        .client
+        .get_messages_by_id(chat_ref, &[target])
+        .await
+        .map_err(tele_invocation)?;
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for msg in fetched.into_iter().flatten() {
+        push_message_row(&mut rows, &msg)?;
+    }
+    Ok(serde_json::json!({"messages": rows}))
+}
+
+async fn watch_latest(
+    shares: &crate::client::ServeShares,
+    chat_ref: grammers_session::types::PeerRef,
+) -> TeleResult<serde_json::Value> {
+    shares.rate_limiter.acquire().await;
+    let mut iter = shares.client.iter_messages(chat_ref).limit(1);
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    while let Some(msg) = iter.next().await.map_err(tele_invocation)? {
+        push_message_row(&mut rows, &msg)?;
+    }
+    Ok(serde_json::json!({"messages": rows}))
 }
 
 use crate::commands::helpers::truncate_text;
