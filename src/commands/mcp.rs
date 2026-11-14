@@ -7,7 +7,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, JsonObject, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, Resource, ResourceContents,
-    ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ServerHandler, ServiceExt};
@@ -189,7 +189,7 @@ impl TeleMcp {
             .collect()
     }
 
-    fn info(&self) -> ServerInfo {
+    fn info(&self) -> ServerConfig {
         let mut instructions = format!(
             "tele MCP server bound to Telegram account \"{}\"; the account is fixed at startup via --account and every tool runs as that account. \
 Tools map tele CLI ops one-to-one. Every tool accepts dry_run:true, which returns the would-payload offline without touching the network. \
@@ -201,7 +201,7 @@ Destructive tools carry annotations.destructiveHint=true: the first call rejects
                 " This instance was started with --read-only, so mutating tools are hidden.",
             );
         }
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -283,7 +283,7 @@ fn mcp_error(e: TeleError) -> ErrorData {
 }
 
 impl ServerHandler for TeleMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.info()
     }
 
