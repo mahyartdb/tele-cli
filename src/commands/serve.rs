@@ -1042,7 +1042,13 @@ async fn dispatch_action(
         }
         for name in &selected {
             if let Some(tx) = pool.resync.get(name) {
-                let _ = tx.send(()).await;
+                // try_send: a full 1-slot buffer already means a resync is
+                // pending for that account; a second queued request adds
+                // nothing and send().await here would stall the whole
+                // sequential dispatcher while the account is mid-reconnect
+                // or flood-wait (its receiver is only polled in the event
+                // loop), eventually hanging EOF shutdown.
+                let _ = tx.try_send(());
             }
         }
         let response = response_ok(id, serde_json::json!({ "resync": "started" }));
@@ -1308,7 +1314,7 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     let disp_read_senders = read_senders.clone();
     let disp_read_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let disp_read_counter_clone = std::sync::Arc::clone(&disp_read_counter);
-    let dispatcher = tokio::spawn(async move {
+    let mut dispatcher = tokio::spawn(async move {
         while let Some((id, op, params)) = dispatch_rx.recv().await {
             let served = disp_pool.served();
             let _ = dispatch_action(
@@ -1380,7 +1386,12 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                 drop(mutations);
                 drop(read_senders);
                 drop(main_response_tx);
-                let _ = tokio::time::timeout(DRAIN_BUDGET, dispatcher).await;
+                let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                // timeout() on a borrowed handle leaves the task running; a
+                // dispatcher stuck past the budget (e.g. blocked on a
+                // saturated lane) would otherwise keep response_rx clones
+                // alive and hang drain_and_flush / EOF shutdown forever.
+                dispatcher.abort();
                 drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                 return Ok(EXIT_OK);
             }
@@ -1460,7 +1471,8 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     drop(mutations);
                     drop(read_senders);
                     drop(main_response_tx);
-                    let _ = tokio::time::timeout(DRAIN_BUDGET, dispatcher).await;
+                    let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                    dispatcher.abort();
                     drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                     return Ok(EXIT_OK);
                 }
@@ -1469,7 +1481,8 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     drop(mutations);
                     drop(read_senders);
                     drop(main_response_tx);
-                    let _ = tokio::time::timeout(DRAIN_BUDGET, dispatcher).await;
+                    let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                    dispatcher.abort();
                     drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                     return Err(e);
                 }
@@ -1506,7 +1519,8 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         drop(mutations);
                         drop(read_senders);
                         drop(main_response_tx);
-                        let _ = tokio::time::timeout(DRAIN_BUDGET, dispatcher).await;
+                        let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                        dispatcher.abort();
                         drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                         return Ok(EXIT_OK);
                     }
@@ -1527,7 +1541,8 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         drop(mutations);
                         drop(read_senders);
                         drop(main_response_tx);
-                        let _ = tokio::time::timeout(DRAIN_BUDGET, dispatcher).await;
+                        let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                        dispatcher.abort();
                         drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                         return Ok(EXIT_OK);
                     }
@@ -1548,7 +1563,8 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             drop(mutations);
                             drop(read_senders);
                             drop(main_response_tx);
-                            let _ = tokio::time::timeout(DRAIN_BUDGET, dispatcher).await;
+                            let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                            dispatcher.abort();
                             drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                             return Ok(EXIT_OK);
                         }
@@ -1578,7 +1594,6 @@ async fn account_task(
     ticks: tokio::sync::mpsc::Sender<AccountTick>,
 ) {
     let initial_catch_up = catch_up;
-    let mut catch_up = catch_up;
     let mut resync_rx = resync_rx;
     let mut failures: u32 = 0;
     let mut greeted = false;
@@ -1669,6 +1684,11 @@ async fn account_task(
         }
         let receiver =
             std::mem::replace(&mut guard.updates, tokio::sync::mpsc::unbounded_channel().1);
+        // Consume the resync flag BEFORE building the stream: the rebuild
+        // triggered by stream.resync / StreamError must run with catch-up
+        // replay, or the outage window is silently lost (the live-only
+        // rebuild advances the persisted update state past it).
+        let catch_up = std::mem::take(&mut resync_requested) || initial_catch_up;
         let mut stream = match guard
             .client
             .stream_updates(
@@ -1691,7 +1711,6 @@ async fn account_task(
                 return;
             }
         };
-        catch_up = std::mem::take(&mut resync_requested) || initial_catch_up;
         let shares = guard.shares();
         pool.publish(&name, shares);
         if greeted {
