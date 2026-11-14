@@ -2602,7 +2602,7 @@ fn until_instant_accepts_timestamp_relative_date_and_rfc3339() {
 
 #[test]
 fn stopper_count_stops_after_exactly_n_emits() {
-    let stopper = StreamStopper::new(Some(3), None);
+    let stopper = StreamStopper::new(Some(3), None, None);
     assert!(!stopper.emitted());
     assert!(!stopper.emitted());
     assert!(stopper.emitted());
@@ -2611,13 +2611,13 @@ fn stopper_count_stops_after_exactly_n_emits() {
 
 #[test]
 fn stopper_count_one_stops_on_first_emit() {
-    let stopper = StreamStopper::new(Some(1), None);
+    let stopper = StreamStopper::new(Some(1), None, None);
     assert!(stopper.emitted());
 }
 
 #[test]
 fn stopper_without_count_never_stops_on_emit() {
-    let stopper = StreamStopper::new(None, None);
+    let stopper = StreamStopper::new(None, None, None);
     assert!(!stopper.emitted());
     assert!(!stopper.emitted());
     assert!(!stopper.time_up());
@@ -2628,7 +2628,7 @@ fn stopper_past_deadline_stays_up_across_checks() {
     let past = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .unwrap();
-    let stopper = StreamStopper::new(None, Some(past));
+    let stopper = StreamStopper::new(None, Some(past), None);
     assert!(stopper.time_up());
     assert!(stopper.time_up());
 }
@@ -2636,7 +2636,7 @@ fn stopper_past_deadline_stays_up_across_checks() {
 #[test]
 fn stopper_future_deadline_is_not_consumed_by_check() {
     let future = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-    let stopper = StreamStopper::new(None, Some(future));
+    let stopper = StreamStopper::new(None, Some(future), None);
     assert!(!stopper.time_up());
     assert!(!stopper.time_up());
 }

@@ -620,6 +620,15 @@ fn until_instant(value: Option<&str>) -> TeleResult<Option<std::time::Instant>> 
     }
 }
 
+fn until_date(value: Option<&str>) -> TeleResult<Option<chrono::DateTime<chrono::Utc>>> {
+    match value {
+        None => Ok(None),
+        Some(v) => Ok(Some(crate::commands::msg::download::parse_download_date(
+            "--until", v,
+        )?)),
+    }
+}
+
 pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     let config_path = flags.config_path.clone();
     use grammers_client::update::Update;
@@ -659,7 +668,8 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     }
     let timeout_secs = args.timeout_secs;
     let until = until_instant(args.until.as_deref())?;
-    let stopper = Arc::new(StreamStopper::new(args.count, until));
+    let until_date = until_date(args.until.as_deref())?;
+    let stopper = Arc::new(StreamStopper::new(args.count, until, until_date));
     let direction = if args.out {
         Some(Direction::Out)
     } else if args.r#in {
@@ -992,6 +1002,13 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                             tokio::time::Instant::now(),
                                         ) {
                                             if emit_row_or_stop(&stopper, &name, done).await? {
+                                                for rest in album_flush(&name, &mut album) {
+                                                    if emit_row_or_stop(&stopper, &name, rest)
+                                                        .await?
+                                                    {
+                                                        return Ok(());
+                                                    }
+                                                }
                                                 return Ok(());
                                             }
                                         }
@@ -1004,6 +1021,11 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                     album_flush_chat(&name, &mut album, chat_id)
                                 {
                                     if emit_row_or_stop(&stopper, &name, done).await? {
+                                        for rest in album_flush(&name, &mut album) {
+                                            if emit_row_or_stop(&stopper, &name, rest).await? {
+                                                return Ok(());
+                                            }
+                                        }
                                         return Ok(());
                                     }
                                 }
@@ -1013,7 +1035,14 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                     chat_id,
                                     None,
                                     Some(row),
-                                )).await? { return Ok(()); }
+                                )).await? {
+                                    for rest in album_flush(&name, &mut album) {
+                                        if emit_row_or_stop(&stopper, &name, rest).await? {
+                                            return Ok(());
+                                        }
+                                    }
+                                    return Ok(());
+                                }
 
                                     }
                                 }
@@ -1242,13 +1271,19 @@ fn stream_row_line(value: &serde_json::Value) -> TeleResult<String> {
 struct StreamStopper {
     remaining: std::sync::Mutex<Option<u64>>,
     until: std::sync::Mutex<Option<std::time::Instant>>,
+    until_date: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
 impl StreamStopper {
-    fn new(count: Option<u64>, until: Option<std::time::Instant>) -> Self {
+    fn new(
+        count: Option<u64>,
+        until: Option<std::time::Instant>,
+        until_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
         StreamStopper {
             remaining: std::sync::Mutex::new(count),
             until: std::sync::Mutex::new(until),
+            until_date: std::sync::Mutex::new(until_date),
         }
     }
 
@@ -1257,6 +1292,25 @@ impl StreamStopper {
         match *guard {
             Some(deadline) => std::time::Instant::now() >= deadline,
             None => false,
+        }
+    }
+
+    /// Documented --until contract: stop after the first event at/after the
+    /// timestamp. Events carry an RFC3339 date only on message rows; rows
+    /// without a date fall back to the wall-clock deadline so Raw/Gap-style
+    /// events cannot loop forever when a past --until would never match.
+    fn event_date_reached(&self, value: &serde_json::Value) -> bool {
+        let guard = self.until_date.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(limit) = *guard else {
+            return false;
+        };
+        match value
+            .get("date")
+            .and_then(|d| d.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        {
+            Some(d) => d.with_timezone(&chrono::Utc) >= limit,
+            None => self.time_up(),
         }
     }
 
@@ -1286,7 +1340,7 @@ async fn emit_row_or_stop(
     account: &str,
     value: serde_json::Value,
 ) -> TeleResult<bool> {
-    if stopper.time_up() || stopper.is_exhausted() {
+    if stopper.event_date_reached(&value) || stopper.time_up() || stopper.is_exhausted() {
         return Ok(true);
     }
     match emit_row(value).await {
@@ -1918,12 +1972,12 @@ mod stopper_tests {
 
     #[test]
     fn count_zero_is_exhausted_before_any_emit() {
-        assert!(StreamStopper::new(Some(0), None).is_exhausted());
+        assert!(StreamStopper::new(Some(0), None, None).is_exhausted());
     }
 
     #[test]
     fn count_none_never_exhausts() {
-        let stopper = StreamStopper::new(None, None);
+        let stopper = StreamStopper::new(None, None, None);
         assert!(!stopper.is_exhausted());
         assert!(!stopper.emitted());
         assert!(!stopper.is_exhausted());
@@ -1931,12 +1985,52 @@ mod stopper_tests {
 
     #[test]
     fn count_n_exhausts_after_n_emits() {
-        let stopper = StreamStopper::new(Some(2), None);
+        let stopper = StreamStopper::new(Some(2), None, None);
         assert!(!stopper.is_exhausted());
         assert!(!stopper.emitted());
         assert!(!stopper.is_exhausted());
         assert!(stopper.emitted());
         assert!(stopper.is_exhausted());
+    }
+
+    #[test]
+    fn past_until_date_stops_on_first_dated_row_before_it() {
+        // Regression: --until used to be a wall-clock deadline, so a past
+        // timestamp expired before the first event and the stream exited
+        // with zero rows instead of replaying backlog dated before the
+        // timestamp.
+        let past = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stopper = StreamStopper::new(None, None, Some(past));
+        let backlog_row = serde_json::json!({"date": "2025-06-01T00:00:00+00:00"});
+        let future_row = serde_json::json!({"date": "2026-06-01T00:00:00+00:00"});
+        assert!(
+            !stopper.event_date_reached(&backlog_row),
+            "backlog dated before --until must stream, not be cut off"
+        );
+        assert!(
+            stopper.event_date_reached(&future_row),
+            "first event at/after --until must stop the stream"
+        );
+    }
+
+    #[test]
+    fn undated_rows_fall_back_to_wall_clock_until() {
+        let past = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stopper = StreamStopper::new(
+            None,
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            Some(past),
+        );
+        let raw_row = serde_json::json!({"event": "Raw"});
+        assert!(
+            stopper.event_date_reached(&raw_row),
+            "undated rows cannot match a past event-date filter forever; \
+             they fall back to the wall-clock deadline"
+        );
     }
 
     #[tokio::test]
@@ -1978,7 +2072,7 @@ mod stopper_tests {
 
     #[tokio::test]
     async fn count_zero_emit_row_or_stop_emits_nothing() {
-        let stopper = StreamStopper::new(Some(0), None);
+        let stopper = StreamStopper::new(Some(0), None, None);
         let row = serde_json::json!({"event": "NewMessage"});
         assert!(super::emit_row_or_stop(&stopper, "work", row)
             .await
