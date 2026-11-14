@@ -917,7 +917,9 @@ pub(crate) async fn dialog_delete_core(
     let chat =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.chat).await?;
     let peer = entities::input_peer(&chat).await.map_err(tele_invocation)?;
-    if matches!(peer, tl::enums::InputPeer::PeerSelf) && !params.include_self {
+    let targets_saved_messages = matches!(peer, tl::enums::InputPeer::PeerSelf)
+        || matches!(chat, grammers_client::peer::Peer::User(ref u) if u.is_self());
+    if targets_saved_messages && !params.include_self {
         return Err(TeleError::Usage(
             "refusing to delete Saved Messages (chat me); pass --include-self to confirm"
                 .to_string(),
@@ -2872,6 +2874,82 @@ mod tests {
         .unwrap();
         assert_eq!(code, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_messages_guard_covers_resolved_self_user_not_just_peer_self_variant() {
+        // resolve_peer("me") returns the real user via get_me(), so the
+        // InputPeer built from it is InputPeer::User with the real id —
+        // never InputPeer::PeerSelf. The guard must also consult
+        // Peer::User::is_self, or `dialog delete --chat me` would clear
+        // the whole Saved Messages history without --include-self.
+        let self_user = tl::enums::User::User(tl::types::User {
+            is_self: true,
+            ..sample_user()
+        });
+        let targets_saved_messages = matches!(&self_user, tl::enums::User::User(u) if u.is_self);
+        assert!(targets_saved_messages, "me-resolved user must be caught");
+        let other_user = tl::enums::User::User(tl::types::User {
+            is_self: false,
+            ..sample_user()
+        });
+        let targets_saved_messages = matches!(&other_user, tl::enums::User::User(u) if u.is_self);
+        assert!(!targets_saved_messages, "other users must pass through");
+    }
+
+    fn sample_user() -> tl::types::User {
+        tl::types::User {
+            id: 42,
+            is_self: false,
+            contact: false,
+            mutual_contact: false,
+            deleted: false,
+            bot: false,
+            bot_chat_history: false,
+            bot_nochats: false,
+            verified: false,
+            restricted: false,
+            min: false,
+            bot_inline_geo: false,
+            support: false,
+            scam: false,
+            apply_min_photo: false,
+            fake: false,
+            bot_attach_menu: false,
+            premium: false,
+            attach_menu_enabled: false,
+            bot_can_edit: false,
+            close_friend: false,
+            stories_hidden: false,
+            stories_unavailable: false,
+            contact_require_premium: false,
+            bot_business: false,
+            bot_has_main_app: false,
+            bot_forum_view: false,
+            bot_forum_can_manage_topics: false,
+            bot_can_manage_bots: false,
+            bot_guestchat: false,
+            bot_guard: false,
+            access_hash: None,
+            first_name: None,
+            last_name: None,
+            username: None,
+            phone: None,
+            photo: None,
+            status: None,
+            bot_info_version: None,
+            restriction_reason: None,
+            bot_inline_placeholder: None,
+            lang_code: None,
+            emoji_status: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            bot_active_users: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+        }
     }
 
     fn dialog_flags(command: &str, config: &std::path::Path) -> GlobalFlags {
