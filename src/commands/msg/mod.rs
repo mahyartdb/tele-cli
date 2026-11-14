@@ -2586,6 +2586,8 @@ pub(crate) async fn search_core(
     shares.rate_limiter.acquire().await;
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut served = 0usize;
+    let mut scanned = 0usize;
+    let mut truncated = false;
     let limit = params.limit as usize;
     if params.global {
         let mut iter = shares.client.search_all_messages().query(&params.query);
@@ -2596,17 +2598,23 @@ pub(crate) async fn search_core(
             iter = iter.limit(limit);
             while let Some(msg) = iter.next().await.map_err(tele_invocation)? {
                 served += 1;
+                scanned += 1;
                 shares.rate_limiter.acquire_for_items(served).await;
                 push_message_row(&mut rows, &msg)?;
             }
         } else {
+            let budget = search_scan_budget(limit);
             while rows.len() < limit {
                 match iter.next().await.map_err(tele_invocation)? {
                     Some(msg) => {
                         served += 1;
+                        scanned += 1;
                         shares.rate_limiter.acquire_for_items(served).await;
                         if search_row_kept(&msg, from_id, since, until) {
                             push_message_row(&mut rows, &msg)?;
+                        } else if scanned > budget {
+                            truncated = true;
+                            break;
                         }
                     }
                     None => break,
@@ -2634,17 +2642,23 @@ pub(crate) async fn search_core(
             iter = iter.limit(limit);
             while let Some(msg) = iter.next().await.map_err(tele_invocation)? {
                 served += 1;
+                scanned += 1;
                 shares.rate_limiter.acquire_for_items(served).await;
                 push_message_row(&mut rows, &msg)?;
             }
         } else if let Some(want) = from_id {
+            let budget = search_scan_budget(limit);
             while rows.len() < limit {
                 match iter.next().await.map_err(tele_invocation)? {
                     Some(msg) => {
                         served += 1;
+                        scanned += 1;
                         shares.rate_limiter.acquire_for_items(served).await;
                         if search_sender_matches(&msg, want) {
                             push_message_row(&mut rows, &msg)?;
+                        } else if scanned > budget {
+                            truncated = true;
+                            break;
                         }
                     }
                     None => break,
@@ -2654,12 +2668,13 @@ pub(crate) async fn search_core(
             iter = iter.limit(limit);
             while let Some(msg) = iter.next().await.map_err(tele_invocation)? {
                 served += 1;
+                scanned += 1;
                 shares.rate_limiter.acquire_for_items(served).await;
                 push_message_row(&mut rows, &msg)?;
             }
         }
     }
-    Ok(serde_json::json!({"messages": rows}))
+    Ok(serde_json::json!({"messages": rows, "scanned": scanned, "truncated": truncated}))
 }
 
 pub(crate) fn validate_export(args: &ExportArgs) -> TeleResult<()> {
@@ -2742,6 +2757,10 @@ pub(crate) enum ExportScan {
 }
 
 pub(crate) fn export_skip_budget(limit: usize) -> usize {
+    limit.saturating_mul(10).max(100)
+}
+
+pub(crate) fn search_scan_budget(limit: usize) -> usize {
     limit.saturating_mul(10).max(100)
 }
 
@@ -2911,6 +2930,13 @@ mod msg_mod_tests {
         assert_eq!(export_skip_budget(5), 100);
         assert_eq!(export_skip_budget(50), 500);
         assert_eq!(export_skip_budget(0), 100);
+    }
+
+    #[test]
+    fn search_scan_budget_scales_with_limit_and_has_floor() {
+        assert_eq!(search_scan_budget(5), 100);
+        assert_eq!(search_scan_budget(50), 500);
+        assert_eq!(search_scan_budget(0), 100);
     }
 
     #[test]
