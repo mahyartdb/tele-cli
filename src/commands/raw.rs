@@ -77,14 +77,8 @@ pub async fn run(args: &RawArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         allow_raw: args.allow_raw,
     };
     validate_raw(&call)?;
-    if !flags.dry_run
-        && generated::requires_explicit_account(&name)
-        && flags.account.is_empty()
-        && flags.tag.is_empty()
-    {
-        return Err(TeleError::Usage(format!(
-            "raw method {name} mutates account data — pass --account or --tag explicitly"
-        )));
+    if let Some(message) = raw_account_requirement(&name, flags) {
+        return Err(TeleError::Usage(message));
     }
     let dry_run = flags.dry_run;
     let envelope = run_fanout(flags, move |account| {
@@ -223,6 +217,23 @@ pub(crate) fn raw_requires_bound_account(method: &str, account: &str) -> TeleRes
         )));
     }
     Ok(())
+}
+
+/// A mutating raw method needs an explicit account selection.
+///
+/// The requirement holds under `--dry-run` too: without a selection the
+/// command fans out over every session, and the preview would be
+/// emitted once per account.
+fn raw_account_requirement(method: &str, flags: &crate::executor::GlobalFlags) -> Option<String> {
+    if !generated::requires_explicit_account(method) {
+        return None;
+    }
+    if !flags.account.is_empty() || !flags.tag.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "raw method {method} mutates account data — pass --account or --tag explicitly"
+    ))
 }
 
 pub(crate) async fn raw_core(
@@ -1332,6 +1343,46 @@ fn bool_result(ok: bool) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutating_raw_methods_require_an_account_even_under_dry_run() {
+        let flags =
+            |account: Vec<String>, tag: Vec<String>, dry_run: bool| crate::executor::GlobalFlags {
+                account,
+                tag,
+                parallel: None,
+                json: false,
+                jsonl: false,
+                dry_run,
+                quiet: false,
+                config_path: None,
+                command: "raw".to_string(),
+            };
+        let mutating = "account.UpdateProfile";
+        let read_only = "users.GetUsers";
+        assert!(
+            raw_account_requirement(mutating, &flags(Vec::new(), Vec::new(), false)).is_some(),
+            "a mutating raw method must demand an explicit account"
+        );
+        assert!(
+            raw_account_requirement(mutating, &flags(Vec::new(), Vec::new(), true)).is_some(),
+            "the requirement must hold under --dry-run too"
+        );
+        assert!(
+            raw_account_requirement(mutating, &flags(vec!["work".to_string()], Vec::new(), true))
+                .is_none(),
+            "an explicit account satisfies the requirement"
+        );
+        assert!(
+            raw_account_requirement(mutating, &flags(Vec::new(), vec!["team".to_string()], true))
+                .is_none(),
+            "an explicit tag satisfies the requirement"
+        );
+        assert!(
+            raw_account_requirement(read_only, &flags(Vec::new(), Vec::new(), true)).is_none(),
+            "read-only raw methods fan out by default"
+        );
+    }
 
     #[test]
     fn params_missing_required_field_fails() {

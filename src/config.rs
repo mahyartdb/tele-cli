@@ -808,6 +808,17 @@ fn acquire_config_lock(cfg_path: &std::path::Path) -> TeleResult<ConfigLockGuard
     }
 }
 
+/// Apply a change to the config under a cross-process lock.
+///
+/// The lock covers the load as well as the write: a caller that renamed a
+/// snapshot read before the lock over the file would lose whatever another
+/// process wrote in between.
+///
+/// Only the accounts table is persisted when the file already exists —
+/// `write_config` merges `[accounts]` into the existing document so
+/// comments and unknown keys survive. A change to a top-level key
+/// (`parallel_max`, `flood_sleep_threshold`, `proxy`) is therefore not
+/// written back.
 pub fn update_config(
     path: Option<&std::path::Path>,
     apply: impl FnOnce(&mut AppConfig) -> TeleResult<()>,
