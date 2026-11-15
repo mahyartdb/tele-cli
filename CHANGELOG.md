@@ -25,8 +25,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Mutating `tele raw` calls require `--account`/`--tag` even under `--dry-run`, matching the documented rule; without a selection the preview was emitted once per account.
 - An unknown config key that is a near-miss of a real one now warns (`paralel_max` -> "did you mean `parallel_max`?"). Keys that are simply unknown stay silent, because unknown per-account keys are preserved across rewrites.
 - `profile set --bio` measures length in UTF-16 units, like the name fields, so an emoji-heavy bio fails with a usage error instead of a raw server error.
+- `listen`'s `--count` cannot emit more rows than asked for when several accounts race to emit, and the reconnect give-up now counts stream errors, not just failed connections.
+- A stalled stdout no longer grows the process without bound: `listen` and `tele serve` cap the wait for the output consumer at 30 seconds, drop the event, count it, and surface the count to the reader.
 
 ### Changed
+
+- `msg forward` notifies the recipient by default, like every other send path; `--silent` forwards without a notification (previously every forward was silent and there was no way to change it). `profile set --name` with a single word clears the surname instead of keeping the old one. `privacy get` and `profile get` label each account's block in multi-account human output. `msg send --copy-from` rejects `--media-ttl`/`--thumbnail` instead of silently ignoring them. `takeout start --photos` warns that the export does not download media.
+- The startup path no longer rewrites file permissions that are already correct (the session sweep and the `.env` tighten), so the per-invocation floor stops growing with the number of session sidecars.
+- The local cache's FTS page cache is sized for its scans (16 MiB), cutting a chat-scoped search over 100k cached rows by ~24%; the connection is reused within a process instead of reopened per request.
 
 - `msg delete` states its scope. In private chats and basic groups the deletion now applies to your copy only unless the new `--revoke` flag is passed; previously every delete revoked, removing the message for the other side as well. `--revoke` and `--self-only` are mutually exclusive, channels ignore `--revoke`, and the dry-run preview states the scope.
 - Eight RustSec advisories are resolved by dependency updates (rmcp 3.1.4 -> 3.10.0, tokio 1.53.1 -> 1.54.1, pulldown-cmark 0.13.4 -> 0.13.6, ctutils 0.4.2 -> 0.4.8), and the manifest floors now exclude the affected versions so a lockfile regeneration cannot reintroduce them.
