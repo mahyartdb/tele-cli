@@ -20,6 +20,11 @@ use grammers_session::Session;
 /// The contact is added and removed within the same request flow, so the user will not
 /// appear in your contact list after resolution completes.
 ///
+/// Only a contact this call actually created is deleted. `contacts.importedContacts`
+/// returns `imported` (the contacts the call added) next to `users` (every resolved
+/// user, including contacts that were already saved); a number that was already a
+/// contact leaves `imported` empty and is left untouched.
+///
 /// Note: Phone resolution may fail if the target user's privacy settings prevent contact-based lookups.
 pub async fn resolve_peer(
     client: &Client,
@@ -38,13 +43,14 @@ pub async fn resolve_peer(
                 "looking up phone number; privacy settings may hide the account",
             );
             let digits_for_cleanup = digits.clone();
+            let client_id = digits.parse::<i64>().expect(
+                "phone digits fit i64: the target classifier caps phone digit strings at 15 digits",
+            );
             let res = client
                 .invoke(&tl::functions::contacts::ImportContacts {
                     contacts: vec![tl::enums::InputContact::InputPhoneContact(
                         tl::types::InputPhoneContact {
-                            client_id: digits.parse::<i64>().expect(
-                                "phone digits fit i64: the target classifier caps phone digit strings at 15 digits",
-                            ),
+                            client_id,
                             phone: digits,
                             first_name: String::new(),
                             last_name: String::new(),
@@ -54,26 +60,38 @@ pub async fn resolve_peer(
                 })
                 .await
                 .map_err(crate::error::invocation_error)?;
-            let users = match res {
-                tl::enums::contacts::ImportedContacts::Contacts(res) => res.users,
-            };
-            if let Some(user) = users.first() {
-                if let Err(e) = client
-                    .invoke(&tl::functions::contacts::DeleteContacts {
-                        id: vec![imported_user_to_input_user(user)],
-                    })
-                    .await
-                {
-                    crate::output::log_line(
-                        "warn",
-                        &format!("failed to clean up temporary import: {e}"),
-                    );
+            let tl::enums::contacts::ImportedContacts::Contacts(imported) = res;
+            // Only a contact WE created may be deleted again. `imported`
+            // lists the contacts this import actually added; `users` also
+            // carries contacts that were already saved, and deleting one
+            // of those would silently drop the user's own contact.
+            let imported_user_id = imported_user_id(&imported.imported, client_id);
+            let users = imported.users;
+            if let Some(user_id) = imported_user_id {
+                let target_user = users.iter().find(|u| raw_user_id(u) == Some(user_id));
+                match target_user {
+                    Some(user) => {
+                        if let Err(e) = client
+                            .invoke(&tl::functions::contacts::DeleteContacts {
+                                id: vec![imported_user_to_input_user(user)],
+                            })
+                            .await
+                        {
+                            crate::output::log_line(
+                                "warn",
+                                &format!("failed to clean up temporary import: {e}"),
+                            );
+                        }
+                    }
+                    None => {
+                        if let Err(e) = cleanup_temp_contact(client, &digits_for_cleanup).await {
+                            crate::output::log_line(
+                                "warn",
+                                &format!("failed to clean up temporary import: {e}"),
+                            );
+                        }
+                    }
                 }
-            } else if let Err(e) = cleanup_temp_contact(client, &digits_for_cleanup).await {
-                crate::output::log_line(
-                    "warn",
-                    &format!("failed to clean up temporary import: {e}"),
-                );
             }
             match users.into_iter().next() {
                 Some(user) => Ok(grammers_client::peer::Peer::User(
@@ -660,6 +678,26 @@ fn imported_user_to_input_user(user: &tl::enums::User) -> tl::enums::InputUser {
             access_hash: u.access_hash.unwrap_or(0),
         }),
     }
+}
+
+fn raw_user_id(user: &tl::enums::User) -> Option<i64> {
+    match user {
+        tl::enums::User::Empty(u) => Some(u.id),
+        tl::enums::User::User(u) => Some(u.id),
+    }
+}
+
+/// The user id this import actually created, if any.
+///
+/// `contacts.importedContacts` returns `imported` (the contacts this call
+/// ADDED) and `users` (every user the call resolved, including contacts
+/// that were already saved). Only an id present in `imported` may be
+/// deleted again.
+fn imported_user_id(imported: &[tl::enums::ImportedContact], client_id: i64) -> Option<i64> {
+    imported.iter().find_map(|c| match c {
+        tl::enums::ImportedContact::Contact(c) if c.client_id == client_id => Some(c.user_id),
+        _ => None,
+    })
 }
 
 async fn cleanup_temp_contact(client: &Client, digits: &str) -> Result<(), InvocationError> {
@@ -1263,6 +1301,31 @@ mod tests {
         let msg = phone_not_found_message();
         assert!(msg.contains("hides it from phone-number search"));
         assert!(msg.contains("message you first"));
+    }
+
+    #[test]
+    fn imported_user_id_is_empty_when_nothing_was_imported() {
+        // Regression: the phone-target lookup used to delete
+        // users.first() unconditionally. When the number was already a
+        // saved contact, `imported` is empty while `users` still carries
+        // that contact, so the user's own contact was deleted.
+        assert_eq!(imported_user_id(&[], 15551234567), None);
+    }
+
+    #[test]
+    fn imported_user_id_matches_the_submitted_client_id() {
+        let imported = vec![tl::enums::ImportedContact::Contact(
+            tl::types::ImportedContact {
+                user_id: 4242,
+                client_id: 15551234567,
+            },
+        )];
+        assert_eq!(imported_user_id(&imported, 15551234567), Some(4242));
+        assert_eq!(
+            imported_user_id(&imported, 15550000000),
+            None,
+            "another client_id must not match"
+        );
     }
 
     #[test]
