@@ -221,17 +221,20 @@ pub async fn run(args: &WizardArgs, flags: &GlobalFlags) -> TeleResult<i32> {
             "a credential is set in the process environment and shadows the .env file",
         );
     }
-    let mut cfg = crate::config::load_config(flags.config_path.as_deref())?;
-    let is_new = !cfg.accounts.contains_key(&name);
+    let is_new = !crate::config::load_config(flags.config_path.as_deref())?
+        .accounts
+        .contains_key(&name);
     if is_new {
-        cfg.accounts
-            .insert(name.clone(), crate::config::AccountConfig::default());
         let path = match flags.config_path.clone() {
             Some(p) => p,
             None => dir.join("config.toml"),
         };
-        crate::config::write_config(&path, &cfg)
-            .map_err(|e| TeleError::Config(format!("failed to write config: {e:#}")))?;
+        crate::config::update_config(Some(&path), |cfg| {
+            cfg.accounts
+                .entry(name.clone())
+                .or_insert_with(crate::config::AccountConfig::default);
+            Ok(())
+        })?;
     }
     let steps = next_steps(&name);
     let data = serde_json::json!({

@@ -423,15 +423,16 @@ async fn add(args: &AddArgs, flags: &GlobalFlags) -> TeleResult<i32> {
             ),
         );
     }
-    let mut cfg = config::load_config(flags.config_path.as_deref())?;
-    let entry = cfg
-        .accounts
-        .entry(args.name.clone())
-        .or_insert_with(config::AccountConfig::default);
-    if let Some(tags) = &args.tags {
-        entry.tags = tags.clone();
-    }
-    config::write_config(&path, &cfg)?;
+    config::update_config(Some(&path), |cfg| {
+        let entry = cfg
+            .accounts
+            .entry(args.name.clone())
+            .or_insert_with(config::AccountConfig::default);
+        if let Some(tags) = &args.tags {
+            entry.tags = tags.clone();
+        }
+        Ok(())
+    })?;
     log_line(
         "info",
         &format!("account {} registered in {}", args.name, path.display()),
@@ -499,10 +500,11 @@ async fn remove(args: &RemoveArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     }
     purge_pending(&args.name);
     session::remove_session(&args.name).await?;
-    let mut cfg = config::load_config(flags.config_path.as_deref())?;
-    cfg.accounts.remove(&args.name);
     let path = default_config_path(&flags.config_path)?;
-    config::write_config(&path, &cfg)?;
+    config::update_config(Some(&path), |cfg| {
+        cfg.accounts.remove(&args.name);
+        Ok(())
+    })?;
     log_line("info", &format!("account {} removed", args.name));
     let data = serde_json::json!({
         "removed": true,
@@ -849,31 +851,11 @@ async fn delete(args: &DeleteArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     session::remove_session(&name)
                         .await
                         .map_err(map_removal_error)?;
-                    match crate::config::load_config(config_path.as_deref()) {
-                        Ok(mut cfg) => {
-                            if cfg.accounts.remove(&name).is_some() {
-                                match default_config_path(&config_path) {
-                                    Ok(path) => {
-                                        if let Err(e) = crate::config::write_config(&path, &cfg) {
-                                            log_line(
-                                                "warn",
-                                                &format!("could not update config.toml: {e:#}"),
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log_line(
-                                            "warn",
-                                            &format!("could not update config.toml: {e:#}"),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => log_line(
-                            "warn",
-                            &format!("could not load config to remove the entry: {e:#}"),
-                        ),
+                    if let Err(e) = crate::config::update_config(config_path.as_deref(), |cfg| {
+                        cfg.accounts.remove(&name);
+                        Ok(())
+                    }) {
+                        log_line("warn", &format!("could not update config.toml: {e:#}"));
                     }
                     Ok(serde_json::json!({"deleted": true, "local_state_removed": true}))
                 }

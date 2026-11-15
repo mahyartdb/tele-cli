@@ -500,6 +500,9 @@ fn read_config(cfg_path: &std::path::Path) -> anyhow::Result<AppConfig> {
             config_display_name(cfg_path)
         )
     })?;
+    for hint in unknown_key_hints(&text) {
+        crate::output::log_line("warn", &hint);
+    }
     let clamped = cfg.parallel_max.clamp(1, 32);
     if clamped != cfg.parallel_max {
         crate::output::log_line(
@@ -512,6 +515,81 @@ fn read_config(cfg_path: &std::path::Path) -> anyhow::Result<AppConfig> {
     }
     cfg.parallel_max = clamped;
     Ok(cfg)
+}
+
+const KNOWN_CONFIG_KEYS: [&str; 4] = ["accounts", "flood_sleep_threshold", "parallel_max", "proxy"];
+
+const KNOWN_ACCOUNT_KEYS: [&str; 8] = [
+    "app_version",
+    "device_model",
+    "flood_sleep_threshold",
+    "lang_code",
+    "proxy",
+    "rpc_per_minute",
+    "system_version",
+    "tags",
+];
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(substitution);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+fn near_miss_suggestion<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
+    known
+        .iter()
+        .map(|candidate| (edit_distance(key, candidate), *candidate))
+        .filter(|(distance, _)| *distance <= 2)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
+}
+
+fn unknown_key_hints(text: &str) -> Vec<String> {
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let root = doc.as_table();
+    let mut hints = Vec::new();
+    for (key, _) in root.iter() {
+        if KNOWN_CONFIG_KEYS.contains(&key) {
+            continue;
+        }
+        if let Some(suggestion) = near_miss_suggestion(key, &KNOWN_CONFIG_KEYS) {
+            hints.push(format!(
+                "unknown config key '{key}'; did you mean '{suggestion}'?"
+            ));
+        }
+    }
+    let Some(accounts) = root.get("accounts").and_then(|item| item.as_table()) else {
+        return hints;
+    };
+    for (account, entry) in accounts.iter() {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        for (key, _) in table.iter() {
+            if KNOWN_ACCOUNT_KEYS.contains(&key) {
+                continue;
+            }
+            if let Some(suggestion) = near_miss_suggestion(key, &KNOWN_ACCOUNT_KEYS) {
+                hints.push(format!(
+                    "unknown config key '{key}' in [accounts.{account}]; did you mean '{suggestion}'?"
+                ));
+            }
+        }
+    }
+    hints
 }
 
 fn proxy_is_unset(p: &ProxyConfig) -> bool {
@@ -660,6 +738,92 @@ pub fn write_config(path: &std::path::Path, cfg: &AppConfig) -> anyhow::Result<(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(path);
+    Ok(())
+}
+
+const CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const CONFIG_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+struct ConfigLockGuard {
+    file: Option<std::fs::File>,
+}
+
+impl Drop for ConfigLockGuard {
+    fn drop(&mut self) {
+        self.file.take();
+    }
+}
+
+fn config_lock_path(cfg_path: &std::path::Path) -> PathBuf {
+    let mut name = cfg_path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+fn acquire_config_lock(cfg_path: &std::path::Path) -> TeleResult<ConfigLockGuard> {
+    let lock_path = config_lock_path(cfg_path);
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            crate::fs_util::create_dir_private(parent).map_err(|e| {
+                TeleError::Config(format!(
+                    "cannot prepare config directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&lock_path).map_err(|e| {
+        TeleError::Config(format!(
+            "cannot open config lock {}: {e}; retry once the other tele process finishes",
+            lock_path.display()
+        ))
+    })?;
+    let deadline = std::time::Instant::now() + CONFIG_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(ConfigLockGuard { file: Some(file) }),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(CONFIG_LOCK_RETRY);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(TeleError::Config(format!(
+                    "config {} is locked by another tele process; retry once it finishes",
+                    cfg_path.display()
+                )));
+            }
+            Err(e) => {
+                return Err(TeleError::Config(format!(
+                    "cannot lock config {}: {e}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
+}
+
+pub fn update_config(
+    path: Option<&std::path::Path>,
+    apply: impl FnOnce(&mut AppConfig) -> TeleResult<()>,
+) -> TeleResult<()> {
+    let cfg_path = match path {
+        Some(p) => p.to_path_buf(),
+        None => app_data_dir_checked()?.join("config.toml"),
+    };
+    // The lock covers the load as well as the write: a caller that renames a
+    // snapshot read before the lock over the file loses whatever another
+    // process wrote in between.
+    let _lock = acquire_config_lock(&cfg_path)?;
+    let mut cfg = read_config(&cfg_path).map_err(|e| TeleError::Config(format!("{e:#}")))?;
+    apply(&mut cfg)?;
+    write_config(&cfg_path, &cfg)
+        .map_err(|e| TeleError::Config(format!("failed to write config: {e:#}")))?;
     Ok(())
 }
 
@@ -1758,6 +1922,147 @@ mod tests {
             "unset optional identity key lost on second rewrite:\n{text2}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_config_serializes_concurrent_writers() {
+        let dir = atomic_dir("update-lock");
+        let path = dir.join("config.toml");
+        write_config(&path, &AppConfig::default()).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for name in ["alpha", "beta"] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                update_config(Some(&path), |cfg| {
+                    // Hold the snapshot open so two unlocked writers overlap
+                    // instead of racing on a few microseconds of file IO.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    cfg.accounts
+                        .insert(name.to_string(), AccountConfig::default());
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let back = read_config(&path).unwrap();
+        let names: Vec<&String> = back.accounts.keys().collect();
+        assert!(
+            back.accounts.contains_key("alpha") && back.accounts.contains_key("beta"),
+            "one writer erased the other: {names:?}"
+        );
+        assert!(
+            dir.join("config.toml.lock").exists(),
+            "the config lock file must outlive the guard"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_config_preserves_comments_and_unknown_keys() {
+        let dir = atomic_dir("update-preserve");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep me\nparallel_max = 2\n\n[accounts.work]\ntags = []\noperator_note = \"call back\"\n",
+        )
+        .unwrap();
+        update_config(Some(&path), |cfg| {
+            cfg.accounts.insert(
+                "new".to_string(),
+                AccountConfig {
+                    tags: vec!["team".to_string()],
+                    ..Default::default()
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"), "comment lost:\n{text}");
+        assert!(
+            text.contains("operator_note"),
+            "unknown per-account key lost:\n{text}"
+        );
+        assert!(
+            text.contains("[accounts.new]"),
+            "new account missing:\n{text}"
+        );
+        let back = read_config(&path).unwrap();
+        assert_eq!(back.accounts.len(), 2);
+        assert_eq!(back.accounts["work"].tags, Vec::<String>::new());
+        assert_eq!(back.accounts["new"].tags, vec!["team".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_config_skips_the_write_when_apply_fails() {
+        let dir = atomic_dir("update-apply-error");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "parallel_max = 2\n").unwrap();
+        let err = update_config(Some(&path), |cfg| {
+            cfg.accounts
+                .insert("alpha".to_string(), AccountConfig::default());
+            Err(TeleError::Usage("stop".to_string()))
+        })
+        .unwrap_err();
+        assert!(matches!(err, TeleError::Usage(_)));
+        let back = read_config(&path).unwrap();
+        assert!(
+            back.accounts.is_empty(),
+            "a failed apply must not rewrite the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_config_key_near_miss_warns_and_unrelated_key_stays_silent() {
+        let dir = atomic_dir("unknown-key-hint");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "paralel_max = 8\noperator_note = \"call back\"\n\n[accounts.work]\ntags = []\ndevice_modl = \"desk\"\n",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let hints = unknown_key_hints(&text);
+        assert_eq!(hints.len(), 2, "{hints:?}");
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.contains("'paralel_max'") && h.contains("'parallel_max'")),
+            "{hints:?}"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.contains("'device_modl'") && h.contains("'device_model'")),
+            "{hints:?}"
+        );
+        assert!(
+            !hints.iter().any(|h| h.contains("operator_note")),
+            "a preserved unknown key must not warn: {hints:?}"
+        );
+        let cfg = read_config(&path).unwrap();
+        assert_eq!(
+            cfg.parallel_max, 1,
+            "a near-miss key must fall back to the default"
+        );
+        assert_eq!(cfg.accounts["work"].tags, Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_distance_matches_known_near_misses() {
+        assert_eq!(edit_distance("paralel_max", "parallel_max"), 1);
+        assert_eq!(edit_distance("device_modl", "device_model"), 1);
+        assert!(edit_distance("operator_note", "parallel_max") > 2);
+        assert_eq!(edit_distance("", "proxy"), 5);
     }
 
     #[test]

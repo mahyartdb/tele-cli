@@ -138,11 +138,8 @@ fn restrict_session_files(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sweep_session_artifacts(name: &str, include_lock: bool) -> anyhow::Result<()> {
+fn sweep_session_artifacts(name: &str) -> anyhow::Result<()> {
     let mut targets = vec![session_path(name)];
-    if include_lock {
-        targets.push(lock_path(name));
-    }
     for suffix in SESSION_SIDECAR_SUFFIXES {
         targets.push(sidecar_path(name, suffix));
     }
@@ -168,34 +165,16 @@ fn sweep_session_artifacts(name: &str, include_lock: bool) -> anyhow::Result<()>
 
 pub async fn remove_session(name: &str) -> anyhow::Result<()> {
     validate_name(name).map_err(anyhow::Error::msg)?;
-    if session_path(name).try_exists()? {
-        let lock = acquire_lock_file(name).await?;
-        let swept = sweep_session_artifacts(name, false);
-        #[cfg(unix)]
-        {
-            let lock_removed = match std::fs::remove_file(lock_path(name)) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            };
-            drop(lock);
-            swept?;
-            lock_removed?;
-        }
-        #[cfg(not(unix))]
-        {
-            drop(lock);
-            swept?;
-            match std::fs::remove_file(lock_path(name)) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            }?;
-        }
-    } else {
-        sweep_session_artifacts(name, true)?;
-    }
-    Ok(())
+    crate::config::ensure_app_data_dir()?;
+    crate::fs_util::create_dir_private(&session_dir())?;
+    // The lock is taken before the state is inspected: a login that creates
+    // the session while removal waits would otherwise have its fresh session
+    // swept by a sweep that ran without the lock.
+    let _lock = acquire_lock_file(name).await?;
+    // The lock file is deliberately left behind: unlinking it while the lock
+    // is still held creates an inode swap that lets a second client lock a
+    // fresh file while the sweep runs on the old one.
+    sweep_session_artifacts(name)
 }
 
 #[derive(Clone)]
@@ -1308,7 +1287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_session_cleans_session_and_lock_files() {
+    async fn remove_session_cleans_session_and_keeps_lock_file() {
         let _guard = lock_env();
         let dir = test_dir("session-lock-remove");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1318,7 +1297,10 @@ mod tests {
         drop(held);
         remove_session("work").await.unwrap();
         assert!(!session_path("work").exists());
-        assert!(!lock_path("work").exists());
+        assert!(
+            lock_path("work").exists(),
+            "removal must leave the lock file in place so concurrent acquirers keep contending on the same inode"
+        );
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1336,7 +1318,7 @@ mod tests {
         }
         assert!(session_path("work").exists());
         assert!(lock_path("work").exists());
-        sweep_session_artifacts("work", false).unwrap();
+        sweep_session_artifacts("work").unwrap();
         assert!(!session_path("work").exists());
         assert!(
             lock_path("work").exists(),
@@ -1363,7 +1345,10 @@ mod tests {
         drop(held);
         remove_session("work").await.unwrap();
         assert!(!session_path("work").exists());
-        assert!(!lock_path("work").exists());
+        assert!(
+            lock_path("work").exists(),
+            "removal must not unlink the lock file after the lock was released"
+        );
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1376,6 +1361,76 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         seed_test_env(&dir);
         remove_session("work").await.unwrap();
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_session_of_never_created_account_takes_the_account_lock() {
+        let _guard = lock_env();
+        let dir = test_dir("session-remove-absent-locks");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_test_env(&dir);
+        crate::config::ensure_app_data_dir().unwrap();
+        crate::fs_util::create_dir_private(&session_dir()).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path("work"))
+            .unwrap();
+        holder.try_lock().unwrap();
+        assert!(!session_path("work").exists());
+        let err = remove_session("work").await.unwrap_err();
+        assert!(
+            err.to_string().contains("is in use by another process"),
+            "removal of an absent session must contend for the account lock: {err}"
+        );
+        assert!(
+            !session_path("work").exists(),
+            "a failed removal must not create a session file"
+        );
+        holder.unlock().unwrap();
+        remove_session("work").await.unwrap();
+        assert!(
+            lock_path("work").exists(),
+            "the lock file must outlive removal"
+        );
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_session_keeps_a_session_another_holder_is_creating() {
+        let _guard = lock_env();
+        let dir = test_dir("session-remove-concurrent-create");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_test_env(&dir);
+        crate::config::ensure_app_data_dir().unwrap();
+        crate::fs_util::create_dir_private(&session_dir()).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path("work"))
+            .unwrap();
+        holder.try_lock().unwrap();
+        std::fs::write(session_path("work"), b"fresh-login").unwrap();
+        let err = remove_session("work").await.unwrap_err();
+        assert!(
+            err.to_string().contains("is in use by another process"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(session_path("work")).unwrap(),
+            b"fresh-login",
+            "removal must not sweep a session created by the lock holder"
+        );
+        holder.unlock().unwrap();
+        remove_session("work").await.unwrap();
+        assert!(!session_path("work").exists());
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1881,7 +1936,10 @@ mod tests {
         remove_session("work").await.unwrap();
 
         assert!(!session_path("work").exists());
-        assert!(!lock_path("work").exists());
+        assert!(
+            lock_path("work").exists(),
+            "the lock file is reused across removals, not unlinked"
+        );
         assert!(!stale_a.exists(), "stale tmp must be swept");
         assert!(!stale_b.exists(), "stale tmp sidecars must be swept");
         assert!(
