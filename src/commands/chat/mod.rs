@@ -2212,24 +2212,13 @@ pub(crate) async fn chat_edit_core(
     if let Some(photo) = &params.photo {
         applied.push("photo");
         if photo == "remove" {
-            let full = fetch_full_chat_info(&shares.client, &chat).await?;
-            let tl::enums::messages::ChatFull::Full(full) = full;
-            let current: Option<tl::enums::Photo> = match &full.full_chat {
-                tl::enums::ChatFull::ChannelFull(f) => Some(f.chat_photo.clone()),
-                tl::enums::ChatFull::Full(f) => f.chat_photo.clone(),
-            };
-            let input_photo = current
-                .as_ref()
-                .and_then(chat_photo_input_photo)
-                .ok_or_else(|| TeleError::Other("chat has no photo to remove".to_string()))?;
-            shares.rate_limiter.acquire().await;
-            let _: Vec<i64> = shares
-                .client
-                .invoke(&tl::functions::photos::DeletePhotos {
-                    id: vec![input_photo],
-                })
-                .await
-                .map_err(tele_invocation)?;
+            settings::remove_chat_photo(
+                &shares.client,
+                &shares.rate_limiter,
+                &chat,
+                is_basic_group,
+            )
+            .await?;
         } else {
             let uploaded = shares
                 .client

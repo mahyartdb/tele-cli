@@ -315,6 +315,50 @@ pub(crate) async fn fetch_full_chat_info(
     }
 }
 
+/// Remove a chat's photo.
+///
+/// The chat photo API is the only one that can clear it: `photos.deletePhotos`
+/// deletes the CURRENT USER's own profile photos, so a chat photo handed to
+/// it is silently ignored and the chat keeps its photo.
+pub(crate) async fn remove_chat_photo(
+    client: &grammers_client::Client,
+    rate_limiter: &crate::rate_limiter::RateLimiter,
+    chat: &grammers_client::peer::Peer,
+    is_basic_group: bool,
+) -> TeleResult<()> {
+    let full = fetch_full_chat_info(client, chat).await?;
+    let tl::enums::messages::ChatFull::Full(full) = full;
+    let current: Option<tl::enums::Photo> = match &full.full_chat {
+        tl::enums::ChatFull::ChannelFull(f) => Some(f.chat_photo.clone()),
+        tl::enums::ChatFull::Full(f) => f.chat_photo.clone(),
+    };
+    if current.is_none() {
+        return Err(TeleError::Other("chat has no photo to remove".to_string()));
+    }
+    let chat_photo = tl::enums::InputChatPhoto::Empty;
+    rate_limiter.acquire().await;
+    if is_basic_group {
+        client
+            .invoke(&tl::functions::messages::EditChatPhoto {
+                chat_id: chat.id().bare_id().unwrap_or_default(),
+                photo: chat_photo,
+            })
+            .await
+            .map_err(tele_invocation)?;
+    } else {
+        client
+            .invoke(&tl::functions::channels::EditPhoto {
+                channel: entities::input_channel(chat)
+                    .await
+                    .map_err(tele_invocation)?,
+                photo: chat_photo,
+            })
+            .await
+            .map_err(tele_invocation)?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn edit_chat(args: EditArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     validate_edit(&args)?;
     crate::executor::require_explicit_selection("chat edit", flags)?;
@@ -400,42 +444,8 @@ pub(crate) async fn edit_chat(args: EditArgs, flags: &GlobalFlags) -> TeleResult
             if let Some(photo) = &photo {
                 applied.push("photo");
                 if photo == "remove" {
-                    let full = fetch_full_chat_info(&guard.client, &chat).await?;
-                    let tl::enums::messages::ChatFull::Full(full) = full;
-                    let current: Option<tl::enums::Photo> = match &full.full_chat {
-                        tl::enums::ChatFull::ChannelFull(f) => Some(f.chat_photo.clone()),
-                        tl::enums::ChatFull::Full(f) => f.chat_photo.clone(),
-                    };
-                    if current.is_none() {
-                        return Err(TeleError::Other("chat has no photo to remove".to_string()));
-                    }
-                    // A chat photo is removed through the chat photo API.
-                    // photos.deletePhotos deletes the CURRENT USER's own
-                    // profile photos, so a chat photo passed to it is
-                    // silently ignored and the chat keeps its photo.
-                    let chat_photo = tl::enums::InputChatPhoto::Empty;
-                    guard.rate_limiter.acquire().await;
-                    if is_basic_group {
-                        guard
-                            .client
-                            .invoke(&tl::functions::messages::EditChatPhoto {
-                                chat_id: chat.id().bare_id().unwrap_or_default(),
-                                photo: chat_photo,
-                            })
-                            .await
-                            .map_err(tele_invocation)?;
-                    } else {
-                        guard
-                            .client
-                            .invoke(&tl::functions::channels::EditPhoto {
-                                channel: entities::input_channel(&chat)
-                                    .await
-                                    .map_err(tele_invocation)?,
-                                photo: chat_photo,
-                            })
-                            .await
-                            .map_err(tele_invocation)?;
-                    }
+                    remove_chat_photo(&guard.client, &guard.rate_limiter, &chat, is_basic_group)
+                        .await?;
                 } else {
                     let uploaded = guard
                         .client
