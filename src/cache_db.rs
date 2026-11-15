@@ -132,6 +132,12 @@ async fn open_db_uncached(account: &str) -> TeleResult<libsql::Connection> {
     conn.execute_batch("PRAGMA recursive_triggers = ON;")
         .await
         .map_err(|e| TeleError::Other(format!("cannot set pragma: {e}")))?;
+    // Curve 3: a chat-scoped FTS search fetches every match by rowid before it
+    // can filter or sort, and at 100k rows the default 2 MiB page cache thrashes
+    // on that walk (40 ms vs 29 ms median with this value; plan unchanged).
+    conn.execute_batch("PRAGMA cache_size = -16384;")
+        .await
+        .map_err(|e| TeleError::Other(format!("cannot set cache page budget: {e}")))?;
     let restrict_path = path.clone();
     tokio::task::spawn_blocking(move || {
         crate::fs_util::restrict_file_private(&restrict_path)
@@ -813,6 +819,87 @@ mod tests {
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert!(open_db(&account).await.is_err());
         let _ = std::fs::remove_file(&path);
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chat_scoped_fts_search_keeps_newest_first_order() {
+        let _guard = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "telecli-cache-ftsorder-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TELE_APP_DIR", &dir);
+        let account = test_account("ftsorder");
+        let msg = |id: i32, chat_id: i64, date: i64, text: &str| CachedMessage {
+            id,
+            chat_id,
+            chat_name: format!("chat-{chat_id}"),
+            sender_id: Some(5),
+            sender_name: "alice".to_string(),
+            date,
+            text: text.to_string(),
+            media_kind: None,
+        };
+        let msgs = vec![
+            msg(1, 100, 1_700_000_100, "deploy east"),
+            msg(2, 200, 1_700_000_200, "deploy west"),
+            msg(3, 100, 1_700_000_300, "deploy north"),
+            msg(4, 100, 1_700_000_400, "unrelated note"),
+            msg(5, 200, 1_700_000_500, "deploy south"),
+        ];
+        store_messages(&account, &msgs).await.unwrap();
+        let scoped = search_cache(&account, "deploy", Some(100), 10)
+            .await
+            .unwrap();
+        let scoped_ids: Vec<i32> = scoped.iter().map(|m| m.id).collect();
+        assert_eq!(
+            scoped_ids,
+            vec![3, 1],
+            "chat scope filters and date DESC orders"
+        );
+        let all = search_cache(&account, "deploy", None, 10).await.unwrap();
+        let all_ids: Vec<i32> = all.iter().map(|m| m.id).collect();
+        assert_eq!(all_ids, vec![5, 3, 2, 1]);
+        let window = search_cache(&account, "deploy", Some(100), 1)
+            .await
+            .unwrap();
+        let window_ids: Vec<i32> = window.iter().map(|m| m.id).collect();
+        assert_eq!(window_ids, vec![3], "limit applies after the date sort");
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_db_sets_the_page_cache_budget_fts_scans_need() {
+        // A chat-scoped FTS search fetches every match by rowid before it can
+        // filter or sort; the 2 MiB default thrashes on that walk at 100k rows.
+        let _guard = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "telecli-cache-budget-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TELE_APP_DIR", &dir);
+        let account = test_account("budget");
+        let conn = open_db(&account).await.unwrap();
+        let mut rows = conn.query("PRAGMA cache_size", ()).await.unwrap();
+        let row = rows.next().await.unwrap().expect("cache_size row");
+        let budget = match row.get::<libsql::Value>(0).unwrap() {
+            libsql::Value::Integer(v) => v,
+            other => panic!("cache_size must be an integer, got {other:?}"),
+        };
+        assert_eq!(budget, -16384, "16 MiB page cache, expressed in KiB");
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

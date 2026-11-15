@@ -62,6 +62,7 @@ need a live account, and the live spot-checks are named per row.
 | `dialog list` folder filter (`src/commands/dialog.rs`) | 1 | the default listing walked the server's ordering of ALL folders and dropped non-main rows locally, so archived dialogs consumed page slots and a listing could return 0 rows while main-folder dialogs existed | folder 0 is requested from the server (`messages.getDialogs` with `folder_id`), same rows, no wasted slots |
 | `chat admin-log` window (`src/commands/chat/admin_log.rs`) | 1 | with only `--until` given, the scan walks back through newer events until it fills the limit or runs out — that is the semantics of the window (events arrive newest-first, so the window is always further back), and the repo's own test locks it | unchanged |
 | serve account-to-main event hop (`src/commands/serve.rs`) | 8 | the hop is bounded (256 slots) but the wait was unbounded: a stalled consumer parked the account task while grammers' UNBOUNDED update channel kept filling — the only unbounded-memory path in the long-running lanes | the wait is capped at 30s; a dropped event is counted and reported as a `Gap` row (`consumer_stalled`), so memory stays bounded and the loss is visible |
+| cache FTS page cache (`src/cache_db.rs`) | 3 | a chat-scoped FTS query over 100k rows took 40.4 ms raw / 48.8 ms end to end: the plan is `SCAN f VIRTUAL TABLE INDEX 0:M3` + `SEARCH m USING INTEGER PRIMARY KEY (rowid=?)` + `USE TEMP B-TREE FOR ORDER BY`, so the rowid lookups dominate (the FTS intersection itself is only 2.3 ms) | `PRAGMA cache_size = -16384` (16 MiB): 30.6 ms raw / 37.2 ms end to end, −24 %, with the plan byte-for-byte identical and the result set and `ORDER BY m.date DESC` untouched |
 
 Live spot-checks still owed: curve 1 (pagination/search time-vs-limit on
 a live account), curve 2 (fan-out `--parallel` sweep, to confirm the
@@ -82,6 +83,23 @@ simulated outage).
   limiter, so a large upload spends far more server calls than its
   budget allows. Documented here rather than changed, because counting
   upload RPCs would change the limiter's meaning (ADR-008).
+
+### Trap: do not add `idx_messages_chat_date`
+
+Measured on the curve-3 dataset (100k rows, chat-scoped FTS query):
+adding an index on `messages(chat_id, date DESC)` flips SQLite's planner
+to an index-driven plan for the unchanged query, and a SPARSE term then
+takes **2.39 s** instead of ~200 µs — the planner starts walking the
+index instead of the FTS match list. No such index exists, and a test
+now pins that premise (`open_db_sets_the_page_cache_budget_fts_scans_need`
+reads `PRAGMA cache_size` back; the search test pins the ordering).
+Query rewrites that were measured and rejected on the same dataset:
+`ORDER BY m.rowid` (26.3 ms but changes the public order), a narrow
+projection (34.0 ms), `rowid IN (subquery)` (33.8 ms), a two-step join
+(34.7 ms), `CROSS JOIN` (38.9 ms), an FTS `chat_key` column (55 ms),
+`temp_store=MEMORY` (47.6 ms) and a 64 MiB page cache (no better than
+16 MiB). Each of those was slower on sparse terms than the shipped
+plan.
 
 ## First-cut scope notes
 
