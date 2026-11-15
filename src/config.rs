@@ -780,7 +780,7 @@ fn acquire_config_lock(cfg_path: &std::path::Path) -> TeleResult<ConfigLockGuard
         opts.mode(0o600);
     }
     let file = opts.open(&lock_path).map_err(|e| {
-        TeleError::Config(format!(
+        TeleError::Other(format!(
             "cannot open config lock {}: {e}; retry once the other tele process finishes",
             lock_path.display()
         ))
@@ -793,13 +793,13 @@ fn acquire_config_lock(cfg_path: &std::path::Path) -> TeleResult<ConfigLockGuard
                 std::thread::sleep(CONFIG_LOCK_RETRY);
             }
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(TeleError::Config(format!(
+                return Err(TeleError::Other(format!(
                     "config {} is locked by another tele process; retry once it finishes",
                     cfg_path.display()
                 )));
             }
             Err(e) => {
-                return Err(TeleError::Config(format!(
+                return Err(TeleError::Other(format!(
                     "cannot lock config {}: {e}",
                     lock_path.display()
                 )));
@@ -823,7 +823,7 @@ pub fn update_config(
     let mut cfg = read_config(&cfg_path).map_err(|e| TeleError::Config(format!("{e:#}")))?;
     apply(&mut cfg)?;
     write_config(&cfg_path, &cfg)
-        .map_err(|e| TeleError::Config(format!("failed to write config: {e:#}")))?;
+        .map_err(|e| TeleError::Other(format!("failed to write config: {e:#}")))?;
     Ok(())
 }
 
