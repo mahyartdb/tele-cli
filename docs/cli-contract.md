@@ -353,7 +353,7 @@ This command removes the current profile photo. It reads the photo id from `user
 
 `tele listen` always streams JSON Lines on stdout, one event per line; `--json` is accepted as a no-op for symmetry. Stdout writes are backpressured: `listen` pauses on a slow reader instead of dropping events. `--fields` projects every emitted streaming row to the named dotted fields (unknown fields fail with a Usage error); without it rows stream whole.
 
-Filter applicability per event family: `--from SENDER` applies to NewMessage/MessageEdited/MessageDeleted-adjacent rows that carry a sender, `--chat` applies wherever a chat id is present, and `--in/--out/--pattern` apply only to message rows. When `--in/--out/--pattern` are set, rows that structurally cannot match them (Raw, MessageDeleted, ChatAction, UserUpdate, CallbackQuery) are suppressed rather than bypassing the filter; `--from` and `--chat` still apply to ChatAction/UserUpdate/CallbackQuery rows. This keeps `--pattern ERROR` from drowning in typing-indicator rows while keeping `--from @bob` working on actions. Finite streams: `--timeout-secs S` bounds the whole run, `--count N` exits after N emitted event rows (all accounts combined), and `--until <RFC3339|unix-ts|YYYY-MM-DD>` exits after the first event at/after that timestamp — each prints a stderr info line and exits 0.
+Filter applicability per event family: `--from SENDER` applies to NewMessage/MessageEdited/MessageDeleted-adjacent rows that carry a sender, `--chat` applies wherever a chat id is present, and `--in/--out/--pattern` apply only to message rows. When `--in/--out/--pattern` are set, rows that structurally cannot match them (Raw, MessageDeleted, ChatAction, UserUpdate, CallbackQuery) are suppressed rather than bypassing the filter; `--from` and `--chat` still apply to ChatAction/UserUpdate/CallbackQuery rows. This keeps `--pattern ERROR` from drowning in typing-indicator rows while keeping `--from @bob` working on actions. Finite streams: `--timeout-secs S` bounds the whole run, `--count N` exits after N emitted event rows (all accounts combined), and `--until <RFC3339|unix-ts|YYYY-MM-DD>` exits after the first event at/after that timestamp - each prints a stderr info line and exits 0. `--until` compares against the event's own date: message rows carry an RFC3339 `date`, Raw and Gap rows carry `state.date` (epoch seconds). A past `--until` therefore replays the backlog dated before it and stops at the first event at/after it, instead of expiring before the first row. Rows that carry no date at all (ChatAction, UserUpdate, CallbackQuery, MessageDeleted) can never match a date filter and never stop the run - use `--timeout-secs` to bound those. A date stop ends every account task, not just the one that crossed the boundary. When the stream stops, pending album members are flushed as an `Album` row rather than dropped.
 
 ```json
 {"event":"NewMessage","account":"work","id":123,"chat_id":456,"text":"...","date":"2026-08-13T12:00:00+00:00"}
@@ -561,9 +561,9 @@ Destructive ops refuse to execute until the driver proves intent. Submitting one
 {"type":"response","id":21,"ok":false,"error":{"type":"ConfirmRequired","message":"op msg delete is destructive and requires confirm:true","would":{"dry_run":true,"ids":[],"self_only":false,"would":"delete all messages in chat @game"}}}
 ```
 
-- The destructive set today: `chat kick`, `chat leave`, `contact remove`, `dialog delete`,
-  `msg delete`, `raw`, `sticker remove`, `story delete`, `topic delete` — the `raw` registry is
-  gated as a whole because individual registry entries include mutating methods.
+- The destructive set today: `cache clear`, `chat kick`, `chat leave`, `contact remove`,
+  `dialog delete`, `msg delete`, `raw`, `sticker remove`, `story delete`, `topic delete` — the
+  `raw` registry is gated as a whole because individual registry entries include mutating methods.
 - Resubmit the same params plus `"confirm":true` to proceed. `"confirm":false` does not unlock the gate.
 - The gate applies even to `"dry_run":true` submissions of destructive ops.
 - Once accepted, the `confirm` key is stripped before params parsing (it never trips `deny_unknown_fields`). Non-destructive ops strip a stray `confirm` the same way; sending `confirm` inside `params` without passing the gate is an unknown-field `ServeError`.
@@ -612,7 +612,7 @@ Lane `mutate` is the ordered lane; `read` is the concurrent lane. The hints colu
 | `cache sync` | sync recent messages from a chat into the local cache | mutate | 120s | |
 | `cache search` | search the local message cache offline | read | 30s | read_only |
 | `cache stats` | show local cache statistics | read | 30s | read_only |
-| `cache clear` | clear the local message cache | mutate | 30s | |
+| `cache clear` | clear the local message cache | mutate | 30s | destructive |
 
 `msg` group:
 

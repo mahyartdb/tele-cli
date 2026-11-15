@@ -387,7 +387,7 @@ pub(crate) fn cache_serve_routes() -> Vec<crate::commands::serve::OpRoute> {
             Lane::Mutate,
             Some(OP_TIMEOUT_SIMPLE),
             false,
-            false,
+            true,
             true,
             "clear the local message cache",
             ClearParams,

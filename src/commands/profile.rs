@@ -147,7 +147,10 @@ fn validate_set(args: &SetArgs) -> TeleResult<()> {
     }
     if let Some(bio) = &args.bio {
         let trimmed = bio.trim();
-        if trimmed.chars().count() > MAX_BIO_CHARS {
+        // Telegram caps bio in UTF-16 units (same basis as the name fields
+        // above); an emoji-heavy bio measured in chars would pass here and
+        // fail server-side with a raw ABOUT_TOO_LONG instead of clean Usage.
+        if trimmed.encode_utf16().count() > MAX_BIO_CHARS {
             return Err(TeleError::Usage("bio exceeds 70 characters".to_string()));
         }
     }

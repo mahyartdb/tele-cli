@@ -3236,7 +3236,7 @@ mod tests {
             ("account status", true, false, true),
             ("account ttl get", true, false, true),
             ("account ttl set", false, false, true),
-            ("cache clear", false, false, true),
+            ("cache clear", false, true, true),
             ("cache search", true, false, true),
             ("cache stats", true, false, true),
             ("cache sync", false, false, true),
@@ -3279,6 +3279,7 @@ mod tests {
                 "sticker remove",
                 "story delete",
                 "topic delete",
+                "cache clear",
                 "chat kick",
                 "chat leave"
             ]
