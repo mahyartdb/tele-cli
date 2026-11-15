@@ -277,25 +277,43 @@ use tools/list to see the {visible} available tele tools"
                 // Mutating ops run one at a time: rmcp answers requests
                 // concurrently, and two overlapping read-modify-write ops
                 // (privacy set, for one) would lose one of the writes.
-                let mutate_guard = match exec.lane {
-                    Lane::Mutate => Some(self.mutate_gate.lock().await),
+                // The gate is taken INSIDE the timeout, so waiting for the
+                // previous mutation counts against this call's budget
+                // instead of queueing behind it unnoticed.
+                let gate = match exec.lane {
+                    Lane::Mutate => Some(Arc::clone(&self.mutate_gate)),
                     Lane::Read => None,
                 };
                 let outcome = match exec.timeout {
-                    Some(limit) => match tokio::time::timeout(limit, future).await {
-                        Ok(outcome) => outcome,
-                        Err(_) => {
-                            let mut err = err_json(
-                                "Timeout",
-                                format!("op {} timed out after {limit:?}", meta.op),
-                            );
-                            err["may_have_executed"] = serde_json::Value::from(true);
-                            Err(err)
+                    Some(limit) => {
+                        match tokio::time::timeout(limit, async move {
+                            let _guard = match &gate {
+                                Some(gate) => Some(gate.lock().await),
+                                None => None,
+                            };
+                            future.await
+                        })
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(_) => {
+                                let mut err = err_json(
+                                    "Timeout",
+                                    format!("op {} timed out after {limit:?}", meta.op),
+                                );
+                                err["may_have_executed"] = serde_json::Value::from(true);
+                                Err(err)
+                            }
                         }
-                    },
-                    None => future.await,
+                    }
+                    None => {
+                        let _guard = match &gate {
+                            Some(gate) => Some(gate.lock().await),
+                            None => None,
+                        };
+                        future.await
+                    }
                 };
-                drop(mutate_guard);
                 match outcome {
                     Ok(data) => Ok(text_result(data, false)),
                     Err(env) => Ok(text_result(env, true)),
