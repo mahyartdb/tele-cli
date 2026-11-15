@@ -6,7 +6,7 @@ use clap::Parser;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, JsonObject, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, Resource, ResourceContents,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, Resource, ResourceContents,
     ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
@@ -219,6 +219,13 @@ Destructive tools carry annotations.destructiveHint=true: the first call rejects
                 .enable_resources()
                 .build(),
         )
+        // Pin the advertised protocol version. The default is rmcp's
+        // LATEST, which moved to 2026-07-28 — the SEP-2567 revision that
+        // replaced the initialize handshake with per-request _meta. tele
+        // answers the initialize handshake, so it must name the newest
+        // version that still has one; otherwise a client that trusts the
+        // advertised version talks a protocol the server does not speak.
+        .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
         .with_server_info(Implementation::new("tele", env!("CARGO_PKG_VERSION")))
         .with_instructions(instructions)
     }
@@ -1008,6 +1015,29 @@ mod tests {
         let full = rt.block_on(offline_handler(false, None));
         let instructions = full.info().instructions.unwrap();
         assert!(!instructions.contains("read-only"), "{instructions}");
+    }
+
+    #[test]
+    fn advertised_protocol_version_still_has_an_initialize_handshake() {
+        // The server answers the initialize handshake, so it must not
+        // advertise a protocol version that dropped the handshake
+        // (SEP-2567, rmcp's ProtocolVersion::LATEST as of 3.10).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handler = rt.block_on(offline_handler(true, None));
+        let info = handler.info();
+        assert!(
+            info.protocol_version.has_initialize(),
+            "advertised protocol version {} has no initialize handshake",
+            info.protocol_version
+        );
+        assert_eq!(
+            info.protocol_version,
+            ProtocolVersion::LATEST_WITH_INITIALIZE,
+            "the advertised version must stay pinned"
+        );
     }
 
     #[test]
