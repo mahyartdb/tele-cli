@@ -28,7 +28,10 @@ pub struct StartArgs {
     contacts: bool,
     #[arg(long, help = "include messages in export")]
     messages: bool,
-    #[arg(long, help = "include photos in export")]
+    #[arg(
+        long,
+        help = "ask the server to include files in the takeout session (the export itself writes contacts, dialogs and messages only -- media files are not downloaded)"
+    )]
     photos: bool,
 }
 
@@ -88,6 +91,15 @@ async fn start(args: StartArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         Box::pin(async move {
             if dry_run {
                 return Ok(start_dry_run_payload(contacts, messages, photos));
+            }
+            if photos {
+                // The flag asks the server for files, but the export writes
+                // contacts, dialogs and messages only -- saying so beats a
+                // silent no-op that leaves the user waiting for photos.
+                output::log_line(
+                    "warn",
+                    "takeout --photos asks the server for files, but the export writes contacts.json, dialogs.json and messages.jsonl only; media files are not downloaded (use `tele msg download` for media)",
+                );
             }
             let dir = export_dir(&name)?;
             let init = async {

@@ -1062,6 +1062,8 @@ tele takeout finish [--abandon]
 
 All three subcommands require explicit account selection. Per-account export artifacts live under `<app data>/export/<account>/`: `contacts.json`, `messages.jsonl`, `dialogs.json`, and the state file `takeout.json`. `--redact-phones` replaces every `phone` value in `contacts.json` with `"[REDACTED]"`.
 
+`--photos` asks the server to include files in the takeout session, but the export writes `contacts.json`, `dialogs.json` and `messages.jsonl` only — media files are not downloaded, and the command warns about it on stderr. Use `tele msg download` for media.
+
 `takeout start` requires at least one scope flag (`--contacts`, `--messages`, or `--photos`); with no flag it exits 1 with a Usage error before connect.
 
 **Progress (human TTY mode):** without `--json`/`--jsonl` and with stderr attached to a terminal, export reports each dialogs page (`dialogs page 2: +100 dialogs`) and each history page (`dialog 3/57 Alice msgs=120`, style `dialog i/N <name> msgs=<n>`) on stderr through the standard log line channel. Stdout stays empty until the final envelope. Machine mode emits no progress lines, and neither does a non-terminal stderr (piped or redirected CI logs stay silent); `-q` silences progress through the usual `[error]`-only floor.
