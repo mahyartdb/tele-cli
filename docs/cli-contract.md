@@ -590,6 +590,8 @@ Any routed op accepts `"dry_run":true` in its params. The request is validated a
 
 Intake is bounded end to end: a 64-line stdin queue and 64-job op queues. A slow consumer stalls the pipeline instead of growing memory without bound. Read stdout continuously.
 
+The account-to-main event hop is bounded too (256 slots) and its wait is capped at 30 seconds: grammers hands the client an *unbounded* update channel, so an account task that parked on the send forever would let that channel grow without limit. When the wait expires the event is dropped, a stderr line counts the drops, and the count rides along with the next event as a `Gap` row (`"reason":"consumer_stalled"`, `"dropped":N`) so the driver sees the gap on the wire instead of a silent hole.
+
 ### Op table (93 routes)
 
 Lane `mutate` is the ordered lane; `read` is the concurrent lane. The hints column lists only non-default flags: `read_only` performs no state change, `destructive` sits behind the confirm gate, and `retry_unsafe` means a blind retry can duplicate an effect. An absent hint means mutating, non-destructive, or retry-safe respectively. Recount the routes with `rg -c 'serve_route!\(' src/`.

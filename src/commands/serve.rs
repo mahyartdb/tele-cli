@@ -90,6 +90,9 @@ enum AccountTick {
     },
     Event {
         ev: serde_json::Value,
+        /// Events dropped because the consumer stalled past the send
+        /// budget. Carried with the next event so the loss is visible.
+        dropped: u32,
     },
     Fatal {
         err: TeleError,
@@ -98,6 +101,15 @@ enum AccountTick {
 
 pub(crate) const OP_TIMEOUT_SIMPLE: Duration = Duration::from_secs(30);
 pub(crate) const OP_TIMEOUT_PAGINATED: Duration = Duration::from_secs(120);
+
+/// How long an account task waits for the main loop to accept an event.
+///
+/// The wait is bounded because grammers hands the client an unbounded
+/// update channel: parking on the send forever would let that channel
+/// grow without limit while the consumer (a slow stdout reader) is
+/// stuck. Past this budget the event is dropped and counted, and the
+/// count rides along with the next event so the driver can see the gap.
+const ACCOUNT_TICK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) type CappedDedupe<K> = crate::capped_map::CappedMap<K, ()>;
 pub(crate) type ServeDedupe = CappedDedupe<(String, i64, i32, i32)>;
@@ -1549,7 +1561,22 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     Err(e) => return Err(e),
                 }
             }
-            Tick::Account(AccountTick::Event { mut ev }) => {
+            Tick::Account(AccountTick::Event { mut ev, dropped }) => {
+                if dropped > 0 {
+                    // The account could not hand over events while the
+                    // consumer was stalled; say so on the wire instead of
+                    // letting the gap pass unnoticed.
+                    let account = ev
+                        .get("account")
+                        .and_then(|a| a.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let mut gap = event_row("Gap", &account, None, None, None);
+                    gap["reason"] = serde_json::json!("consumer_stalled");
+                    gap["dropped"] = serde_json::json!(dropped);
+                    apply_seq(&mut gap, &mut seq);
+                    let _ = writer.emit(&gap).await;
+                }
                 apply_seq(&mut ev, &mut seq);
                 let mut emitted = false;
                 for _ in 0..2 {
@@ -1596,6 +1623,7 @@ async fn account_task(
     let initial_catch_up = catch_up;
     let mut resync_rx = resync_rx;
     let mut failures: u32 = 0;
+    let mut dropped: u32 = 0;
     let mut greeted = false;
     let mut dedupe = ServeDedupe::new(SERVE_DEDUPE_CAP);
     let mut resync_requested = false;
@@ -1803,8 +1831,31 @@ async fn account_task(
                         }
                     };
                     let ev = event_row(kind, &name, chat_id, None, Some(row));
-                    if ticks.send(AccountTick::Event { ev }).await.is_err() {
-                        return;
+                    // The hop to the main loop is bounded, but grammers
+                    // hands us an UNBOUNDED update channel: parking here
+                    // forever would let it grow without limit while the
+                    // consumer is stuck. So the send is bounded, and an
+                    // event that cannot be handed over in time is dropped
+                    // and counted instead of stalling the account.
+                    match tokio::time::timeout(
+                        ACCOUNT_TICK_SEND_TIMEOUT,
+                        ticks.send(AccountTick::Event { ev, dropped }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => dropped = 0,
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            dropped += 1;
+                            output::log_line(
+                                "warn",
+                                &format!(
+                                    "serve: account {name} dropped {dropped} event(s): the consumer stalled for {}s",
+                                    ACCOUNT_TICK_SEND_TIMEOUT.as_secs()
+                                ),
+                            );
+                            continue;
+                        }
                     }
                 }
             }
@@ -1817,6 +1868,33 @@ async fn account_task(
 mod tests {
     use super::*;
     use grammers_session::Session;
+
+    #[tokio::test]
+    async fn account_tick_send_is_bounded_so_the_update_channel_cannot_grow_without_limit() {
+        // grammers hands the client an unbounded update channel, so the
+        // account task must not park on the send forever: an event that
+        // cannot be handed over within the budget is dropped and counted.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AccountTick>(1);
+        tx.send(AccountTick::Event {
+            ev: serde_json::json!({"event": "NewMessage"}),
+            dropped: 0,
+        })
+        .await
+        .unwrap();
+        let stalled = tokio::time::timeout(
+            ACCOUNT_TICK_SEND_TIMEOUT,
+            tx.send(AccountTick::Event {
+                ev: serde_json::json!({"event": "NewMessage"}),
+                dropped: 0,
+            }),
+        )
+        .await;
+        assert!(stalled.is_err(), "the send must not wait forever");
+        // The queued event is still there, so the account task would
+        // carry its drop count forward with the next one.
+        let first = rx.recv().await.unwrap();
+        assert!(matches!(first, AccountTick::Event { dropped: 0, .. }));
+    }
 
     #[test]
     fn hello_roundtrip_parses_protocol() {
