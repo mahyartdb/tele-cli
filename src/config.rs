@@ -818,7 +818,8 @@ fn acquire_config_lock(cfg_path: &std::path::Path) -> TeleResult<ConfigLockGuard
 /// `write_config` merges `[accounts]` into the existing document so
 /// comments and unknown keys survive. A change to a top-level key
 /// (`parallel_max`, `flood_sleep_threshold`, `proxy`) is therefore not
-/// written back.
+/// written back, and the helper rejects such a change instead of
+/// reporting a silent success.
 pub fn update_config(
     path: Option<&std::path::Path>,
     apply: impl FnOnce(&mut AppConfig) -> TeleResult<()>,
@@ -832,7 +833,24 @@ pub fn update_config(
     // process wrote in between.
     let _lock = acquire_config_lock(&cfg_path)?;
     let mut cfg = read_config(&cfg_path).map_err(|e| TeleError::Config(format!("{e:#}")))?;
+    let before = (
+        cfg.parallel_max,
+        cfg.flood_sleep_threshold,
+        cfg.proxy.is_some(),
+    );
     apply(&mut cfg)?;
+    let after = (
+        cfg.parallel_max,
+        cfg.flood_sleep_threshold,
+        cfg.proxy.is_some(),
+    );
+    if before != after {
+        return Err(TeleError::Other(
+            "config update changed a top-level key, which is not persisted; \
+             only the accounts table can be written this way"
+                .to_string(),
+        ));
+    }
     write_config(&cfg_path, &cfg)
         .map_err(|e| TeleError::Other(format!("failed to write config: {e:#}")))?;
     Ok(())
