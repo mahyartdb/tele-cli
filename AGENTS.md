@@ -9,7 +9,7 @@
 - **Async:** tokio (rt-multi-thread, macros, sync, time, io-std)
 - **Serialization:** serde + serde_json, toml 0.8
 - **Output:** comfy-table 7 (human), JSON/JSONL (machine)
-- **Other:** chrono, base64, qrcode, log (env-gated), rmcp 3.1 (MCP stdio, schemars 1.2 via re-export)
+- **Other:** chrono, base64, qrcode, log (env-gated), rmcp 3.10 (MCP stdio, schemars 1.2 via re-export)
 
 ## Context hierarchy
 
@@ -79,7 +79,7 @@ src/
 ├── serialize.rs         message_to_json(), peer_key(), media_name()
 ├── session.rs           FileSession (SQLite) per named account
 ├── logging.rs           stderr-only structured logging
-├── fs_util.rs           Permission helpers (create_dir_private, restrict_file_private); sensitive-file detection lives in msg.rs validate_upload_path()
+├── fs_util.rs           Permission helpers (create_dir_private, restrict_file_private); sensitive-file detection lives in msg/validate.rs validate_upload_path()
 ├── rate_limiter.rs      Per-account token-bucket RPC rate limiter
 ├── cache_db.rs          Per-account SQLite message cache (FTS5)
 ├── capped_map.rs        Bounded LRU-ish dedupe map shared by serve/listen
@@ -90,7 +90,7 @@ src/
     ├── cache.rs     cache sync/search/stats/clear (local FTS5 cache)
     ├── chat/        mod.rs, admin_log.rs, invite.rs, participants.rs, settings.rs, tests.rs (join, create, leave, participants, kick, admin, admin-log, stats, invite, requests, settings, edit, link)
     ├── dialog.rs        list, drafts, draft, archive/unarchive, delete, pin, folders, folder-create, folder-delete, folder-reorder
-    ├── msg/         mod.rs, params.rs, send.rs, download.rs, validate.rs, tests.rs (send incl. scheduled, get, edit, delete, forward, search, react, download, read, pin, vote, typing, click)
+    ├── msg/         mod.rs, params.rs, send.rs, download.rs, poll.rs, translate.rs, validate.rs, tests.rs (send incl. scheduled, get, edit, delete, forward, search, react, download, read, pin, vote, poll-*, translate, typing, click)
     ├── topic.rs         list, create, close, reopen, edit, delete, pin
     ├── contact.rs       list, add, remove, block, unblock
     ├── profile.rs       get, set (name, bio, photo, username, emoji-status)
@@ -113,15 +113,15 @@ src/
 ```markdown
 # Project Map
 
-## Auth (src/commands/account.rs, src/client.rs, src/session.rs)
+## Auth (src/commands/account/, src/client.rs, src/session.rs)
 Login, 2FA, QR, sessions. Pattern: ClientGuard::connect() owns grammers; commands resolve and print.
-Key files: account.rs, client.rs, session.rs, config.rs
+Key files: account/, client.rs, session.rs, config.rs
 
-## Messaging (src/commands/msg.rs, src/serialize.rs)
+## Messaging (src/commands/msg/, src/serialize.rs)
 Send/edit/delete/forward/search/react/download/read/pin/vote/typing/click + media handling.
-Pattern: SendParams + deny_unknown_fields + would payload (msg.rs:348)
+Pattern: SendParams + deny_unknown_fields + would payload (msg/params.rs)
 
-## Chats & Forums (src/commands/chat.rs, src/commands/topic.rs, src/entities.rs)
+## Chats & Forums (src/commands/chat/, src/commands/topic.rs, src/entities.rs)
 Join/create/leave/participants/kick/admin/admin-log/stats/invite/requests/settings/edit/link + forum topics. Pattern: peer resolution before numeric parse.
 
 ## Dialogs & Contacts (src/commands/dialog.rs, src/commands/contact.rs)
@@ -154,7 +154,7 @@ Errors, envelopes, fan-out, permissions. Pattern: TeleError enum, Envelope, run_
 One short example of this codebase's style:
 
 ```rust
-// src/commands/msg.rs:348 — SendParams + deny_unknown_fields + would payload
+// src/commands/msg/params.rs — SendParams + deny_unknown_fields + would payload
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendParams {
@@ -205,7 +205,7 @@ When a spec row conflicts with existing code, do not guess. Surface it:
 
 ```
 CONFLICT:
-docs/capabilities.md says REST for messages, but src/commands/msg.rs uses
+docs/capabilities.md says REST for messages, but src/commands/msg/ uses
 raw TL without a friendly wrapper.
 Options:
 A) Follow the spec — add the friendly method
