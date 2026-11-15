@@ -230,6 +230,11 @@ pub struct DeleteArgs {
         help = "delete only for yourself (no revoke; private chats and basic groups only, not channels)"
     )]
     pub(crate) self_only: bool,
+    #[arg(
+        long,
+        help = "also delete for the other side (revoke); private chats and basic groups only, not channels"
+    )]
+    pub(crate) revoke: bool,
 }
 
 #[derive(Args, Clone)]
@@ -732,6 +737,8 @@ pub(crate) struct DeleteParams {
     #[serde(default)]
     pub(crate) self_only: bool,
     #[serde(default)]
+    pub(crate) revoke: bool,
+    #[serde(default)]
     pub(crate) dry_run: bool,
 }
 
@@ -742,6 +749,7 @@ impl From<&DeleteArgs> for DeleteParams {
             ids: a.ids.clone(),
             all: a.all,
             self_only: a.self_only,
+            revoke: a.revoke,
             dry_run: false,
         }
     }
@@ -754,6 +762,7 @@ impl From<&DeleteParams> for DeleteArgs {
             ids: p.ids.clone(),
             all: p.all,
             self_only: p.self_only,
+            revoke: p.revoke,
         }
     }
 }

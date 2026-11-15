@@ -561,6 +561,7 @@ fn delete_requires_ids_unless_all() {
         ids: Vec::new(),
         all: false,
         self_only: false,
+        revoke: false,
     };
     assert!(matches!(validate_delete(&args), Err(TeleError::Usage(_))));
     let mut with_all = args;
@@ -571,6 +572,7 @@ fn delete_requires_ids_unless_all() {
         ids: vec![1, 2],
         all: false,
         self_only: false,
+        revoke: false,
     };
     assert!(validate_delete(&with_ids).is_ok());
 }
@@ -582,6 +584,7 @@ fn delete_rejects_all_with_ids() {
         ids: vec![1, 2],
         all: true,
         self_only: false,
+        revoke: false,
     };
     assert!(matches!(validate_delete(&args), Err(TeleError::Usage(_))));
 }
@@ -613,6 +616,7 @@ fn validate_delete_rejects_self_only_with_all() {
         ids: Vec::new(),
         all: true,
         self_only: true,
+        revoke: false,
     };
     assert!(matches!(validate_delete(&args), Err(TeleError::Usage(_))));
     let with_ids = DeleteArgs {
@@ -620,8 +624,45 @@ fn validate_delete_rejects_self_only_with_all() {
         ids: vec![1],
         all: false,
         self_only: true,
+        revoke: false,
     };
     assert!(validate_delete(&with_ids).is_ok());
+}
+
+#[test]
+fn validate_delete_rejects_self_only_with_revoke() {
+    let args = DeleteArgs {
+        chat: crate::chat_target::ChatTarget::new_unchecked("me".to_string()),
+        ids: vec![1],
+        all: false,
+        self_only: true,
+        revoke: true,
+    };
+    assert!(matches!(validate_delete(&args), Err(TeleError::Usage(_))));
+}
+
+#[test]
+fn delete_dry_run_states_the_delete_scope() {
+    let mut args = DeleteArgs {
+        chat: crate::chat_target::ChatTarget::new_unchecked("me".to_string()),
+        ids: Vec::new(),
+        all: true,
+        self_only: false,
+        revoke: false,
+    };
+    let own = delete_serve_dry_run(&args).unwrap();
+    assert!(
+        own["would"].as_str().unwrap().contains("for yourself"),
+        "would: {own}"
+    );
+    assert_eq!(own["revoke"], serde_json::json!(false));
+    args.revoke = true;
+    let both = delete_serve_dry_run(&args).unwrap();
+    assert!(
+        both["would"].as_str().unwrap().contains("for both sides"),
+        "would: {both}"
+    );
+    assert_eq!(both["revoke"], serde_json::json!(true));
 }
 
 #[test]
@@ -961,6 +1002,7 @@ fn non_get_commands_reject_deep_link_message_ids() {
         ids: vec![1],
         all: false,
         self_only: false,
+        revoke: false,
     };
     assert!(matches!(validate_delete(&delete), Err(TeleError::Usage(_))));
 
@@ -1101,6 +1143,7 @@ fn msg_validators_reject_empty_or_whitespace_chat() {
             ids: vec![1],
             all: false,
             self_only: false,
+            revoke: false,
         };
         assert!(
             matches!(validate_delete(&delete), Err(TeleError::Usage(_))),
@@ -5266,6 +5309,7 @@ fn validate_delete_rejects_nonpositive_ids() {
         ids: vec![3],
         all: false,
         self_only: false,
+        revoke: false,
     };
     assert!(validate_delete(&base).is_ok());
     for bad in [vec![0], vec![-4], vec![3, 0]] {
@@ -5281,6 +5325,7 @@ fn validate_delete_rejects_nonpositive_ids() {
         ids: vec![-1],
         all: false,
         self_only: false,
+        revoke: false,
         dry_run: false,
     };
     assert!(matches!(
@@ -5749,6 +5794,7 @@ fn delete_dry_run_carries_chat() {
         ids: vec![1, 2],
         all: false,
         self_only: false,
+        revoke: false,
     };
     let value = delete_serve_dry_run(&args).unwrap();
     assert_eq!(value["dry_run"], serde_json::json!(true));

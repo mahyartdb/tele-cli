@@ -274,7 +274,9 @@ Rows gain additive `"username"` (a string, empty when none). The human table app
 
 ## `msg delete`
 
-`results[].data` carries `requested` (how many ids you asked to delete) and `deleted` (how many the server actually removed). When `deleted < requested` (already-deleted ids, other people's messages, or missing permission), the row also carries `"partial": true` and the process exits 2. `--self-only` deletes only for yourself (private chats and basic groups; rejected for channels) via `messages.deleteMessages { revoke: false }`. It is mutually exclusive with `--all`.
+`results[].data` carries `requested` (how many ids you asked to delete) and `deleted` (how many the server actually removed). When `deleted < requested` (already-deleted ids, other people's messages, or missing permission), the row also carries `"partial": true` and the process exits 2. `--self-only` deletes only for yourself (private chats and basic groups; rejected for channels) via `messages.deleteMessages { revoke: false }`. It is mutually exclusive with `--all` and with `--revoke`.
+
+In private chats and basic groups the delete scope is explicit: without `--revoke` the deletion applies to your copy only (`revoke: false`), with `--revoke` it also removes the message for the other side (`revoke: true`). `--revoke` is mutually exclusive with `--self-only`. Channels ignore both flags — channel deletes use `channels.deleteMessages`, which has no revoke variant. The dry-run payload states the scope (`"revoke": true|false` and a `would` ending in "for yourself" or "for both sides"), and `results[].data` carries the same `revoke` flag.
 
 ## `msg click`
 

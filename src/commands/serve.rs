@@ -2531,7 +2531,10 @@ mod tests {
         let Plan::DryRun(data) = plan else {
             panic!("expected dry run plan");
         };
-        assert_eq!(data["would"], "delete all messages in chat @game");
+        assert_eq!(
+            data["would"],
+            "delete all messages in chat @game for yourself"
+        );
         assert_eq!(data["self_only"], false);
 
         let plan = plan_for(
@@ -3424,7 +3427,10 @@ mod tests {
             other => panic!("expected dry run plan, got {other:?}"),
         };
         assert_eq!(err["would"], dry_via_planner);
-        assert_eq!(err["would"]["would"], "delete all messages in chat @game");
+        assert_eq!(
+            err["would"]["would"],
+            "delete all messages in chat @game for yourself"
+        );
     }
 
     #[test]

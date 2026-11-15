@@ -293,6 +293,11 @@ pub(crate) fn validate_delete(args: &DeleteArgs) -> TeleResult<()> {
             "--all and --self-only are mutually exclusive".to_string(),
         ));
     }
+    if args.self_only && args.revoke {
+        return Err(TeleError::Usage(
+            "--self-only and --revoke are mutually exclusive".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -310,15 +315,21 @@ fn delete_report(requested: usize, deleted: usize) -> (serde_json::Value, bool) 
 }
 
 pub(crate) fn delete_serve_dry_run(args: &DeleteArgs) -> TeleResult<serde_json::Value> {
+    let scope = if args.revoke {
+        "for both sides"
+    } else {
+        "for yourself"
+    };
     Ok(serde_json::json!({
     "dry_run": true,
     "chat": args.chat,
     "ids": args.ids,
     "self_only": args.self_only,
+    "revoke": args.revoke,
     "would": if args.all {
-        format!("delete all messages in chat {}", args.chat)
+        format!("delete all messages in chat {} {scope}", args.chat)
     } else {
-        format!("delete {} message(s) by id", args.ids.len())
+        format!("delete {} message(s) by id {scope}", args.ids.len())
     }}))
 }
 
@@ -353,9 +364,11 @@ pub(crate) async fn delete_core(
     let all = params.all;
     let ids = params.ids;
     let self_only = params.self_only;
+    let revoke = params.revoke;
     let chat =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.chat).await?;
     let chat_ref = entities::peer_ref(&chat).await.map_err(tele_invocation)?;
+    let is_channel = chat.id().kind() == grammers_session::types::PeerKind::Channel;
     if all {
         let mut iter = shares.client.iter_messages(chat_ref);
         let mut count = 0usize;
@@ -365,21 +378,13 @@ pub(crate) async fn delete_core(
             requested += 1;
             batch.push(msg.id());
             if batch.len() >= 100 {
-                let deleted = shares
-                    .client
-                    .delete_messages(chat_ref, &batch)
-                    .await
-                    .map_err(tele_invocation)?;
+                let deleted = delete_batch(shares, chat_ref, &batch, is_channel, revoke).await?;
                 count += deleted;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            let deleted = shares
-                .client
-                .delete_messages(chat_ref, &batch)
-                .await
-                .map_err(tele_invocation)?;
+            let deleted = delete_batch(shares, chat_ref, &batch, is_channel, revoke).await?;
             count += deleted;
         }
         let (mut report, partial) = delete_report(requested, count);
@@ -400,28 +405,11 @@ pub(crate) async fn delete_core(
             ));
         }
         for chunk in batches(&ids) {
-            let affected = shares
-                .client
-                .invoke(&grammers_client::tl::functions::messages::DeleteMessages {
-                    revoke: false,
-                    id: chunk.to_vec(),
-                })
-                .await
-                .map_err(tele_invocation)?;
-            count += match affected {
-                grammers_client::tl::enums::messages::AffectedMessages::Messages(m) => {
-                    m.pts_count.max(0) as usize
-                }
-            };
+            count += delete_batch(shares, chat_ref, chunk, is_channel, false).await?;
         }
     } else {
         for chunk in batches(&ids) {
-            let deleted = shares
-                .client
-                .delete_messages(chat_ref, chunk)
-                .await
-                .map_err(tele_invocation)?;
-            count += deleted;
+            count += delete_batch(shares, chat_ref, chunk, is_channel, revoke).await?;
         }
     }
     let (report, partial) = delete_report(ids.len(), count);
@@ -431,7 +419,46 @@ pub(crate) async fn delete_core(
             &format!("delete removed {count} of {} requested id(s)", ids.len()),
         );
     }
+    let mut report = report;
+    report["revoke"] = serde_json::json!(revoke && !self_only);
     Ok(report)
+}
+
+/// Delete a batch of messages.
+///
+/// `revoke` decides whether the other side loses the message too. The
+/// friendly `delete_messages` wrapper hardcodes `revoke: true` for every
+/// non-channel peer, so a bulk delete in a private chat wiped the
+/// conversation for both participants. The raw request is used instead so
+/// revoking has to be asked for explicitly.
+async fn delete_batch(
+    shares: &crate::client::ServeShares,
+    chat_ref: grammers_session::types::PeerRef,
+    ids: &[i32],
+    is_channel: bool,
+    revoke: bool,
+) -> TeleResult<usize> {
+    if is_channel {
+        let deleted = shares
+            .client
+            .delete_messages(chat_ref, ids)
+            .await
+            .map_err(tele_invocation)?;
+        return Ok(deleted);
+    }
+    let affected = shares
+        .client
+        .invoke(&grammers_client::tl::functions::messages::DeleteMessages {
+            revoke,
+            id: ids.to_vec(),
+        })
+        .await
+        .map_err(tele_invocation)?;
+    Ok(match affected {
+        grammers_client::tl::enums::messages::AffectedMessages::Messages(m) => {
+            m.pts_count.max(0) as usize
+        }
+    })
 }
 
 pub(crate) fn validate_forward(args: &ForwardArgs) -> TeleResult<()> {
