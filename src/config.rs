@@ -359,12 +359,6 @@ fn overlay_process_env(
 
 pub fn credentials() -> anyhow::Result<Credentials> {
     let path = app_data_dir_checked()?.join(".env");
-    if path.exists() {
-        crate::fs_util::restrict_file_private(&path)
-            .map_err(|e| credentials_tighten_error(&path, &e))?;
-    } else {
-        let _ = crate::fs_util::create_file_private(&path);
-    }
     let stamp = FileStamp::of(&path);
     let overlay = env_overlay_key();
     if let Some(creds) = CREDS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&(
@@ -373,6 +367,15 @@ pub fn credentials() -> anyhow::Result<Credentials> {
         overlay.clone(),
     )) {
         return Ok(creds.clone());
+    }
+    // Tightening runs only on a cache miss, so a process pays for it once per
+    // .env state instead of once per call. A failure still fails closed before
+    // any credential is parsed.
+    if stamp.exists {
+        crate::fs_util::restrict_file_private(&path)
+            .map_err(|e| credentials_tighten_error(&path, &e))?;
+    } else {
+        let _ = crate::fs_util::create_file_private(&path);
     }
     let mut env = load_env(&path);
     overlay_process_env(&mut env, std::env::vars_os());
@@ -1683,6 +1686,38 @@ mod tests {
         credentials().unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn credentials_tightens_env_once_per_process() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = creds_env_dir("creds-tighten-once");
+        let path = dir.join(".env");
+        std::fs::write(&path, "TELE_API_ID=6\nTELE_API_HASH=eeee\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let before = crate::fs_util::permission_write_count(&path);
+        credentials().unwrap();
+        let tightened = crate::fs_util::permission_write_count(&path);
+        assert_eq!(
+            tightened,
+            before + 1,
+            "the first call must tighten the credentials file"
+        );
+        credentials().unwrap();
+        assert_eq!(
+            crate::fs_util::permission_write_count(&path),
+            tightened,
+            "a credential cache hit must not rewrite the .env ACL"
+        );
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

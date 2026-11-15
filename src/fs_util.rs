@@ -182,61 +182,224 @@ pub fn restrict_file_private(path: &Path) -> std::io::Result<()> {
     set_user_only_dacl(path, false)
 }
 
+#[cfg(test)]
+static PERMISSION_WRITES: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_permission_write(path: &Path) {
+    PERMISSION_WRITES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn permission_write_count(path: &Path) -> usize {
+    PERMISSION_WRITES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|written| written.as_path() == path)
+        .count()
+}
+
 #[cfg(windows)]
-fn set_user_only_dacl(path: &Path, inheritable: bool) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::{PCWSTR, PWSTR};
-    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
-    use windows::Win32::Security::Authorization::{
-        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
-        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
-    };
+fn current_user_sid() -> std::io::Result<&'static [u8]> {
+    static SID: std::sync::OnceLock<Result<Vec<u8>, String>> = std::sync::OnceLock::new();
+    match SID.get_or_init(read_current_user_sid) {
+        Ok(bytes) => Ok(bytes.as_slice()),
+        Err(message) => Err(std::io::Error::other(message.clone())),
+    }
+}
+
+#[cfg(windows)]
+fn read_current_user_sid() -> Result<Vec<u8>, String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        GetTokenInformation, TokenUser, ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
-        TOKEN_QUERY, TOKEN_USER,
+        GetLengthSid, GetTokenInformation, TokenUser, PSID, TOKEN_QUERY, TOKEN_USER,
     };
-    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     // SAFETY: `token` comes from OpenProcessToken and is closed on every
     // return path; `buffer` is sized from the API's own size query and its
     // pointer plus length are passed together so GetTokenInformation cannot
     // overrun it; `read_unaligned` reads a TOKEN_USER the API just wrote
-    // without assuming buffer alignment; `user_sid` borrows `buffer`, which
-    // outlives its use in SetEntriesInAclW; `new_acl` allocated by
-    // SetEntriesInAclW is freed exactly once via LocalFree when non-null;
-    // `path_wide` is NUL-terminated and alive for the SetNamedSecurityInfoW
-    // call.
+    // without assuming buffer alignment; the SID bytes are copied out of the
+    // buffer before either the buffer or the token is released, so the cached
+    // copy is self-contained.
     unsafe {
         let mut token = HANDLE::default();
         if let Err(e) = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) {
-            return Err(std::io::Error::other(e.to_string()));
+            return Err(e.to_string());
         }
 
         let mut size = 0u32;
         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut size);
         let mut buffer = vec![0u8; size as usize];
-        if let Err(e) = GetTokenInformation(
+        let filled = GetTokenInformation(
             token,
             TokenUser,
             Some(buffer.as_mut_ptr() as *mut _),
             size,
             &mut size,
-        ) {
-            let _ = CloseHandle(token);
-            return Err(std::io::Error::other(e.to_string()));
+        );
+
+        let result = match filled {
+            Err(e) => Err(e.to_string()),
+            Ok(()) => {
+                let token_user = std::ptr::read_unaligned(buffer.as_ptr() as *const TOKEN_USER);
+                let sid = PSID(token_user.User.Sid.0);
+                let len = GetLengthSid(sid) as usize;
+                Ok(std::slice::from_raw_parts(sid.0 as *const u8, len).to_vec())
+            }
+        };
+
+        let _ = CloseHandle(token);
+        result
+    }
+}
+
+#[cfg(windows)]
+fn dacl_is_owner_only(path: &Path, inheritable: bool) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL, WIN32_ERROR};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        GetAce, GetLengthSid, GetSecurityDescriptorControl, IsValidSid, ACCESS_ALLOWED_ACE,
+        ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    // ACCESS_ALLOWED_ACE_TYPE lives in Win32::System::SystemServices, which is
+    // not among this crate's enabled windows features.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+    let owner_sid = current_user_sid()?;
+    let path_wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+
+    // SAFETY: `path_wide` is NUL-terminated and alive for the call; `dacl` and
+    // `descriptor` are out-parameters that the API fills in; the returned
+    // descriptor is freed exactly once below, after the pointers into it are no
+    // longer used.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(path_wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut descriptor,
+        )
+    };
+    if status != WIN32_ERROR(0) {
+        return Err(std::io::Error::other(format!(
+            "GetNamedSecurityInfoW failed: {}",
+            status.0
+        )));
+    }
+
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    let control_known =
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }.is_ok();
+    let mut owner_only = control_known && (control & SE_DACL_PROTECTED.0) != 0 && !dacl.is_null();
+    if owner_only {
+        // SAFETY: `dacl` is non-null and points into `descriptor`.
+        owner_only = unsafe { (*dacl).AceCount } == 1;
+    }
+
+    if owner_only {
+        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the ACE index is within the ACL's AceCount, and the pointer
+        // GetAce returns stays valid until `descriptor` is freed below.
+        if unsafe { GetAce(dacl, 0, &mut ace) }.is_ok() {
+            let header = unsafe { std::ptr::read_unaligned(ace as *const ACE_HEADER) };
+            let allowed = unsafe { std::ptr::read_unaligned(ace as *const ACCESS_ALLOWED_ACE) };
+            let expected_flags = if inheritable {
+                (CONTAINER_INHERIT_ACE.0 | OBJECT_INHERIT_ACE.0) as u8
+            } else {
+                0
+            };
+            let ace_sid = PSID(unsafe {
+                (ace as *const u8).add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+            } as *mut _);
+            // SAFETY: `ace_sid` points at the ACE's own SID; IsValidSid checks
+            // its structure before GetLengthSid and the byte comparison read
+            // exactly the SID length the ACE declares.
+            let sid_matches = if unsafe { IsValidSid(ace_sid) }.as_bool() {
+                let len = unsafe { GetLengthSid(ace_sid) } as usize;
+                len == owner_sid.len()
+                    && unsafe { std::slice::from_raw_parts(ace_sid.0 as *const u8, len) }
+                        == owner_sid
+            } else {
+                false
+            };
+            owner_only = header.AceType == ACCESS_ALLOWED_ACE_TYPE
+                && header.AceFlags == expected_flags
+                && allowed.Mask == FILE_ALL_ACCESS.0
+                && sid_matches;
+        } else {
+            owner_only = false;
         }
+    }
 
-        let token_user = std::ptr::read_unaligned(buffer.as_ptr() as *const TOKEN_USER);
-        let user_sid = PSID(token_user.User.Sid.0);
+    // SAFETY: `descriptor` came from GetNamedSecurityInfoW, which allocates with
+    // LocalAlloc, so LocalFree releases it; no pointer into it is used after.
+    unsafe {
+        let _ = LocalFree(HLOCAL(descriptor.0));
+    }
 
+    Ok(owner_only)
+}
+
+#[cfg(windows)]
+fn set_user_only_dacl(path: &Path, inheritable: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
+        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    };
+    use windows::Win32::Security::{
+        ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    // A check that cannot read the current ACL (missing path, denied read)
+    // falls through to the rewrite, so the error a caller sees still comes from
+    // the write that has always produced it.
+    if dacl_is_owner_only(path, inheritable).unwrap_or(false) {
+        return Ok(());
+    }
+
+    let user_sid = current_user_sid()?;
+    let sid = PSID(user_sid.as_ptr() as *mut _);
+
+    // SAFETY: `user_sid` is the process user's SID, cached for the life of the
+    // process, so it outlives its use in SetEntriesInAclW; `new_acl` allocated
+    // by SetEntriesInAclW is freed exactly once via LocalFree when non-null;
+    // `path_wide` is NUL-terminated and alive for the SetNamedSecurityInfoW
+    // call.
+    unsafe {
         let trustee = TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
             TrusteeForm: TRUSTEE_IS_SID,
             TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: PWSTR(user_sid.0 as *mut u16),
+            ptstrName: PWSTR(sid.0 as *mut u16),
         };
 
         let ea = EXPLICIT_ACCESS_W {
@@ -253,7 +416,6 @@ fn set_user_only_dacl(path: &Path, inheritable: bool) -> std::io::Result<()> {
         let mut new_acl: *mut ACL = std::ptr::null_mut();
         let result = SetEntriesInAclW(Some(&[ea]), None, &mut new_acl);
         if result.0 != 0 {
-            let _ = CloseHandle(token);
             return Err(std::io::Error::other(format!(
                 "SetEntriesInAclW failed: {}",
                 result.0
@@ -265,6 +427,9 @@ fn set_user_only_dacl(path: &Path, inheritable: bool) -> std::io::Result<()> {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
+
+        #[cfg(test)]
+        record_permission_write(path);
 
         let result = SetNamedSecurityInfoW(
             PCWSTR(path_wide.as_ptr()),
@@ -279,7 +444,6 @@ fn set_user_only_dacl(path: &Path, inheritable: bool) -> std::io::Result<()> {
         if !new_acl.is_null() {
             let _ = LocalFree(HLOCAL(new_acl as *mut _));
         }
-        let _ = CloseHandle(token);
 
         if result.0 != 0 {
             return Err(std::io::Error::other(format!(
@@ -300,6 +464,12 @@ pub fn restrict_file_private(_path: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn restrict(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let current = std::fs::metadata(path)?.permissions().mode();
+    if current & 0o7777 == mode & 0o7777 {
+        return Ok(());
+    }
+    #[cfg(test)]
+    record_permission_write(path);
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
@@ -441,6 +611,160 @@ mod tests {
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn restrict_file_private_skips_rewrite_when_already_private() {
+        let dir = temp_path("no-rewrite");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.session");
+        std::fs::write(&file, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(windows)]
+        assert!(
+            !dacl_is_owner_only(&file, false).unwrap(),
+            "a file created in a shared directory inherits a DACL that is not owner-only"
+        );
+        let before = permission_write_count(&file);
+        restrict_file_private(&file).unwrap();
+        let tightened = permission_write_count(&file);
+        assert_eq!(
+            tightened,
+            before + 1,
+            "an exposed session file must be tightened"
+        );
+        restrict_file_private(&file).unwrap();
+        assert_eq!(
+            permission_write_count(&file),
+            tightened,
+            "a file that is already owner-only must not be rewritten"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        #[cfg(windows)]
+        assert!(dacl_is_owner_only(&file, false).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_file_private_rewrites_when_mode_widened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_path("rewiden");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.session");
+        std::fs::write(&file, b"x").unwrap();
+        restrict_file_private(&file).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = permission_write_count(&file);
+        restrict_file_private(&file).unwrap();
+        assert_eq!(permission_write_count(&file), before + 1);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn grant_everyone_full_access(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PWSTR;
+        use windows::Win32::Foundation::{LocalFree, HLOCAL, WIN32_ERROR};
+        use windows::Win32::Security::Authorization::{
+            SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
+            SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+        };
+        use windows::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        // S-1-1-0 (Everyone) as a self-relative SID.
+        let everyone: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS.0,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: windows::Win32::Security::ACE_FLAGS(0),
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: PWSTR(everyone.as_ptr() as *mut u16),
+            },
+        };
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: the trustee SID lives in `everyone` for the whole call and
+        // SetEntriesInAclW copies it into the ACL it allocates; that ACL is
+        // freed exactly once below and is passed to SetNamedSecurityInfoW while
+        // still alive.
+        unsafe {
+            assert_eq!(SetEntriesInAclW(Some(&[ea]), None, &mut acl).0, 0);
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            wide.push(0);
+            let status = SetNamedSecurityInfoW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                windows::Win32::Security::PSID(std::ptr::null_mut()),
+                windows::Win32::Security::PSID(std::ptr::null_mut()),
+                Some(acl),
+                None,
+            );
+            let _ = LocalFree(HLOCAL(acl as *mut _));
+            assert_eq!(status, WIN32_ERROR(0));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restrict_file_private_rewrites_when_acl_changes() {
+        let dir = temp_path("acl-change");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.session");
+        std::fs::write(&file, b"x").unwrap();
+        restrict_file_private(&file).unwrap();
+        assert!(dacl_is_owner_only(&file, false).unwrap());
+        grant_everyone_full_access(&file);
+        assert!(
+            !dacl_is_owner_only(&file, false).unwrap(),
+            "an ACE granted to Everyone is not the owner-only ACL"
+        );
+        let before = permission_write_count(&file);
+        restrict_file_private(&file).unwrap();
+        assert_eq!(permission_write_count(&file), before + 1);
+        assert!(dacl_is_owner_only(&file, false).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_user_sid_is_cached_and_well_formed() {
+        let first = current_user_sid().unwrap();
+        let second = current_user_sid().unwrap();
+        assert_eq!(
+            first.as_ptr(),
+            second.as_ptr(),
+            "the SID must be read from the process token once per process"
+        );
+        assert_eq!(first[0], 1, "SID revision must be 1");
+        let sub_authorities = first[1] as usize;
+        assert_eq!(first.len(), 8 + 4 * sub_authorities);
+        assert!(
+            first[2..8].iter().any(|b| *b != 0),
+            "the identifier authority must be non-zero"
+        );
     }
 
     #[cfg(unix)]
