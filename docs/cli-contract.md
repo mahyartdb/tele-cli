@@ -831,7 +831,7 @@ Envelope `type` strings inside `isError:true` text reuse the serve taxonomy:
 Self-correction loop: fix params per `ServeError.param`, add
 `"confirm":true` after `ConfirmRequired`, wait out `seconds` on an
 `InvocationError` with `name: FLOOD_WAIT`, or switch to `"dry_run":true`
-to preview anything first. MCP applies the same lane timeouts as the serve wire (30s simple, 120s paginated/raw, 600s story send, no limit on download). Requests run one at a time in arrival order.
+to preview anything first. MCP applies the same lane timeouts as the serve wire (30s simple, 120s paginated/raw, 600s story send, no limit on download). rmcp answers JSON-RPC requests concurrently, so read-only tools may overlap; mutating tools are serialized and run one at a time in arrival order, exactly like the serve wire's single mutate lane. That ordering is load-bearing for read-modify-write ops (for example `privacy set`, which fetches, merges, and writes the rule set).
 
 ### Not exposed over MCP
 
@@ -996,7 +996,7 @@ Same hints notation as the serve table: listed values mark non-defaults, and an 
 
 ### Backpressure
 
-Not applicable: rmcp processes requests one at a time on the stdio transport, so there are no queue bounds to honor (contrast `tele serve`'s bounded intake).
+Partly applicable: rmcp answers requests concurrently, so read-only calls may overlap freely. Mutating calls are serialized behind a single gate, so at most one mutating tool runs at a time; there is no queue bound, so a client that fires many mutating calls in a row will see them run one after another rather than being rejected (contrast `tele serve`'s bounded intake, which drops with a `QueueFull` error).
 
 ### Client configuration
 

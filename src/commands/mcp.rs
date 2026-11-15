@@ -14,7 +14,8 @@ use rmcp::{ServerHandler, ServiceExt};
 
 use crate::client::{ClientGuard, ServeShares};
 use crate::commands::serve::{
-    apply_confirm_gate, err_json, serve_op_routes, OpRoute, Plan, Planner, SchemaFn, ServeRunner,
+    apply_confirm_gate, err_json, serve_op_routes, Lane, OpRoute, Plan, Planner, SchemaFn,
+    ServeRunner,
 };
 use crate::error::{TeleError, TeleResult, EXIT_OK};
 
@@ -30,6 +31,7 @@ pub(crate) struct McpRouteMeta {
 #[derive(Clone, Copy)]
 struct ExecEntry {
     destructive: bool,
+    lane: Lane,
     schema_fn: SchemaFn,
     planner: Planner,
     runner: ServeRunner,
@@ -44,6 +46,14 @@ pub(crate) struct TeleMcp {
     routes: Vec<McpRouteMeta>,
     execs: HashMap<&'static str, ExecEntry>,
     visible_names: HashSet<String>,
+    /// Serializes mutating calls.
+    ///
+    /// rmcp dispatches every JSON-RPC request in its own task, so two
+    /// overlapping `privacy set` calls would interleave their
+    /// fetch/merge/write cycles and the second write would discard the
+    /// first's rules. `tele serve` funnels the same ops through a single
+    /// mutate worker for exactly this reason.
+    mutate_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn tool_name_for_op(op: &str) -> String {
@@ -74,6 +84,7 @@ fn build_route_tables(ops: &[OpRoute]) -> (Vec<McpRouteMeta>, HashMap<&'static s
                 r.op,
                 ExecEntry {
                     destructive: r.destructive,
+                    lane: r.lane,
                     schema_fn: r.schema_fn,
                     planner: r.planner,
                     runner: r.runner,
@@ -176,6 +187,7 @@ impl TeleMcp {
             routes,
             execs,
             visible_names,
+            mutate_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -255,6 +267,13 @@ use tools/list to see the {visible} available tele tools"
             Ok(Plan::DryRun(data)) => Ok(text_result(data, false)),
             Ok(Plan::Execute(raw)) => {
                 let future = (exec.runner)(self.shares.clone(), raw);
+                // Mutating ops run one at a time: rmcp answers requests
+                // concurrently, and two overlapping read-modify-write ops
+                // (privacy set, for one) would lose one of the writes.
+                let mutate_guard = match exec.lane {
+                    Lane::Mutate => Some(self.mutate_gate.lock().await),
+                    Lane::Read => None,
+                };
                 let outcome = match exec.timeout {
                     Some(limit) => match tokio::time::timeout(limit, future).await {
                         Ok(outcome) => outcome,
@@ -269,6 +288,7 @@ use tools/list to see the {visible} available tele tools"
                     },
                     None => future.await,
                 };
+                drop(mutate_guard);
                 match outcome {
                     Ok(data) => Ok(text_result(data, false)),
                     Err(env) => Ok(text_result(env, true)),
@@ -590,6 +610,51 @@ mod tests {
             read_only,
             groups,
         )
+    }
+
+    /// Mutating tools must not overlap.
+    ///
+    /// rmcp answers JSON-RPC requests concurrently, so two mutating calls
+    /// used to interleave their fetch/merge/write cycles -- two `privacy
+    /// set` calls would leave one write's rules discarded. The gate makes
+    /// mutating calls run one at a time, like the serve wire's single
+    /// mutate lane.
+    #[tokio::test]
+    async fn mutating_tools_are_serialized() {
+        let op = OpRoute {
+            op: "probe mutate",
+            lane: Lane::Mutate,
+            timeout: None,
+            read_only: false,
+            destructive: false,
+            retry_safe: false,
+            summary: "probe",
+            planner: |_op, _raw| Ok(Plan::Execute(serde_json::json!({}))),
+            runner: |_shares, _raw| Box::pin(async { Ok(serde_json::json!({"ok": true})) }),
+            schema_fn: || serde_json::json!({"type": "object"}),
+        };
+        let handler = TeleMcp::from_ops(
+            offline_shares("gate").await,
+            "test-acct".to_string(),
+            false,
+            None,
+            std::slice::from_ref(&op),
+        );
+        let gate = Arc::clone(&handler.mutate_gate);
+        let held = gate.lock().await;
+        let handler = Arc::new(handler);
+        let call = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move { handler.call_core("probe_mutate", None).await.map(|_| ()) }
+        });
+        // The call cannot finish while the gate is held by this task.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !call.is_finished(),
+            "a mutating call must wait for the gate"
+        );
+        drop(held);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
     }
 
     #[test]
