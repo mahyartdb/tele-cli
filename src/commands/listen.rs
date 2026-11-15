@@ -90,6 +90,12 @@ const MAX_ALBUM_LEN: usize = 20;
 const ALBUM_BUFFER_CAP: usize = 20;
 const OBSERVED_PEER_CAP: usize = 10_000;
 const GAP_TRACKER_CAP: usize = 10_000;
+const LISTEN_OUTPUT_CAPACITY: usize = 256;
+/// grammers hands the client an unbounded update channel: an account task
+/// parked forever on a stalled stdout would let it grow without limit. Past
+/// this budget the row is dropped and counted instead.
+const LISTEN_STALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const LISTEN_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
@@ -502,15 +508,21 @@ fn album_flush(account: &str, buf: &mut AlbumBuffer) -> Vec<serde_json::Value> {
 }
 
 /// Emit a row without consulting the stopper. Returns true when the
-/// stream must stop (broken pipe).
-async fn emit_direct(account: &str, value: serde_json::Value) -> TeleResult<bool> {
-    match emit_row(value).await {
-        Ok(()) => Ok(false),
-        Err(e) if emit_stops_stream(&e) => Ok(true),
+/// stream must stop (stdout is gone).
+async fn emit_direct(
+    writer: &ListenWriter,
+    account: &str,
+    value: serde_json::Value,
+) -> TeleResult<bool> {
+    match writer.emit(account, value).await {
+        Ok(_) => Ok(false),
         Err(e) if matches!(e, TeleError::Usage(_)) => Err(e),
+        Err(e) if emit_stops_stream(&e) => Ok(true),
         Err(e) => {
+            // stdout is unusable: continuing would only repeat this failure
+            // once per row.
             output::log_line("error", &format!("{account}: emit failed: {}", e.message()));
-            Ok(false)
+            Ok(true)
         }
     }
 }
@@ -522,9 +534,13 @@ async fn emit_direct(account: &str, value: serde_json::Value) -> TeleResult<bool
 /// row before it was written. These members were already received off the
 /// wire, so dropping them is silent data loss: they would appear neither
 /// as an `Album` row nor as individual `NewMessage` rows.
-async fn flush_albums_on_stop(account: &str, album: &mut AlbumBuffer) -> TeleResult<()> {
+async fn flush_albums_on_stop(
+    writer: &ListenWriter,
+    account: &str,
+    album: &mut AlbumBuffer,
+) -> TeleResult<()> {
     for row in album_flush(account, album) {
-        if emit_direct(account, row).await? {
+        if emit_direct(writer, account, row).await? {
             return Ok(());
         }
     }
@@ -533,13 +549,14 @@ async fn flush_albums_on_stop(account: &str, album: &mut AlbumBuffer) -> TeleRes
 
 /// Emit a row, flushing pending albums when the stream stops.
 async fn emit_or_stop(
+    writer: &ListenWriter,
     stopper: &StreamStopper,
     account: &str,
     album: &mut AlbumBuffer,
     value: serde_json::Value,
 ) -> TeleResult<bool> {
-    if emit_row_or_stop(stopper, account, value).await? {
-        flush_albums_on_stop(account, album).await?;
+    if emit_row_or_stop(writer, stopper, account, value).await? {
+        flush_albums_on_stop(writer, account, album).await?;
         return Ok(true);
     }
     Ok(false)
@@ -719,6 +736,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     let timeout_secs = args.timeout_secs;
     let (until, until_date) = until_bounds(args.until.as_deref())?;
     let stopper = Arc::new(StreamStopper::new(args.count, until, until_date));
+    let writer = spawn_listen_writer();
     let direction = if args.out {
         Some(Direction::Out)
     } else if args.r#in {
@@ -738,6 +756,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         let filter_patterns = filter_patterns.clone();
         let semaphore = Arc::clone(&semaphore);
         let stopper = Arc::clone(&stopper);
+        let writer = writer.clone();
         tasks.spawn(async move {
             let result: TeleResult<()> = async {
                 let creds =
@@ -862,7 +881,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             continue;
                         }
                     };
-                    failures = on_reconnect_success(failures);
+                    failures = on_stream_connected(failures);
                     // gaps/observed/album are declared before the reconnect
                     // loop (see below) so gap detection and peer bookkeeping
                     // survive an outage instead of resetting blind.
@@ -882,7 +901,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 // through the stopper would veto them once
                                 // the count budget is spent.
                                 for done in album_flush(&name, &mut album) {
-                                    if emit_direct(&name, done).await? {
+                                    if emit_direct(&writer, &name, done).await? {
                                         return Ok(());
                                     }
                                 }
@@ -917,7 +936,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 for done in
                                     album_sweep(&name, &mut album, tokio::time::Instant::now())
                                 {
-                                    if emit_or_stop(&stopper, &name, &mut album, done).await? {
+                                    if emit_or_stop(&writer, &stopper, &name, &mut album, done).await? {
                                         return Ok(());
                                     }
                                 }
@@ -936,7 +955,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 // album members are written directly so a
                                 // spent count budget cannot drop them.
                                 for done in album_flush(&name, &mut album) {
-                                    if emit_direct(&name, done).await? {
+                                    if emit_direct(&writer, &name, done).await? {
                                         return Ok(());
                                     }
                                 }
@@ -961,7 +980,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         }
                         if gap_on {
                             if let Some(signal) = gaps.observe(update.raw()) {
-                                                                if emit_or_stop(&stopper, &name, &mut album, gap_row(&name, &signal, update.state())).await? { return Ok(()); }
+                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, gap_row(&name, &signal, update.state())).await? { return Ok(()); }
 
                             }
                         }
@@ -1024,7 +1043,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                             peer,
                                             None,
                                         );
-                                                                                if emit_or_stop(&stopper, &name, &mut album, service_row(
+                                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, service_row(
                                             &name, chat_id, svc_row, &svc.action,
                                         )).await? { return Ok(()); }
 
@@ -1057,7 +1076,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                             gid,
                                             tokio::time::Instant::now(),
                                         ) {
-                                            if emit_or_stop(&stopper, &name, &mut album, done).await? {
+                                            if emit_or_stop(&writer, &stopper, &name, &mut album, done).await? {
                                                 return Ok(());
                                             }
                                         }
@@ -1069,11 +1088,11 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 for done in
                                     album_flush_chat(&name, &mut album, chat_id)
                                 {
-                                    if emit_or_stop(&stopper, &name, &mut album, done).await? {
+                                    if emit_or_stop(&writer, &stopper, &name, &mut album, done).await? {
                                         return Ok(());
                                     }
                                 }
-                                if emit_or_stop(&stopper, &name, &mut album, event_row(
+                                if emit_or_stop(&writer, &stopper, &name, &mut album, event_row(
                                     "NewMessage",
                                     &name,
                                     chat_id,
@@ -1141,7 +1160,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                             peer,
                                             None,
                                         );
-                                                                                if emit_or_stop(&stopper, &name, &mut album, service_row(
+                                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, service_row(
                                             &name, chat_id, svc_row, &svc.action,
                                         )).await? { return Ok(()); }
 
@@ -1163,7 +1182,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                     }
                                 };
                                 crate::serialize::ensure_outer_peer_sender(&mut row, peer, None);
-                                                                if emit_or_stop(&stopper, &name, &mut album, event_row(
+                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, event_row(
                                     "MessageEdited",
                                     &name,
                                     chat_id,
@@ -1191,7 +1210,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 let Some(matched) = matched else {
                                     continue;
                                 };
-                                                                if emit_or_stop(&stopper, &name, &mut album, event_row(
+                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, event_row(
                                     "MessageDeleted",
                                     &name,
                                     sole_chat_label(&filter.chats),
@@ -1208,7 +1227,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                         if !filter.action_allows(peer, sender) {
                                             continue;
                                         }
-                                                                                if emit_or_stop(&stopper, &name, &mut album, row).await? { return Ok(()); }
+                                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, row).await? { return Ok(()); }
 
                                         continue;
                                     }
@@ -1220,7 +1239,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                         if !filter.action_allows(peer, sender) {
                                             continue;
                                         }
-                                                                                if emit_or_stop(&stopper, &name, &mut album, row).await? { return Ok(()); }
+                                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, row).await? { return Ok(()); }
 
                                         continue;
                                     }
@@ -1232,7 +1251,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                         if !filter.action_allows(peer, sender) {
                                             continue;
                                         }
-                                                                                if emit_or_stop(&stopper, &name, &mut album, row).await? { return Ok(()); }
+                                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, row).await? { return Ok(()); }
 
                                         continue;
                                     }
@@ -1243,7 +1262,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 if !filter.raw_allows(update_peer(update.raw())) {
                                     continue;
                                 }
-                                                                if emit_or_stop(&stopper, &name, &mut album, raw_row(&name, update.raw(), update.state())).await? { return Ok(()); }
+                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, raw_row(&name, update.raw(), update.state())).await? { return Ok(()); }
 
                             }
                         }
@@ -1283,27 +1302,199 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
             }
         }
     }
+    writer.finish().await;
     if timeout_secs > 0 {
         output::log_line("info", "listen timeout reached");
     }
     Ok(crate::error::aggregate_exit_code(ok_count, &failed))
 }
 
-async fn emit_row(value: serde_json::Value) -> TeleResult<()> {
-    let line = stream_row_line(&value)?;
-    tokio::task::spawn_blocking(move || {
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "{line}")?;
-        out.flush()
-    })
-    .await
-    .map_err(|e| TeleError::TaskPanic(e.to_string()))??;
-    Ok(())
+enum EmitOutcome {
+    /// The row was handed to the writer thread; it will be written in order.
+    Queued,
+    /// The stdout consumer stayed stalled past the budget and the row was
+    /// dropped. The drop is counted and stamped on the next written row.
+    Dropped,
 }
 
-fn stream_row_line(value: &serde_json::Value) -> TeleResult<String> {
-    let projected = crate::output::apply_output_fields(value)?;
+#[derive(Clone)]
+struct ListenWriter {
+    tx: tokio::sync::mpsc::Sender<String>,
+    dropped: std::sync::Arc<std::sync::Mutex<u32>>,
+    error: std::sync::Arc<std::sync::Mutex<Option<TeleError>>>,
+    handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    stall_budget: std::time::Duration,
+}
+
+impl ListenWriter {
+    /// Hand one row to the writer thread, waiting at most `stall_budget`.
+    ///
+    /// The handoff is bounded because grammers hands the client an UNBOUNDED
+    /// update channel: parking here forever would let it grow without limit
+    /// while stdout is stalled. A row that cannot be handed over in time is
+    /// dropped, counted, and surfaced on the next row that is.
+    async fn emit(&self, account: &str, value: serde_json::Value) -> TeleResult<EmitOutcome> {
+        let pending = self.take_dropped();
+        let line = match stream_row_line_with_dropped(&value, pending) {
+            Ok(line) => line,
+            Err(e) => {
+                self.add_dropped(pending);
+                return Err(e);
+            }
+        };
+        match tokio::time::timeout(self.stall_budget, self.tx.send(line)).await {
+            Ok(Ok(())) => Ok(EmitOutcome::Queued),
+            Ok(Err(_)) => {
+                self.add_dropped(pending);
+                Err(self.writer_error())
+            }
+            Err(_) => {
+                let dropped = self.add_dropped(pending.saturating_add(1));
+                output::log_line(
+                    "warn",
+                    &format!(
+                        "listen: account {account} dropped a row: stdout stayed stalled for {}s ({dropped} dropped since the last written row)",
+                        self.stall_budget.as_secs()
+                    ),
+                );
+                Ok(EmitOutcome::Dropped)
+            }
+        }
+    }
+
+    /// Close the writer and wait until every queued row is flushed. Account
+    /// tasks must be joined first so their writer clones are gone.
+    async fn finish(self) {
+        let stranded = self.take_dropped();
+        let ListenWriter {
+            tx, error, handle, ..
+        } = self;
+        drop(tx);
+        let handle = handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(handle) = handle {
+            // The writer thread can be inside a write to a consumer that
+            // stopped reading, so the join is bounded: a reader that never
+            // drains must not keep the process alive after the stream ends.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let spawned = std::thread::Builder::new()
+                .name("listen-writer-join".to_string())
+                .spawn(move || {
+                    let _ = handle.join();
+                    let _ = done_tx.send(());
+                });
+            match spawned {
+                Ok(_) => match tokio::time::timeout(LISTEN_FLUSH_BUDGET, done_rx).await {
+                    Ok(_) => {}
+                    Err(_) => output::log_line(
+                        "warn",
+                        &format!(
+                            "listen: stdout did not drain within {}s at shutdown",
+                            LISTEN_FLUSH_BUDGET.as_secs()
+                        ),
+                    ),
+                },
+                Err(e) => output::log_line(
+                    "warn",
+                    &format!("listen: could not join the jsonl writer: {e}"),
+                ),
+            }
+        }
+        if stranded > 0 {
+            output::log_line(
+                "warn",
+                &format!("listen: {stranded} row(s) were dropped before the stream ended"),
+            );
+        }
+        let err = error.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(err) = err {
+            if !err.is_broken_pipe() {
+                output::log_line(
+                    "error",
+                    &format!("listen: stdout writer failed: {}", err.message()),
+                );
+            }
+        }
+    }
+
+    fn take_dropped(&self) -> u32 {
+        let mut guard = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    }
+
+    fn add_dropped(&self, delta: u32) -> u32 {
+        let mut guard = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = guard.saturating_add(delta);
+        *guard
+    }
+
+    fn writer_error(&self) -> TeleError {
+        let guard = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(e) if e.is_broken_pipe() => TeleError::BrokenPipe,
+            Some(e) => TeleError::Other(e.message()),
+            None => TeleError::TaskPanic("listen writer thread stopped".to_string()),
+        }
+    }
+}
+
+/// One writer thread per run owns stdout for every account task, so rows keep
+/// the order they were submitted in and the queue bound is the only buffer
+/// between grammers and the terminal.
+fn spawn_writer<F, W>(open: F, capacity: usize, stall_budget: std::time::Duration) -> ListenWriter
+where
+    F: FnOnce() -> W + Send + 'static,
+    W: Write,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(capacity);
+    let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let writer_error = std::sync::Arc::clone(&error);
+    let handle = std::thread::Builder::new()
+        .name("listen-jsonl-writer".to_string())
+        .spawn(move || {
+            let mut out = open();
+            while let Some(line) = rx.blocking_recv() {
+                let written = writeln!(out, "{line}")
+                    .and_then(|()| out.flush())
+                    .map_err(TeleError::from);
+                if let Err(e) = written {
+                    *writer_error
+                        .lock()
+                        .unwrap_or_else(|inner| inner.into_inner()) = Some(e);
+                    break;
+                }
+            }
+        })
+        .expect("spawn listen jsonl writer thread");
+    ListenWriter {
+        tx,
+        dropped: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        error,
+        handle: std::sync::Arc::new(std::sync::Mutex::new(Some(handle))),
+        stall_budget,
+    }
+}
+
+fn spawn_listen_writer() -> ListenWriter {
+    spawn_writer(
+        || std::io::stdout().lock(),
+        LISTEN_OUTPUT_CAPACITY,
+        LISTEN_STALL_BUDGET,
+    )
+}
+
+fn stream_row_line_with_dropped(value: &serde_json::Value, dropped: u32) -> TeleResult<String> {
+    let mut projected = crate::output::apply_output_fields(value)?;
+    if dropped > 0 {
+        if let serde_json::Value::Object(map) = &mut projected {
+            map.insert("dropped".to_string(), serde_json::Value::from(dropped));
+        }
+    }
     Ok(serde_json::to_string(&projected)?)
+}
+
+#[cfg(test)]
+fn stream_row_line(value: &serde_json::Value) -> TeleResult<String> {
+    stream_row_line_with_dropped(value, 0)
 }
 
 #[derive(Default)]
@@ -1376,28 +1567,53 @@ impl StreamStopper {
         }
     }
 
+    /// Reserve one event row against the shared `--count` budget before the
+    /// row is written. The decrement and the "was there room" decision happen
+    /// under one lock: checking the budget and decrementing after the write
+    /// lets two accounts both pass the check and overshoot `--count`.
+    fn reserve(&self) -> CountSlot {
+        let mut guard = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            None => CountSlot::Reserved { last: false },
+            Some(0) => CountSlot::Exhausted,
+            Some(n) => {
+                *n -= 1;
+                CountSlot::Reserved { last: *n == 0 }
+            }
+        }
+    }
+
+    /// Give a reserved slot back when the row never reached stdout.
+    fn release(&self) {
+        let mut guard = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = guard.as_mut() {
+            *n += 1;
+        }
+    }
+
+    #[cfg(test)]
     fn is_exhausted(&self) -> bool {
         let guard = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
         matches!(*guard, Some(0))
     }
 
     /// Returns true when this emit consumed the last allowed row.
+    #[cfg(test)]
     fn emitted(&self) -> bool {
-        let mut guard = self.remaining.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_mut() {
-            Some(n) => {
-                if *n == 0 {
-                    return true;
-                }
-                *n -= 1;
-                *n == 0
-            }
-            None => false,
-        }
+        matches!(
+            self.reserve(),
+            CountSlot::Reserved { last: true } | CountSlot::Exhausted
+        )
     }
 }
 
+enum CountSlot {
+    Reserved { last: bool },
+    Exhausted,
+}
+
 async fn emit_row_or_stop(
+    writer: &ListenWriter,
     stopper: &StreamStopper,
     account: &str,
     value: serde_json::Value,
@@ -1412,19 +1628,28 @@ async fn emit_row_or_stop(
     // time_up() only fires for a FUTURE --until (a past timestamp has no
     // wall-clock deadline), where it bounds the run even if no dated row
     // ever arrives.
-    if stopper.stop_requested() || stopper.time_up() || stopper.is_exhausted() {
+    if stopper.stop_requested() || stopper.time_up() {
         return Ok(true);
     }
-    match emit_row(value).await {
-        Ok(()) => {}
-        Err(e) if emit_stops_stream(&e) => return Ok(true),
-        Err(e) if matches!(e, TeleError::Usage(_)) => return Err(e),
-        Err(e) => {
-            output::log_line("error", &format!("{account}: emit failed: {}", e.message()));
+    let last = match stopper.reserve() {
+        CountSlot::Exhausted => return Ok(true),
+        CountSlot::Reserved { last } => last,
+    };
+    match writer.emit(account, value).await {
+        Ok(EmitOutcome::Queued) => {}
+        Ok(EmitOutcome::Dropped) => {
+            stopper.release();
             return Ok(false);
         }
+        Err(e) if matches!(e, TeleError::Usage(_)) => return Err(e),
+        Err(e) if emit_stops_stream(&e) => return Ok(true),
+        Err(e) => {
+            // stdout is unusable: stop instead of logging once per row.
+            output::log_line("error", &format!("{account}: emit failed: {}", e.message()));
+            return Ok(true);
+        }
     }
-    if stopper.emitted() {
+    if last {
         output::log_line("info", "listen --count reached");
         return Ok(true);
     }
@@ -1577,6 +1802,13 @@ fn reconnect_allowed(consecutive_failures: u32) -> bool {
 
 fn on_failure(failures: u32) -> u32 {
     failures + 1
+}
+
+/// An established connection is not proof the stream works: a stream that
+/// connects and immediately errors would reset the streak every cycle and
+/// never reach the give-up limit. Only a consumed update resets it.
+fn on_stream_connected(failures: u32) -> u32 {
+    failures
 }
 
 fn on_reconnect_success(failures: u32) -> u32 {
@@ -2040,7 +2272,109 @@ mod tests;
 
 #[cfg(test)]
 mod stopper_tests {
-    use super::StreamStopper;
+    use super::{CountSlot, ListenWriter, StreamStopper};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedLines(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLines {
+        fn lines(&self) -> Vec<String> {
+            let bytes = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl std::io::Write for CapturedLines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BrokenPipeSink;
+
+    impl std::io::Write for BrokenPipeSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct GatedSink {
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        out: CapturedLines,
+    }
+
+    impl std::io::Write for GatedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (lock, cv) = &*self.gate;
+            let mut open = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                open = cv.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+            drop(open);
+            self.out.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_writer(capacity: usize, wait: std::time::Duration) -> (ListenWriter, CapturedLines) {
+        let sink = CapturedLines::default();
+        let writer = super::spawn_writer(
+            {
+                let sink = sink.clone();
+                move || sink
+            },
+            capacity,
+            wait,
+        );
+        (writer, sink)
+    }
+
+    fn release_gate(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+        let (lock, cv) = &**gate;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+
+    /// Wait until the writer thread has dequeued the queued row, so the next
+    /// send faces a free slot instead of racing a 200ms budget.
+    async fn wait_until_writer_took_the_queued_row(writer: &ListenWriter) {
+        for _ in 0..400 {
+            if writer.tx.capacity() > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the writer thread never dequeued the queued row");
+    }
+
+    fn quiet_fields() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::output::lock_fields_for_test();
+        crate::output::clear_output_fields();
+        guard
+    }
 
     #[test]
     fn count_zero_is_exhausted_before_any_emit() {
@@ -2121,11 +2455,17 @@ mod stopper_tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         let stopper = StreamStopper::new(None, None, Some(limit));
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
         let row = serde_json::json!({"event": "NewMessage", "date": "2026-06-01T00:00:00+00:00"});
-        assert!(super::emit_row_or_stop(&stopper, "work", row)
+        assert!(super::emit_row_or_stop(&writer, &stopper, "work", row)
             .await
             .unwrap());
         assert!(stopper.stop_requested());
+        writer.finish().await;
+        assert!(
+            sink.lines().is_empty(),
+            "the row that reaches --until must not be written"
+        );
     }
 
     #[tokio::test]
@@ -2168,9 +2508,174 @@ mod stopper_tests {
     #[tokio::test]
     async fn count_zero_emit_row_or_stop_emits_nothing() {
         let stopper = StreamStopper::new(Some(0), None, None);
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
         let row = serde_json::json!({"event": "NewMessage"});
-        assert!(super::emit_row_or_stop(&stopper, "work", row)
+        assert!(super::emit_row_or_stop(&writer, &stopper, "work", row)
             .await
             .unwrap());
+        writer.finish().await;
+        assert!(sink.lines().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn count_budget_is_reserved_before_the_emit_so_accounts_cannot_overshoot() {
+        let _lock = quiet_fields();
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
+        let stopper = Arc::new(StreamStopper::new(Some(5), None, None));
+        let mut tasks = tokio::task::JoinSet::new();
+        for account in 0..16 {
+            let writer = writer.clone();
+            let stopper = Arc::clone(&stopper);
+            tasks.spawn(async move {
+                let mut album = super::AlbumBuffer::new();
+                let row = serde_json::json!({"event": "NewMessage", "account": account});
+                super::emit_or_stop(&writer, &stopper, "acct", &mut album, row).await
+            });
+        }
+        let mut stopped = 0;
+        while let Some(joined) = tasks.join_next().await {
+            if joined.expect("task").expect("emit") {
+                stopped += 1;
+            }
+        }
+        writer.finish().await;
+        assert_eq!(
+            sink.lines().len(),
+            5,
+            "--count must cap emitted rows even when every account races for the budget"
+        );
+        assert_eq!(
+            stopped, 12,
+            "one stop for the last slot, one per starved account"
+        );
+        assert!(matches!(stopper.reserve(), CountSlot::Exhausted));
+    }
+
+    #[test]
+    fn connect_success_without_a_delivered_update_keeps_the_failure_streak() {
+        let mut failures = 0;
+        for _ in 0..=super::MAX_RECONNECT_ATTEMPTS {
+            failures = super::on_stream_connected(failures);
+            assert!(
+                super::reconnect_allowed(failures),
+                "a connect that has not delivered an update must not reset the streak"
+            );
+            failures = super::on_failure(failures);
+        }
+        assert!(
+            super::give_up(failures),
+            "repeated connect-then-error cycles must reach the give-up limit"
+        );
+        assert_eq!(failures, super::MAX_RECONNECT_ATTEMPTS + 1);
+        assert_eq!(
+            super::on_reconnect_success(failures),
+            0,
+            "a consumed update is what resets the streak"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn writer_preserves_order_and_writes_each_row_once() {
+        let _lock = quiet_fields();
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
+        for id in 0i64..200 {
+            writer
+                .emit("acct", serde_json::json!({"event": "NewMessage", "id": id}))
+                .await
+                .unwrap();
+        }
+        writer.finish().await;
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 200, "every row must be written exactly once");
+        for (expected, line) in lines.iter().enumerate() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["id"], serde_json::json!(expected as i64));
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn writer_surfaces_broken_pipe_instead_of_hanging_or_swallowing_it() {
+        let _lock = quiet_fields();
+        let writer =
+            super::spawn_writer(|| BrokenPipeSink, 4, std::time::Duration::from_millis(200));
+        let mut failure = None;
+        for _ in 0..64 {
+            match writer
+                .emit("acct", serde_json::json!({"event": "NewMessage"}))
+                .await
+            {
+                Ok(_) => continue,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = failure.expect("the writer failure must reach the emitters");
+        assert!(err.is_broken_pipe(), "err: {err}");
+        assert!(
+            super::emit_stops_stream(&err),
+            "a broken pipe must still stop the stream"
+        );
+        assert_eq!(err.exit_code(), crate::error::EXIT_OK);
+        writer.finish().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_stalled_stdout_drops_the_row_counts_it_and_stamps_the_next_one() {
+        let _lock = quiet_fields();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let sink = CapturedLines::default();
+        let writer = super::spawn_writer(
+            {
+                let gate = Arc::clone(&gate);
+                let sink = sink.clone();
+                move || GatedSink { gate, out: sink }
+            },
+            1,
+            std::time::Duration::from_millis(200),
+        );
+        writer
+            .emit("acct", serde_json::json!({"event": "NewMessage", "id": 1}))
+            .await
+            .unwrap();
+        wait_until_writer_took_the_queued_row(&writer).await;
+        writer
+            .emit("acct", serde_json::json!({"event": "NewMessage", "id": 2}))
+            .await
+            .unwrap();
+        let dropped = writer
+            .emit("acct", serde_json::json!({"event": "NewMessage", "id": 3}))
+            .await
+            .unwrap();
+        assert!(
+            matches!(dropped, super::EmitOutcome::Dropped),
+            "a row that cannot be handed off must be dropped, not parked"
+        );
+
+        release_gate(&gate);
+        writer
+            .emit("acct", serde_json::json!({"event": "NewMessage", "id": 4}))
+            .await
+            .unwrap();
+        writer.finish().await;
+
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 3, "the dropped row must never reach stdout");
+        let rows: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let ids: Vec<i64> = rows.iter().map(|row| row["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2, 4], "order must survive the drop");
+        assert_eq!(
+            rows.last().unwrap()["dropped"],
+            1,
+            "the loss must ride along with the next written row"
+        );
     }
 }
