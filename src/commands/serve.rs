@@ -2533,7 +2533,7 @@ mod tests {
         };
         assert_eq!(
             data["would"],
-            "delete all messages in chat @game for yourself"
+            "delete all messages in chat @game for yourself (channels always delete for everyone)"
         );
         assert_eq!(data["self_only"], false);
 
@@ -3429,7 +3429,7 @@ mod tests {
         assert_eq!(err["would"], dry_via_planner);
         assert_eq!(
             err["would"]["would"],
-            "delete all messages in chat @game for yourself"
+            "delete all messages in chat @game for yourself (channels always delete for everyone)"
         );
     }
 

@@ -315,10 +315,14 @@ fn delete_report(requested: usize, deleted: usize) -> (serde_json::Value, bool) 
 }
 
 pub(crate) fn delete_serve_dry_run(args: &DeleteArgs) -> TeleResult<serde_json::Value> {
+    // The peer kind is not known before connecting, so the preview states
+    // both cases: a channel delete always removes the message for every
+    // subscriber (channels.deleteMessages has no revoke variant), while a
+    // private chat needs --revoke for that.
     let scope = if args.revoke {
-        "for both sides"
+        "for both sides (channels always delete for everyone)".to_string()
     } else {
-        "for yourself"
+        "for yourself (channels always delete for everyone)".to_string()
     };
     Ok(serde_json::json!({
     "dry_run": true,
@@ -338,6 +342,8 @@ async fn delete(args: DeleteArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     crate::executor::require_explicit_selection("msg delete", flags)?;
     let config_path = flags.config_path.clone();
     let dry_run = flags.dry_run;
+    let json = flags.json;
+    let jsonl = flags.jsonl;
     let envelope = run_fanout(flags, move |name| {
         let config_path = config_path.clone();
         let args = args.clone();
@@ -352,6 +358,29 @@ async fn delete(args: DeleteArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         })
     })
     .await?;
+    if !output::machine_mode(json, jsonl) {
+        // Say what happened: the default scope changed, and a silent exit 0
+        // left the recipient keeping the message with no way to notice.
+        for outcome in &envelope.accounts {
+            if !outcome.ok {
+                continue;
+            }
+            let deleted = outcome
+                .data
+                .as_ref()
+                .and_then(|d| d.get("deleted"))
+                .and_then(|d| d.as_u64())
+                .unwrap_or(0);
+            let scope = match outcome.data.as_ref().and_then(|d| d.get("revoke")) {
+                Some(serde_json::Value::Bool(true)) => "for both sides",
+                _ => "for yourself",
+            };
+            crate::output::log_line(
+                "info",
+                &format!("deleted {deleted} message(s) {scope}"),
+            );
+        }
+    }
     crate::executor::finish(flags, &envelope)
 }
 
@@ -369,6 +398,12 @@ pub(crate) async fn delete_core(
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.chat).await?;
     let chat_ref = entities::peer_ref(&chat).await.map_err(tele_invocation)?;
     let is_channel = chat.id().kind() == grammers_session::types::PeerKind::Channel;
+    if is_channel && revoke {
+        crate::output::log_line(
+            "warn",
+            "--revoke has no effect on channels: a channel delete always removes the message for everyone",
+        );
+    }
     if all {
         let mut iter = shares.client.iter_messages(chat_ref);
         let mut count = 0usize;
@@ -389,6 +424,7 @@ pub(crate) async fn delete_core(
         }
         let (mut report, partial) = delete_report(requested, count);
         report["unconfirmed"] = serde_json::json!(true);
+        report["revoke"] = serde_json::json!(is_channel || (revoke && !self_only));
         if partial {
             crate::output::log_line(
                 "warn",
@@ -419,7 +455,10 @@ pub(crate) async fn delete_core(
             &format!("delete removed {count} of {} requested id(s)", ids.len()),
         );
     }
-    report["revoke"] = serde_json::json!(revoke && !self_only);
+    // `revoke` reports whether the deletion also removed the message for
+    // other participants. A channel delete always does -- channels have no
+    // self-only variant -- so the flag flips only for private chats.
+    report["revoke"] = serde_json::json!(is_channel || (revoke && !self_only));
     Ok(report)
 }
 
@@ -583,12 +622,15 @@ pub(crate) fn forward_sent_ids(
         .filter_map(|(original, rnd)| rnd_to_id.get(rnd).map(|new| (*original, *new)))
         .collect();
     if pairs.is_empty() {
+        // No random_id mapping came back. Fall back to the produced
+        // messages in order, pairing them with the chunk positionally --
+        // the first chunk id is not necessarily the one that was sent.
         let produced: Vec<i32> = list.iter().filter_map(forward_produced_id).collect();
-        if produced.len() == 1 {
-            if let Some(original) = chunk.first() {
-                pairs.push((*original, produced[0]));
-            }
-        }
+        pairs = chunk
+            .iter()
+            .zip(produced.iter())
+            .map(|(original, new)| (*original, *new))
+            .collect();
     }
     pairs
 }
@@ -628,6 +670,16 @@ pub(crate) async fn forward_core(
                     dropped.extend_from_slice(chunk);
                     continue;
                 }
+                // Ids the server never confirmed must still appear in the
+                // report -- otherwise they vanish from forwarded, dropped
+                // and failed alike.
+                let paired: Vec<i32> = pairs.iter().map(|(original, _)| *original).collect();
+                dropped.extend(
+                    chunk
+                        .iter()
+                        .copied()
+                        .filter(|id| !paired.contains(id)),
+                );
                 shares.rate_limiter.acquire().await;
                 let new_ids: Vec<i32> = pairs.iter().map(|(_, new)| *new).collect();
                 let fetched = shares

@@ -522,6 +522,77 @@ fn forward_updates_with_id_map(pairs: &[(i64, i32)]) -> tl::enums::Updates {
     })
 }
 
+fn forward_updates_with_produced(ids: &[i32]) -> tl::enums::Updates {
+    tl::enums::Updates::Updates(tl::types::Updates {
+        updates: ids
+            .iter()
+            .map(|id| {
+                let mut message = tl::types::Message {
+                    out: false,
+                    mentioned: false,
+                    media_unread: false,
+                    silent: false,
+                    post: false,
+                    from_scheduled: false,
+                    legacy: false,
+                    edit_hide: false,
+                    pinned: false,
+                    noforwards: false,
+                    invert_media: false,
+                    offline: false,
+                    video_processing_pending: false,
+                    paid_suggested_post_stars: false,
+                    paid_suggested_post_ton: false,
+                    id: *id,
+                    from_id: None,
+                    from_boosts_applied: None,
+                    from_rank: None,
+                    peer_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: 1 }),
+                    saved_peer_id: None,
+                    fwd_from: None,
+                    via_bot_id: None,
+                    via_business_bot_id: None,
+                    guestchat_via_from: None,
+                    reply_to: None,
+                    date: 0,
+                    message: String::new(),
+                    media: None,
+                    reply_markup: None,
+                    entities: None,
+                    views: None,
+                    forwards: None,
+                    replies: None,
+                    edit_date: None,
+                    post_author: None,
+                    grouped_id: None,
+                    reactions: None,
+                    restriction_reason: None,
+                    ttl_period: None,
+                    quick_reply_shortcut_id: None,
+                    effect: None,
+                    factcheck: None,
+                    report_delivery_until_date: None,
+                    paid_message_stars: None,
+                    suggested_post: None,
+                    schedule_repeat_period: None,
+                    summary_from_language: None,
+                    rich_message: None,
+                };
+                message.id = *id;
+                tl::enums::Update::NewMessage(tl::types::UpdateNewMessage {
+                    message: tl::enums::Message::Message(message),
+                    pts: 0,
+                    pts_count: 0,
+                })
+            })
+            .collect(),
+        users: Vec::new(),
+        chats: Vec::new(),
+        date: 0,
+        seq: 0,
+    })
+}
+
 #[test]
 fn forward_sent_ids_maps_random_ids_to_new_ids_in_chunk_order() {
     let chunk = [1, 2, 3];
@@ -552,6 +623,30 @@ fn forward_sent_ids_skips_unmapped_and_empty_updates() {
         seq: 0,
     });
     assert!(forward_sent_ids(&bare, &chunk, &[11, 22, 33]).is_empty());
+}
+
+#[test]
+fn forward_sent_ids_pairs_positionally_when_no_random_id_map_came_back() {
+    // Regression: with no MessageId mapping, the fallback paired the
+    // single produced message with the FIRST chunk id, which misattributed
+    // the forwarded id and dropped the rest of the chunk from the report
+    // entirely.
+    let chunk = [7, 8];
+    let updates = forward_updates_with_produced(&[900, 901]);
+    assert_eq!(
+        forward_sent_ids(&updates, &chunk, &[11, 22]),
+        vec![(7, 900), (8, 901)]
+    );
+}
+
+#[test]
+fn forward_sent_ids_pairs_only_what_the_server_produced() {
+    let chunk = [7, 8, 9];
+    let updates = forward_updates_with_produced(&[900]);
+    assert_eq!(
+        forward_sent_ids(&updates, &chunk, &[11, 22, 33]),
+        vec![(7, 900)]
+    );
 }
 
 #[test]

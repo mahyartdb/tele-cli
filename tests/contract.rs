@@ -1108,7 +1108,7 @@ fn msg_delete_requires_ids_unless_all() {
     assert_eq!(v["results"][0]["data"]["dry_run"], serde_json::json!(true));
     assert_eq!(
         v["results"][0]["data"]["would"],
-        serde_json::json!("delete all messages in chat me for yourself")
+        serde_json::json!("delete all messages in chat me for yourself (channels always delete for everyone)")
     );
 }
 

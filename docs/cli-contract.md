@@ -177,7 +177,7 @@ Rules:
 
 ## `dialog list`
 
-`tele dialog list [--limit N] [--folder ID]` lists dialogs; `--folder` must be `0` (main) or `1` (archive) — any other value is a Usage error before connect — and switches the listing from `iter_dialogs` to raw `messages.getDialogs` with `folder_id`, paging until `--limit` rows are collected. Rows keep the same shape as the default listing. `tele dialog drafts` accepts the same `--limit`/`--folder` arguments but refuses `--folder` with a Usage error before connecting.
+`tele dialog list [--limit N] [--folder ID]` lists dialogs; `--folder` must be `0` (main) or `1` (archive) — any other value is a Usage error before connect. The listing always asks the server for the folder it needs (`messages.getDialogs` with `folder_id`), paging until `--limit` rows are collected: requesting folder 0 from the server matters because the server otherwise orders dialogs from every folder, so archived dialogs would consume page slots and a listing could come back empty while main-folder dialogs existed. Rows keep the same shape as before. `tele dialog drafts` accepts the same `--limit`/`--folder` arguments but refuses `--folder` with a Usage error before connecting.
 
 ## `dialog draft`, `dialog pin`, `dialog delete`
 
@@ -288,7 +288,7 @@ Rows gain additive `"username"` (a string, empty when none). The human table app
 
 `results[].data` carries `requested` (how many ids you asked to delete) and `deleted` (how many the server actually removed). When `deleted < requested` (already-deleted ids, other people's messages, or missing permission), the row also carries `"partial": true` and the process exits 2. `--self-only` deletes only for yourself (private chats and basic groups; rejected for channels) via `messages.deleteMessages { revoke: false }`. It is mutually exclusive with `--all` and with `--revoke`.
 
-In private chats and basic groups the delete scope is explicit: without `--revoke` the deletion applies to your copy only (`revoke: false`), with `--revoke` it also removes the message for the other side (`revoke: true`). `--revoke` is mutually exclusive with `--self-only`. Channels ignore `--revoke` — channel deletes use `channels.deleteMessages`, which has no revoke variant — and reject `--self-only` with a Usage error. The dry-run payload states the scope (`"revoke": true|false` and a `would` ending in "for yourself" or "for both sides"), and the by-id `results[].data` echoes the requested scope as `revoke` (the `--all` sweep report does not).
+In private chats and basic groups the delete scope is explicit: without `--revoke` the deletion applies to your copy only (`revoke: false`), with `--revoke` it also removes the message for the other side (`revoke: true`). `--revoke` is mutually exclusive with `--self-only`. Channels ignore `--revoke` — channel deletes use `channels.deleteMessages`, which has no revoke variant, so a channel delete always removes the message for every member — and reject `--self-only` with a Usage error. The dry-run payload states the scope (`"revoke": true|false` and a `would` naming the scope for private chats and the always-for-everyone channel case, since the peer kind is not known before connecting), and `results[].data` carries the effective scope as `revoke` — true when the deletion also removed the message for other participants (channels always, private chats only with `--revoke`) — for both the by-id and the `--all` report. In human mode a line states what was deleted and on whose side.
 
 ## `msg click`
 
