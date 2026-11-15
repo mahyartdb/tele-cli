@@ -412,14 +412,13 @@ pub(crate) async fn delete_core(
             count += delete_batch(shares, chat_ref, chunk, is_channel, revoke).await?;
         }
     }
-    let (report, partial) = delete_report(ids.len(), count);
+    let (mut report, partial) = delete_report(ids.len(), count);
     if partial {
         crate::output::log_line(
             "warn",
             &format!("delete removed {count} of {} requested id(s)", ids.len()),
         );
     }
-    let mut report = report;
     report["revoke"] = serde_json::json!(revoke && !self_only);
     Ok(report)
 }
