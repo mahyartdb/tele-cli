@@ -1094,11 +1094,41 @@ fn extract_edit_date(value: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn extract_max_id(value: &serde_json::Value) -> Option<i32> {
-    let msgs = value.get("messages")?.as_array()?;
-    msgs.iter()
-        .filter_map(|m| m.get("id")?.as_i64().and_then(|v| i32::try_from(v).ok()))
-        .max()
+/// What a watch tick concluded.
+enum WatchOutcome {
+    /// The watched message was edited.
+    Edited(serde_json::Value),
+    /// A newer message landed in the chat.
+    Newer(serde_json::Value),
+    /// Nothing to report yet.
+    Continue,
+}
+
+/// Decide what a poll tick means.
+///
+/// The edit check wins over the newer-message check, matching the
+/// documented contract: the watched row is returned when it changed, and
+/// the newest row only when the watched message itself did not change.
+fn watch_decision(
+    target_row: Option<&serde_json::Value>,
+    initial_edit: Option<&str>,
+    latest_row: Option<&serde_json::Value>,
+    target: i32,
+) -> WatchOutcome {
+    if let Some(row) = target_row {
+        let current_edit = row.get("edit_date").and_then(|d| d.as_str());
+        if current_edit.is_some() && current_edit != initial_edit {
+            return WatchOutcome::Edited(row.clone());
+        }
+    }
+    if let Some(latest) = latest_row {
+        if let Some(max_id) = latest.get("id").and_then(|i| i.as_i64()) {
+            if max_id > i64::from(target) {
+                return WatchOutcome::Newer(latest.clone());
+            }
+        }
+    }
+    WatchOutcome::Continue
 }
 
 pub(crate) async fn get_watch_core(
@@ -1150,51 +1180,110 @@ pub(crate) async fn get_watch_core(
                 params.timeout_secs
             )));
         }
-        let current = watch_fetch(shares, chat_ref, target).await?;
-        let current_edit = extract_edit_date(&current);
-        if current_edit.is_some() && current_edit != initial_edit {
-            return Ok(current);
-        }
-        if current_edit.is_none() {
-            let latest = watch_latest(shares, chat_ref).await?;
-            if let Some(max_id) = extract_max_id(&latest) {
-                if max_id > target {
-                    return Ok(latest);
+        let probe = watch_probe(shares, chat_ref, target).await?;
+        match watch_decision(
+            probe.target_row.as_ref(),
+            initial_edit.as_deref(),
+            probe.latest_row.as_ref(),
+            target,
+        ) {
+            WatchOutcome::Edited(row) => {
+                let mut row = row;
+                if params.replied {
+                    if let Some(msg) = &probe.target_msg {
+                        attach_reply_parent(shares, msg, &mut row).await?;
+                    }
                 }
+                return Ok(serde_json::json!({"messages": [row]}));
             }
+            WatchOutcome::Newer(latest) => {
+                return Ok(serde_json::json!({"messages": [latest]}));
+            }
+            WatchOutcome::Continue => {}
         }
     }
 }
 
-async fn watch_fetch(
+struct WatchProbe {
+    /// The watched message's current row, when the probe page covered it.
+    target_row: Option<serde_json::Value>,
+    /// The raw watched message, needed to resolve its reply parent.
+    target_msg: Option<grammers_client::message::Message>,
+    /// The newest message in the chat.
+    latest_row: Option<serde_json::Value>,
+}
+
+/// One poll tick: fetch the newest messages and look for the watched one.
+///
+/// The watched message is usually recent, so a single bounded page covers
+/// both the newest message and the target — one RPC per tick instead of
+/// the two the old loop spent, on top of the peer resolution it repeated
+/// on every tick. An older target falls back to a dedicated fetch.
+const WATCH_PROBE_PAGE: usize = 20;
+
+async fn watch_probe(
     shares: &crate::client::ServeShares,
     chat_ref: grammers_session::types::PeerRef,
     target: i32,
-) -> TeleResult<serde_json::Value> {
+) -> TeleResult<WatchProbe> {
     shares.rate_limiter.acquire().await;
-    let fetched = shares
+    let mut iter = shares
         .client
-        .get_messages_by_id(chat_ref, &[target])
-        .await
-        .map_err(tele_invocation)?;
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-    for msg in fetched.into_iter().flatten() {
-        push_message_row(&mut rows, &msg)?;
+        .iter_messages(chat_ref)
+        .limit(WATCH_PROBE_PAGE);
+    let mut latest_row: Option<serde_json::Value> = None;
+    let mut target_row: Option<serde_json::Value> = None;
+    let mut target_msg: Option<grammers_client::message::Message> = None;
+    while let Some(msg) = iter.next().await.map_err(tele_invocation)? {
+        let mut row = crate::serialize::message_to_json(&msg)?;
+        crate::serialize::enrich_message_row(&mut row, &msg);
+        if latest_row.is_none() {
+            latest_row = Some(row.clone());
+        }
+        if msg.id() == target {
+            target_row = Some(row);
+            target_msg = Some(msg);
+            break;
+        }
     }
-    Ok(serde_json::json!({"messages": rows}))
+    if target_row.is_none() {
+        shares.rate_limiter.acquire().await;
+        let fetched = shares
+            .client
+            .get_messages_by_id(chat_ref, &[target])
+            .await
+            .map_err(tele_invocation)?;
+        for msg in fetched.into_iter().flatten() {
+            let mut row = crate::serialize::message_to_json(&msg)?;
+            crate::serialize::enrich_message_row(&mut row, &msg);
+            target_row = Some(row);
+            target_msg = Some(msg);
+        }
+    }
+    Ok(WatchProbe {
+        target_row,
+        target_msg,
+        latest_row,
+    })
 }
 
-async fn watch_latest(
+/// Fetch the reply parent of the watched message and attach it as
+/// `replied_to`, matching the one-shot `msg get --replied` payload.
+async fn attach_reply_parent(
     shares: &crate::client::ServeShares,
-    chat_ref: grammers_session::types::PeerRef,
-) -> TeleResult<serde_json::Value> {
-    shares.rate_limiter.acquire().await;
-    let mut iter = shares.client.iter_messages(chat_ref).limit(1);
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-    while let Some(msg) = iter.next().await.map_err(tele_invocation)? {
-        push_message_row(&mut rows, &msg)?;
+    msg: &grammers_client::message::Message,
+    row: &mut serde_json::Value,
+) -> TeleResult<()> {
+    if let Some(parent) = shares
+        .client
+        .get_reply_to_message(msg)
+        .await
+        .map_err(tele_invocation)?
+    {
+        let parent_row = crate::serialize::message_to_json(&parent)?;
+        row["replied_to"] = parent_row;
     }
-    Ok(serde_json::json!({"messages": rows}))
+    Ok(())
 }
 
 use crate::commands::helpers::truncate_text;
@@ -2960,6 +3049,66 @@ mod msg_mod_tests {
         assert_eq!(search_scan_budget(5), 100);
         assert_eq!(search_scan_budget(50), 500);
         assert_eq!(search_scan_budget(0), 100);
+    }
+
+    fn watch_row(id: i32, edit_date: Option<&str>) -> serde_json::Value {
+        let mut row = serde_json::json!({"id": id, "text": "x"});
+        if let Some(e) = edit_date {
+            row["edit_date"] = serde_json::json!(e);
+        }
+        row
+    }
+
+    #[test]
+    fn watch_returns_edited_target_when_edit_date_changes() {
+        let initial = Some("2026-01-01T00:00:00+00:00");
+        let target = watch_row(7, Some("2026-02-02T00:00:00+00:00"));
+        let latest = watch_row(9, None);
+        match watch_decision(Some(&target), initial, Some(&latest), 7) {
+            WatchOutcome::Edited(row) => assert_eq!(row["id"], serde_json::json!(7)),
+            _ => panic!("an edit must win over a newer message"),
+        }
+    }
+
+    #[test]
+    fn watch_returns_newer_message_when_target_unchanged() {
+        let initial = Some("2026-01-01T00:00:00+00:00");
+        let target = watch_row(7, Some("2026-01-01T00:00:00+00:00"));
+        let latest = watch_row(9, None);
+        match watch_decision(Some(&target), initial, Some(&latest), 7) {
+            WatchOutcome::Newer(row) => assert_eq!(row["id"], serde_json::json!(9)),
+            _ => panic!("an unchanged target must fall through to the newer message"),
+        }
+    }
+
+    #[test]
+    fn watch_detects_newer_message_even_when_target_was_already_edited() {
+        // Regression: an earlier rewrite gated the newest-message probe on
+        // the target having no edit_date, so a message that was already
+        // edited before the watch started never reported newer messages.
+        let initial = Some("2026-01-01T00:00:00+00:00");
+        let target = watch_row(7, Some("2026-01-01T00:00:00+00:00"));
+        let latest = watch_row(9, None);
+        match watch_decision(Some(&target), initial, Some(&latest), 7) {
+            WatchOutcome::Newer(row) => assert_eq!(row["id"], serde_json::json!(9)),
+            _ => panic!("a pre-edited target must still report newer messages"),
+        }
+    }
+
+    #[test]
+    fn watch_keeps_polling_when_nothing_changed() {
+        let initial = Some("2026-01-01T00:00:00+00:00");
+        let target = watch_row(7, Some("2026-01-01T00:00:00+00:00"));
+        let latest = watch_row(5, None);
+        assert!(matches!(
+            watch_decision(Some(&target), initial, Some(&latest), 7),
+            WatchOutcome::Continue
+        ));
+        let unedited = watch_row(7, None);
+        assert!(matches!(
+            watch_decision(Some(&unedited), None, Some(&latest), 7),
+            WatchOutcome::Continue
+        ));
     }
 
     #[test]

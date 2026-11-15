@@ -254,7 +254,7 @@ Rows gain additive `"username"` (a string, empty when none). The human table app
 
 ## `msg get --watch`
 
-`tele msg get --chat X --id N --watch [--timeout-secs S]` polls until the message changes and returns the newest row: an edit to the watched message, or a newer message landing in the chat while the poll runs. `--timeout-secs` (default 60, must be > 0) bounds the whole poll; on expiry the command exits 3 with a `Timeout`-class error. The same `watch`/`timeout_secs` params are available over serve/MCP (`GetParams.watch`, `timeout_secs`).
+`tele msg get --chat X --id N --watch [--timeout-secs S] [--poll-interval S]` polls until the message changes and returns the newest row: an edit to the watched message, or a newer message landing in the chat while the poll runs. An edit wins over a newer message when both happen in the same tick. `--timeout-secs` (default 60, must be > 0) bounds the whole poll; on expiry the command exits 3 with a `Timeout`-class error. `--poll-interval` (default 2, must be >= 1) is the sleep between polls. The same `watch`/`timeout_secs`/`poll_interval` params are available over serve/MCP (`GetParams.watch`, `timeout_secs`, `poll_interval`).
 
 ## `msg get --replied`
 
