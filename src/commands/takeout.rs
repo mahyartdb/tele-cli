@@ -273,6 +273,50 @@ fn export_error_message(dir: &std::path::Path, cause: &str) -> String {
     )
 }
 
+fn export_expired_message(dir: &std::path::Path, cause: &str) -> String {
+    format!(
+        "takeout export failed; export dir {}: {}; the server-side takeout session expired (TAKEOUT_INVALID/TAKEOUT_REQUIRED), so re-running `tele takeout export` cannot resume and the saved checkpoints cannot be reused: clear the stale local takeout.json with `tele takeout finish --abandon`, then run `tele takeout start` again to begin a new session; cause: {cause}",
+        dir.to_string_lossy(),
+        export_state(dir),
+    )
+}
+
+fn takeout_session_expired(err: &TeleError) -> bool {
+    matches!(
+        err,
+        TeleError::Rpc(_, _, name, _) if name == "TAKEOUT_INVALID" || name == "TAKEOUT_REQUIRED"
+    )
+}
+
+fn export_failure(dir: &std::path::Path, err: TeleError) -> TeleError {
+    let guidance = if takeout_session_expired(&err) {
+        export_expired_message(dir, &err.message())
+    } else {
+        export_error_message(dir, &err.message())
+    };
+    err.with_guidance(&guidance)
+}
+
+impl TeleError {
+    fn with_guidance(self, guidance: &str) -> TeleError {
+        match self {
+            TeleError::Usage(m) => TeleError::Usage(format!("{m}; {guidance}")),
+            TeleError::Auth(m) => TeleError::Auth(format!("{m}; {guidance}")),
+            TeleError::Config(m) => TeleError::Config(format!("{m}; {guidance}")),
+            TeleError::Invocation(m, seconds) => {
+                TeleError::Invocation(format!("{m}; {guidance}"), seconds)
+            }
+            TeleError::Rpc(m, code, name, seconds) => {
+                TeleError::Rpc(format!("{m}; {guidance}"), code, name, seconds)
+            }
+            TeleError::TaskPanic(m) => TeleError::TaskPanic(format!("{m}; {guidance}")),
+            TeleError::Timeout(m) => TeleError::Timeout(format!("{m}; {guidance}")),
+            TeleError::Other(m) => TeleError::Other(format!("{m}; {guidance}")),
+            TeleError::BrokenPipe => TeleError::BrokenPipe,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ResumeCursor {
     Fresh,
@@ -361,7 +405,7 @@ async fn export(args: ExportArgs, flags: &GlobalFlags) -> TeleResult<i32> {
             guard.rate_limiter.acquire().await;
             run_export(&guard, &dir, limit, takeout_id, human, redact_phones)
                 .await
-                .map_err(|e| TeleError::Other(export_error_message(&dir, &e.to_string())))
+                .map_err(|e| export_failure(&dir, e))
         })
     })
     .await?;
@@ -1252,6 +1296,68 @@ mod tests {
         assert!(msg.contains("takeout export"), "msg: {msg}");
         assert!(msg.contains("FLOOD_WAIT"), "msg: {msg}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_failure_keeps_rpc_code_name_and_seconds() {
+        let dir = temp_dir("err-typed");
+        let err = TeleError::Rpc(
+            "rpc error 420: FLOOD_WAIT (value: 30)".to_string(),
+            420,
+            "FLOOD_WAIT".to_string(),
+            Some(30),
+        );
+        let wrapped = export_failure(&dir, err);
+        let json = wrapped.as_json();
+        assert_eq!(json["type"], "InvocationError");
+        assert_eq!(json["code"], serde_json::json!(420));
+        assert_eq!(json["name"], serde_json::json!("FLOOD_WAIT"));
+        assert_eq!(json["seconds"], serde_json::json!(30));
+        let msg = wrapped.message();
+        assert!(
+            msg.starts_with("rpc error 420: FLOOD_WAIT (value: 30); takeout export failed"),
+            "msg: {msg}"
+        );
+        assert!(msg.contains("resume automatically"), "msg: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_failure_keeps_auth_and_usage_variants() {
+        let dir = temp_dir("err-variants");
+        let auth = export_failure(&dir, TeleError::Auth("session invalid".to_string()));
+        assert_eq!(auth.as_json()["type"], "AuthError");
+        assert_eq!(auth.exit_code(), 4);
+        assert!(auth.message().contains("takeout export failed"));
+
+        let usage = export_failure(&dir, TeleError::Usage("bad --message-limit".to_string()));
+        assert_eq!(usage.as_json()["type"], "UsageError");
+        assert_eq!(usage.exit_code(), 1);
+        assert!(usage.message().contains("takeout export failed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_takeout_session_failure_tones_down_resume_promises() {
+        for name in ["TAKEOUT_INVALID", "TAKEOUT_REQUIRED"] {
+            let dir = temp_dir("err-expired");
+            std::fs::write(dir.join("contacts.json"), "[]").unwrap();
+            let err = TeleError::Rpc(
+                format!("rpc error 404: {name}"),
+                404,
+                name.to_string(),
+                None,
+            );
+            let wrapped = export_failure(&dir, err);
+            let msg = wrapped.message();
+            assert!(!msg.contains("kept alive"), "{name} msg: {msg}");
+            assert!(!msg.contains("resume automatically"), "{name} msg: {msg}");
+            assert!(msg.contains("expired"), "{name} msg: {msg}");
+            assert!(msg.contains("`tele takeout start`"), "{name} msg: {msg}");
+            assert!(msg.contains("contacts.json: written"), "{name} msg: {msg}");
+            assert_eq!(wrapped.as_json()["name"], serde_json::json!(name));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

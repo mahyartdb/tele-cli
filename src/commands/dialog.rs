@@ -750,6 +750,21 @@ fn delete_route(peer: &tl::enums::InputPeer) -> DeleteRoute {
     }
 }
 
+pub(crate) fn saved_messages_refusal(
+    peer: &tl::enums::InputPeer,
+    is_self_user: bool,
+    include_self: bool,
+) -> Option<&'static str> {
+    if include_self {
+        return None;
+    }
+    let targets_saved_messages = matches!(peer, tl::enums::InputPeer::PeerSelf)
+        || (matches!(peer, tl::enums::InputPeer::User(_)) && is_self_user);
+    targets_saved_messages.then_some(
+        "refusing to delete Saved Messages (your own account); pass --include-self (include_self: true over serve/MCP) to confirm",
+    )
+}
+
 fn delete_result(target: &str, left: bool, cleared: bool) -> serde_json::Value {
     serde_json::json!({
         "chat": target,
@@ -917,13 +932,9 @@ pub(crate) async fn dialog_delete_core(
     let chat =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.chat).await?;
     let peer = entities::input_peer(&chat).await.map_err(tele_invocation)?;
-    let targets_saved_messages = matches!(peer, tl::enums::InputPeer::PeerSelf)
-        || matches!(chat, grammers_client::peer::Peer::User(ref u) if u.is_self());
-    if targets_saved_messages && !params.include_self {
-        return Err(TeleError::Usage(
-            "refusing to delete Saved Messages (chat me); pass --include-self to confirm"
-                .to_string(),
-        ));
+    let is_self_user = matches!(chat, grammers_client::peer::Peer::User(ref u) if u.is_self());
+    if let Some(refusal) = saved_messages_refusal(&peer, is_self_user, params.include_self) {
+        return Err(TeleError::Usage(refusal.to_string()));
     }
     match delete_route(&peer) {
         DeleteRoute::HistoryClear => {
@@ -2735,6 +2746,10 @@ mod tests {
             delete_route(&peer_channel(11)),
             DeleteRoute::Leave
         ));
+        assert!(matches!(
+            delete_route(&tl::enums::InputPeer::Empty),
+            DeleteRoute::Leave
+        ));
     }
 
     #[test]
@@ -2877,79 +2892,36 @@ mod tests {
     }
 
     #[test]
-    fn saved_messages_guard_covers_resolved_self_user_not_just_peer_self_variant() {
-        // resolve_peer("me") returns the real user via get_me(), so the
-        // InputPeer built from it is InputPeer::User with the real id —
-        // never InputPeer::PeerSelf. The guard must also consult
-        // Peer::User::is_self, or `dialog delete --chat me` would clear
-        // the whole Saved Messages history without --include-self.
-        let self_user = tl::enums::User::User(tl::types::User {
-            is_self: true,
-            ..sample_user()
-        });
-        let targets_saved_messages = matches!(&self_user, tl::enums::User::User(u) if u.is_self);
-        assert!(targets_saved_messages, "me-resolved user must be caught");
-        let other_user = tl::enums::User::User(tl::types::User {
-            is_self: false,
-            ..sample_user()
-        });
-        let targets_saved_messages = matches!(&other_user, tl::enums::User::User(u) if u.is_self);
-        assert!(!targets_saved_messages, "other users must pass through");
+    fn saved_messages_refusal_truth_table() {
+        let self_peer = tl::enums::InputPeer::PeerSelf;
+        assert!(saved_messages_refusal(&self_peer, false, false).is_some());
+        assert!(saved_messages_refusal(&self_peer, true, false).is_some());
+        assert!(saved_messages_refusal(&self_peer, false, true).is_none());
+        assert!(saved_messages_refusal(&self_peer, true, true).is_none());
+
+        let self_user = peer_user(7);
+        assert!(saved_messages_refusal(&self_user, true, false).is_some());
+        assert!(saved_messages_refusal(&self_user, true, true).is_none());
+        assert!(saved_messages_refusal(&self_user, false, false).is_none());
+        assert!(saved_messages_refusal(&self_user, false, true).is_none());
+
+        let ordinary_chat = peer_chat(9);
+        assert!(saved_messages_refusal(&ordinary_chat, false, false).is_none());
+        assert!(saved_messages_refusal(&ordinary_chat, true, false).is_none());
+
+        let channel = peer_channel(11);
+        assert!(saved_messages_refusal(&channel, false, false).is_none());
+        assert!(saved_messages_refusal(&channel, true, false).is_none());
     }
 
-    fn sample_user() -> tl::types::User {
-        tl::types::User {
-            id: 42,
-            is_self: false,
-            contact: false,
-            mutual_contact: false,
-            deleted: false,
-            bot: false,
-            bot_chat_history: false,
-            bot_nochats: false,
-            verified: false,
-            restricted: false,
-            min: false,
-            bot_inline_geo: false,
-            support: false,
-            scam: false,
-            apply_min_photo: false,
-            fake: false,
-            bot_attach_menu: false,
-            premium: false,
-            attach_menu_enabled: false,
-            bot_can_edit: false,
-            close_friend: false,
-            stories_hidden: false,
-            stories_unavailable: false,
-            contact_require_premium: false,
-            bot_business: false,
-            bot_has_main_app: false,
-            bot_forum_view: false,
-            bot_forum_can_manage_topics: false,
-            bot_can_manage_bots: false,
-            bot_guestchat: false,
-            bot_guard: false,
-            access_hash: None,
-            first_name: None,
-            last_name: None,
-            username: None,
-            phone: None,
-            photo: None,
-            status: None,
-            bot_info_version: None,
-            restriction_reason: None,
-            bot_inline_placeholder: None,
-            lang_code: None,
-            emoji_status: None,
-            usernames: None,
-            stories_max_id: None,
-            color: None,
-            profile_color: None,
-            bot_active_users: None,
-            bot_verification_icon: None,
-            send_paid_messages_stars: None,
-        }
+    #[test]
+    fn saved_messages_refusal_message_names_cli_and_serve_flags() {
+        let msg = saved_messages_refusal(&peer_user(7), true, false).unwrap();
+        assert!(msg.contains("Saved Messages"), "msg: {msg}");
+        assert!(msg.contains("your own account"), "msg: {msg}");
+        assert!(msg.contains("--include-self"), "msg: {msg}");
+        assert!(msg.contains("include_self: true"), "msg: {msg}");
+        assert!(msg.contains("serve/MCP"), "msg: {msg}");
     }
 
     fn dialog_flags(command: &str, config: &std::path::Path) -> GlobalFlags {
