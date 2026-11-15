@@ -45,6 +45,25 @@ Measured 2026-09-19 on the maintainer Windows box, debug profile, deps-cached:
    + `catch_up` in `client.rs`): live-flood spot check. Gate: behaviour
    documented before any queue/lane change lands.
 
+## Landed optimisations (2026-11)
+
+Recorded here so the next curve run has a before/after reference. RPC
+and scan counts are offline-verifiable; the wall-clock numbers still
+need a live account, and the live spot-checks are named per row.
+
+| Change | Curve | Before | After |
+|---|---|---|---|
+| `msg search` client-side-filter scan bound (`src/commands/msg/mod.rs`) | 1 | unbounded: the scan only ended at `--limit` matches or history exhaustion, so `--from` over a chat where that sender rarely wrote walked the whole history (100-message pages, one RPC per page) | bounded at `search_scan_budget` = 10x `--limit` (floor 100) rows examined; `truncated` reports the cut, and human mode warns |
+| `msg get --watch` poll tick (`src/commands/msg/mod.rs`) | 1 | ~4 RPCs per tick (peer resolve x2 - a real `contacts.ResolveUsername` for `@username` targets - plus one fetch per probe) and 2 session-DB peer lookups | 1 RPC per tick for a recent target (one bounded page carries both the newest message and the watched one), 2 for an older target; the peer is resolved once before the loop |
+| `serve` resync dispatch (`src/commands/serve.rs`) | 2, 8 | `tx.send(()).await` on a 1-slot channel whose receiver is only polled inside the account event loop: a second resync while an account reconnects or waits out a flood stalled the sequential dispatcher | `try_send`: a full slot already means a resync is pending, so the duplicate is dropped instead of blocking the dispatcher |
+| `serve` catch-up flag consumption (`src/commands/serve.rs`) | 8 | the flag was consumed after `stream_updates` built the stream, so a resync/error rebuild ran live-only and the outage window was lost | the flag is taken before the stream is built, so the rebuild replays from the persisted pts |
+| `listen` album flush on stop (`src/commands/listen.rs`) | 8 | pending album members were dropped on every `--count`/`--until`/broken-pipe stop (neither an `Album` row nor `NewMessage` rows) | flushed before the stop returns, on every stop site |
+
+Live spot-checks still owed: curve 1 (pagination/search time-vs-limit on
+a live account), curve 2 (fan-out `--parallel` sweep, to confirm the
+dispatcher change costs nothing), curve 8 (resync replay after a
+simulated outage).
+
 ## First-cut scope notes
 
 - FTS5: the `messages_au` update trigger closed the open "no update trigger"
