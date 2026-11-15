@@ -2577,13 +2577,15 @@ fn per_event_serialization_error_does_not_kill_stream() {
 }
 
 #[test]
-fn until_instant_none_yields_no_deadline() {
-    assert_eq!(until_instant(None).unwrap(), None);
+fn until_bounds_none_yields_no_deadline_and_no_date() {
+    let (deadline, date) = until_bounds(None).unwrap();
+    assert_eq!(deadline, None);
+    assert_eq!(date, None);
 }
 
 #[test]
-fn until_instant_invalid_value_maps_to_usage() {
-    let err = until_instant(Some("garbage")).expect_err("invalid --until must be rejected");
+fn until_bounds_invalid_value_maps_to_usage() {
+    let err = until_bounds(Some("garbage")).expect_err("invalid --until must be rejected");
     assert!(matches!(err, TeleError::Usage(_)), "err: {err}");
     assert_eq!(err.exit_code(), crate::error::EXIT_USAGE);
     assert!(err.message().contains("--until"), "err: {err}");
@@ -2591,13 +2593,37 @@ fn until_instant_invalid_value_maps_to_usage() {
 }
 
 #[test]
-fn until_instant_accepts_timestamp_relative_date_and_rfc3339() {
-    assert!(until_instant(Some("4102444800")).unwrap().is_some());
-    assert!(until_instant(Some("+90s")).unwrap().is_some());
-    assert!(until_instant(Some("2100-01-01")).unwrap().is_some());
-    assert!(until_instant(Some("2100-01-01T00:00:00Z"))
+fn until_bounds_accepts_timestamp_relative_date_and_rfc3339() {
+    assert!(until_bounds(Some("4102444800")).unwrap().1.is_some());
+    assert!(until_bounds(Some("+90s")).unwrap().1.is_some());
+    assert!(until_bounds(Some("2100-01-01")).unwrap().1.is_some());
+    assert!(until_bounds(Some("2100-01-01T00:00:00Z"))
         .unwrap()
+        .1
         .is_some());
+}
+
+#[test]
+fn past_until_has_no_wall_clock_deadline() {
+    // Regression: a past --until used to produce an already-expired
+    // wall-clock deadline, which stopped the stream before its first row
+    // instead of bounding it by event date.
+    let (deadline, date) = until_bounds(Some("2020-01-01T00:00:00Z")).unwrap();
+    assert_eq!(
+        deadline, None,
+        "a past --until must not carry a wall-clock deadline"
+    );
+    assert!(date.is_some(), "the event-date limit is still set");
+}
+
+#[test]
+fn future_until_carries_both_bounds() {
+    let (deadline, date) = until_bounds(Some("2100-01-01T00:00:00Z")).unwrap();
+    assert!(
+        deadline.is_some(),
+        "a future --until keeps its wall deadline"
+    );
+    assert!(date.is_some());
 }
 
 #[test]

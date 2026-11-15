@@ -501,6 +501,50 @@ fn album_flush(account: &str, buf: &mut AlbumBuffer) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Emit a row without consulting the stopper. Returns true when the
+/// stream must stop (broken pipe).
+async fn emit_direct(account: &str, value: serde_json::Value) -> TeleResult<bool> {
+    match emit_row(value).await {
+        Ok(()) => Ok(false),
+        Err(e) if emit_stops_stream(&e) => Ok(true),
+        Err(e) if matches!(e, TeleError::Usage(_)) => Err(e),
+        Err(e) => {
+            output::log_line("error", &format!("{account}: emit failed: {}", e.message()));
+            Ok(false)
+        }
+    }
+}
+
+/// Emit pending albums after a stop was decided.
+///
+/// The stop decision already consumed the `--count` budget (or hit the
+/// date boundary), so re-entering `emit_row_or_stop` here would veto every
+/// row before it was written. These members were already received off the
+/// wire, so dropping them is silent data loss: they would appear neither
+/// as an `Album` row nor as individual `NewMessage` rows.
+async fn flush_albums_on_stop(account: &str, album: &mut AlbumBuffer) -> TeleResult<()> {
+    for row in album_flush(account, album) {
+        if emit_direct(account, row).await? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Emit a row, flushing pending albums when the stream stops.
+async fn emit_or_stop(
+    stopper: &StreamStopper,
+    account: &str,
+    album: &mut AlbumBuffer,
+    value: serde_json::Value,
+) -> TeleResult<bool> {
+    if emit_row_or_stop(stopper, account, value).await? {
+        flush_albums_on_stop(account, album).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn album_flush_chat(
     account: &str,
     buf: &mut AlbumBuffer,
@@ -608,24 +652,30 @@ pub(crate) fn dedupe_key(
 #[cfg(test)]
 use super::serve::pts_from_state;
 
-fn until_instant(value: Option<&str>) -> TeleResult<Option<std::time::Instant>> {
+/// Parse `--until` into both bounds: the wall-clock deadline (only for a
+/// FUTURE timestamp) and the event-date limit.
+///
+/// A past timestamp gets NO wall-clock deadline. The old code turned the
+/// negative offset into `Duration::ZERO`, so the deadline was already
+/// expired and the stream stopped before its first row — the documented
+/// "first event at/after that timestamp" filter never had a chance to
+/// match the backlog it was meant to bound.
+fn until_bounds(
+    value: Option<&str>,
+) -> TeleResult<(
+    Option<std::time::Instant>,
+    Option<chrono::DateTime<chrono::Utc>>,
+)> {
     match value {
-        None => Ok(None),
+        None => Ok((None, None)),
         Some(v) => {
             let dt = crate::commands::msg::download::parse_download_date("--until", v)?;
-            Ok(Some(
-                std::time::Instant::now() + (dt - chrono::Utc::now()).to_std().unwrap_or_default(),
-            ))
+            let deadline = (dt - chrono::Utc::now())
+                .to_std()
+                .ok()
+                .map(|d| std::time::Instant::now() + d);
+            Ok((deadline, Some(dt)))
         }
-    }
-}
-
-fn until_date(value: Option<&str>) -> TeleResult<Option<chrono::DateTime<chrono::Utc>>> {
-    match value {
-        None => Ok(None),
-        Some(v) => Ok(Some(crate::commands::msg::download::parse_download_date(
-            "--until", v,
-        )?)),
     }
 }
 
@@ -667,8 +717,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         output::log_line("info", "listen streams JSONL events on stdout");
     }
     let timeout_secs = args.timeout_secs;
-    let until = until_instant(args.until.as_deref())?;
-    let until_date = until_date(args.until.as_deref())?;
+    let (until, until_date) = until_bounds(args.until.as_deref())?;
     let stopper = Arc::new(StreamStopper::new(args.count, until, until_date));
     let direction = if args.out {
         Some(Direction::Out)
@@ -828,8 +877,12 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     loop {
                         if let Some(d) = deadline {
                             if std::time::Instant::now() >= d {
+                                // The deadline already ends the run, so these
+                                // rows are written directly: routing them
+                                // through the stopper would veto them once
+                                // the count budget is spent.
                                 for done in album_flush(&name, &mut album) {
-                                    if emit_row_or_stop(&stopper, &name, done).await? {
+                                    if emit_direct(&name, done).await? {
                                         return Ok(());
                                     }
                                 }
@@ -864,7 +917,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 for done in
                                     album_sweep(&name, &mut album, tokio::time::Instant::now())
                                 {
-                                    if emit_row_or_stop(&stopper, &name, done).await? {
+                                    if emit_or_stop(&stopper, &name, &mut album, done).await? {
                                         return Ok(());
                                     }
                                 }
@@ -879,8 +932,11 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                     );
                                     return Err(crate::error::invocation_error(e));
                                 }
+                                // The stream is about to reconnect; pending
+                                // album members are written directly so a
+                                // spent count budget cannot drop them.
                                 for done in album_flush(&name, &mut album) {
-                                    if emit_row_or_stop(&stopper, &name, done).await? {
+                                    if emit_direct(&name, done).await? {
                                         return Ok(());
                                     }
                                 }
@@ -905,7 +961,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         }
                         if gap_on {
                             if let Some(signal) = gaps.observe(update.raw()) {
-                                                                if emit_row_or_stop(&stopper, &name, gap_row(&name, &signal, update.state())).await? { return Ok(()); }
+                                                                if emit_or_stop(&stopper, &name, &mut album, gap_row(&name, &signal, update.state())).await? { return Ok(()); }
 
                             }
                         }
@@ -968,7 +1024,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                             peer,
                                             None,
                                         );
-                                                                                if emit_row_or_stop(&stopper, &name, service_row(
+                                                                                if emit_or_stop(&stopper, &name, &mut album, service_row(
                                             &name, chat_id, svc_row, &svc.action,
                                         )).await? { return Ok(()); }
 
@@ -1001,14 +1057,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                             gid,
                                             tokio::time::Instant::now(),
                                         ) {
-                                            if emit_row_or_stop(&stopper, &name, done).await? {
-                                                for rest in album_flush(&name, &mut album) {
-                                                    if emit_row_or_stop(&stopper, &name, rest)
-                                                        .await?
-                                                    {
-                                                        return Ok(());
-                                                    }
-                                                }
+                                            if emit_or_stop(&stopper, &name, &mut album, done).await? {
                                                 return Ok(());
                                             }
                                         }
@@ -1020,27 +1069,17 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 for done in
                                     album_flush_chat(&name, &mut album, chat_id)
                                 {
-                                    if emit_row_or_stop(&stopper, &name, done).await? {
-                                        for rest in album_flush(&name, &mut album) {
-                                            if emit_row_or_stop(&stopper, &name, rest).await? {
-                                                return Ok(());
-                                            }
-                                        }
+                                    if emit_or_stop(&stopper, &name, &mut album, done).await? {
                                         return Ok(());
                                     }
                                 }
-                                if emit_row_or_stop(&stopper, &name, event_row(
+                                if emit_or_stop(&stopper, &name, &mut album, event_row(
                                     "NewMessage",
                                     &name,
                                     chat_id,
                                     None,
                                     Some(row),
                                 )).await? {
-                                    for rest in album_flush(&name, &mut album) {
-                                        if emit_row_or_stop(&stopper, &name, rest).await? {
-                                            return Ok(());
-                                        }
-                                    }
                                     return Ok(());
                                 }
 
@@ -1102,7 +1141,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                             peer,
                                             None,
                                         );
-                                                                                if emit_row_or_stop(&stopper, &name, service_row(
+                                                                                if emit_or_stop(&stopper, &name, &mut album, service_row(
                                             &name, chat_id, svc_row, &svc.action,
                                         )).await? { return Ok(()); }
 
@@ -1124,7 +1163,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                     }
                                 };
                                 crate::serialize::ensure_outer_peer_sender(&mut row, peer, None);
-                                                                if emit_row_or_stop(&stopper, &name, event_row(
+                                                                if emit_or_stop(&stopper, &name, &mut album, event_row(
                                     "MessageEdited",
                                     &name,
                                     chat_id,
@@ -1152,7 +1191,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 let Some(matched) = matched else {
                                     continue;
                                 };
-                                                                if emit_row_or_stop(&stopper, &name, event_row(
+                                                                if emit_or_stop(&stopper, &name, &mut album, event_row(
                                     "MessageDeleted",
                                     &name,
                                     sole_chat_label(&filter.chats),
@@ -1169,7 +1208,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                         if !filter.action_allows(peer, sender) {
                                             continue;
                                         }
-                                                                                if emit_row_or_stop(&stopper, &name, row).await? { return Ok(()); }
+                                                                                if emit_or_stop(&stopper, &name, &mut album, row).await? { return Ok(()); }
 
                                         continue;
                                     }
@@ -1181,7 +1220,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                         if !filter.action_allows(peer, sender) {
                                             continue;
                                         }
-                                                                                if emit_row_or_stop(&stopper, &name, row).await? { return Ok(()); }
+                                                                                if emit_or_stop(&stopper, &name, &mut album, row).await? { return Ok(()); }
 
                                         continue;
                                     }
@@ -1193,7 +1232,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                         if !filter.action_allows(peer, sender) {
                                             continue;
                                         }
-                                                                                if emit_row_or_stop(&stopper, &name, row).await? { return Ok(()); }
+                                                                                if emit_or_stop(&stopper, &name, &mut album, row).await? { return Ok(()); }
 
                                         continue;
                                     }
@@ -1204,7 +1243,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 if !filter.raw_allows(update_peer(update.raw())) {
                                     continue;
                                 }
-                                                                if emit_row_or_stop(&stopper, &name, raw_row(&name, update.raw(), update.state())).await? { return Ok(()); }
+                                                                if emit_or_stop(&stopper, &name, &mut album, raw_row(&name, update.raw(), update.state())).await? { return Ok(()); }
 
                             }
                         }
@@ -1272,6 +1311,7 @@ struct StreamStopper {
     remaining: std::sync::Mutex<Option<u64>>,
     until: std::sync::Mutex<Option<std::time::Instant>>,
     until_date: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 impl StreamStopper {
@@ -1284,7 +1324,17 @@ impl StreamStopper {
             remaining: std::sync::Mutex::new(count),
             until: std::sync::Mutex::new(until),
             until_date: std::sync::Mutex::new(until_date),
+            stopped: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn request_stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn time_up(&self) -> bool {
@@ -1296,21 +1346,33 @@ impl StreamStopper {
     }
 
     /// Documented --until contract: stop after the first event at/after the
-    /// timestamp. Events carry an RFC3339 date only on message rows; rows
-    /// without a date fall back to the wall-clock deadline so Raw/Gap-style
-    /// events cannot loop forever when a past --until would never match.
+    /// timestamp.
+    ///
+    /// Message rows carry an RFC3339 `date`; Raw and Gap rows carry
+    /// `state.date` (epoch seconds). Rows with neither (ChatAction,
+    /// UserUpdate, CallbackQuery, MessageDeleted) can never match a date
+    /// filter, so they never stop the stream — `--timeout-secs` bounds
+    /// those runs.
     fn event_date_reached(&self, value: &serde_json::Value) -> bool {
         let guard = self.until_date.lock().unwrap_or_else(|e| e.into_inner());
         let Some(limit) = *guard else {
             return false;
         };
-        match value
+        let row_date = value
             .get("date")
             .and_then(|d| d.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        {
-            Some(d) => d.with_timezone(&chrono::Utc) >= limit,
-            None => self.time_up(),
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .or_else(|| {
+                value
+                    .get("state")
+                    .and_then(|s| s.get("date"))
+                    .and_then(|d| d.as_i64())
+                    .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+            });
+        match row_date {
+            Some(d) => d >= limit,
+            None => false,
         }
     }
 
@@ -1340,7 +1402,17 @@ async fn emit_row_or_stop(
     account: &str,
     value: serde_json::Value,
 ) -> TeleResult<bool> {
-    if stopper.event_date_reached(&value) || stopper.time_up() || stopper.is_exhausted() {
+    // A date stop is shared: once one account reaches the --until boundary
+    // the whole run ends, instead of leaving quiet accounts streaming on.
+    if stopper.event_date_reached(&value) {
+        stopper.request_stop();
+        output::log_line("info", "listen --until reached");
+        return Ok(true);
+    }
+    // time_up() only fires for a FUTURE --until (a past timestamp has no
+    // wall-clock deadline), where it bounds the run even if no dated row
+    // ever arrives.
+    if stopper.stop_requested() || stopper.time_up() || stopper.is_exhausted() {
         return Ok(true);
     }
     match emit_row(value).await {
@@ -1994,7 +2066,7 @@ mod stopper_tests {
     }
 
     #[test]
-    fn past_until_date_stops_on_first_dated_row_before_it() {
+    fn past_until_date_stops_on_first_row_at_or_after_it() {
         // Regression: --until used to be a wall-clock deadline, so a past
         // timestamp expired before the first event and the stream exited
         // with zero rows instead of replaying backlog dated before the
@@ -2016,21 +2088,44 @@ mod stopper_tests {
     }
 
     #[test]
-    fn undated_rows_fall_back_to_wall_clock_until() {
-        let past = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+    fn raw_and_gap_rows_match_on_state_date() {
+        let limit = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let stopper = StreamStopper::new(
-            None,
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
-            Some(past),
-        );
-        let raw_row = serde_json::json!({"event": "Raw"});
-        assert!(
-            stopper.event_date_reached(&raw_row),
-            "undated rows cannot match a past event-date filter forever; \
-             they fall back to the wall-clock deadline"
-        );
+        let stopper = StreamStopper::new(None, None, Some(limit));
+        let before = serde_json::json!({"event": "Raw", "state": {"date": 1_700_000_000i64}});
+        let after = serde_json::json!({"event": "Raw", "state": {"date": 2_000_000_000i64}});
+        assert!(!stopper.event_date_reached(&before));
+        assert!(stopper.event_date_reached(&after));
+    }
+
+    #[test]
+    fn rows_without_any_date_never_stop_the_stream() {
+        // ChatAction/UserUpdate/CallbackQuery rows carry no date at all, so
+        // they can never match a date filter. They must not stop the run;
+        // --timeout-secs bounds it instead.
+        let limit = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stopper = StreamStopper::new(None, None, Some(limit));
+        let undated = serde_json::json!({"event": "ChatAction"});
+        assert!(!stopper.event_date_reached(&undated));
+        assert!(!stopper.time_up());
+    }
+
+    #[tokio::test]
+    async fn emit_row_or_stop_stops_on_a_dated_row_at_or_after_the_limit() {
+        // The wiring, not just the predicate: a past --until must not stop
+        // the stream before the row is written.
+        let limit = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stopper = StreamStopper::new(None, None, Some(limit));
+        let row = serde_json::json!({"event": "NewMessage", "date": "2026-06-01T00:00:00+00:00"});
+        assert!(super::emit_row_or_stop(&stopper, "work", row)
+            .await
+            .unwrap());
+        assert!(stopper.stop_requested());
     }
 
     #[tokio::test]
