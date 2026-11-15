@@ -165,7 +165,7 @@ pub(crate) async fn topic_create_core(
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.chat).await?;
     crate::commands::chat::ensure_chat_peer(&chat, "topic create")?;
     let peer = entities::input_peer(&chat).await.map_err(tele_invocation)?;
-    let _: tl::enums::Updates = shares
+    let updates: tl::enums::Updates = shares
         .client
         .invoke(&tl::functions::messages::CreateForumTopic {
             title_missing: false,
@@ -178,10 +178,31 @@ pub(crate) async fn topic_create_core(
         })
         .await
         .map_err(tele_invocation)?;
-    Ok(serde_json::json!({
-        "chat": params.chat,
-        "title": params.title,
-        "ok": true}))
+    Ok(create_payload(&params.chat, &params.title, &updates))
+}
+
+fn create_payload(chat: &str, title: &str, updates: &tl::enums::Updates) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "chat": chat,
+        "title": title,
+        "ok": true});
+    if let Some(topic_id) = created_topic_id(updates) {
+        payload["topic"] = serde_json::json!(topic_id);
+    }
+    payload
+}
+
+fn created_topic_id(updates: &tl::enums::Updates) -> Option<i32> {
+    let list = match updates {
+        tl::enums::Updates::Updates(u) => &u.updates,
+        tl::enums::Updates::Combined(u) => &u.updates,
+        _ => return None,
+    };
+    list.iter().find_map(|update| match update {
+        tl::enums::Update::NewChannelMessage(m) => Some(m.message.id()),
+        tl::enums::Update::NewMessage(m) => Some(m.message.id()),
+        _ => None,
+    })
 }
 
 async fn simple_action(
@@ -1400,6 +1421,97 @@ mod tests {
             assert!(matches!(err, TeleError::Usage(_)), "for {bad}");
             assert!(err.message().contains("positive"), "for {bad}");
         }
+    }
+
+    fn service_message(id: i32) -> tl::enums::Message {
+        tl::enums::Message::Service(tl::types::MessageService {
+            out: true,
+            mentioned: false,
+            media_unread: false,
+            reactions_are_possible: false,
+            silent: false,
+            post: false,
+            legacy: false,
+            id,
+            from_id: None,
+            peer_id: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 1 }),
+            saved_peer_id: None,
+            reply_to: None,
+            date: 1_760_000_000,
+            action: tl::enums::MessageAction::Empty,
+            reactions: None,
+            ttl_period: None,
+        })
+    }
+
+    fn new_channel_message(id: i32) -> tl::enums::Update {
+        tl::enums::Update::NewChannelMessage(tl::types::UpdateNewChannelMessage {
+            message: service_message(id),
+            pts: 1,
+            pts_count: 1,
+        })
+    }
+
+    fn updates_with(updates: Vec<tl::enums::Update>) -> tl::enums::Updates {
+        tl::enums::Updates::Updates(tl::types::Updates {
+            updates,
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 1_760_000_000,
+            seq: 0,
+        })
+    }
+
+    #[test]
+    fn created_topic_id_reads_the_new_channel_message_root_id() {
+        let updates = updates_with(vec![
+            tl::enums::Update::DeleteMessages(tl::types::UpdateDeleteMessages {
+                messages: vec![1],
+                pts: 1,
+                pts_count: 1,
+            }),
+            new_channel_message(77),
+        ]);
+        assert_eq!(created_topic_id(&updates), Some(77));
+    }
+
+    #[test]
+    fn created_topic_id_handles_combined_and_missing_updates() {
+        let combined = tl::enums::Updates::Combined(tl::types::UpdatesCombined {
+            updates: vec![new_channel_message(12)],
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 1_760_000_000,
+            seq_start: 0,
+            seq: 0,
+        });
+        assert_eq!(created_topic_id(&combined), Some(12));
+        assert_eq!(created_topic_id(&tl::enums::Updates::TooLong), None);
+        assert_eq!(
+            created_topic_id(&updates_with(vec![tl::enums::Update::DeleteMessages(
+                tl::types::UpdateDeleteMessages {
+                    messages: vec![1],
+                    pts: 1,
+                    pts_count: 1,
+                }
+            )])),
+            None
+        );
+    }
+
+    #[test]
+    fn create_payload_adds_topic_only_when_the_id_is_known() {
+        let with_id = create_payload(
+            "work",
+            "Topic",
+            &updates_with(vec![new_channel_message(42)]),
+        );
+        assert_eq!(with_id["topic"], serde_json::json!(42));
+        assert_eq!(with_id["ok"], serde_json::json!(true));
+
+        let unknown = create_payload("work", "Topic", &tl::enums::Updates::TooLong);
+        assert_eq!(unknown.get("topic"), None);
+        assert_eq!(unknown["chat"], serde_json::json!("work"));
     }
 
     #[test]

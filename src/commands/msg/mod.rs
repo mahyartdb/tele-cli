@@ -375,10 +375,7 @@ async fn delete(args: DeleteArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                 Some(serde_json::Value::Bool(true)) => "for both sides",
                 _ => "for yourself",
             };
-            crate::output::log_line(
-                "info",
-                &format!("deleted {deleted} message(s) {scope}"),
-            );
+            crate::output::log_line("info", &format!("deleted {deleted} message(s) {scope}"));
         }
     }
     crate::executor::finish(flags, &envelope)
@@ -674,12 +671,7 @@ pub(crate) async fn forward_core(
                 // report -- otherwise they vanish from forwarded, dropped
                 // and failed alike.
                 let paired: Vec<i32> = pairs.iter().map(|(original, _)| *original).collect();
-                dropped.extend(
-                    chunk
-                        .iter()
-                        .copied()
-                        .filter(|id| !paired.contains(id)),
-                );
+                dropped.extend(chunk.iter().copied().filter(|id| !paired.contains(id)));
                 shares.rate_limiter.acquire().await;
                 let new_ids: Vec<i32> = pairs.iter().map(|(_, new)| *new).collect();
                 let fetched = shares

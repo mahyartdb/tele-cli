@@ -227,16 +227,20 @@ fn parse_set_ref(raw: &str) -> TeleResult<String> {
         }
     }
     let lower = s.to_ascii_lowercase();
-    if let Some(pos) = lower.find("t.me/addstickers/") {
-        s = &s[pos + "t.me/addstickers/".len()..];
+    let link_prefixes = ["t.me/addstickers/", "t.me/addemoji/"];
+    if let Some((pos, prefix)) = link_prefixes
+        .iter()
+        .find_map(|prefix| lower.find(prefix).map(|pos| (pos, *prefix)))
+    {
+        s = &s[pos + prefix.len()..];
     } else if lower.contains("t.me/") || s.contains('/') {
         return Err(TeleError::Usage(format!(
-            "--set \"{raw}\" must be a sticker-set short name or a t.me/addstickers link"
+            "--set \"{raw}\" must be a sticker-set short name or a t.me/addstickers or t.me/addemoji link"
         )));
     }
     if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(TeleError::Usage(format!(
-            "--set \"{raw}\" must be a sticker-set short name (letters, digits, underscore) or a t.me/addstickers link"
+            "--set \"{raw}\" must be a sticker-set short name (letters, digits, underscore) or a t.me/addstickers or t.me/addemoji link"
         )));
     }
     if s.len() > 64 {
@@ -882,6 +886,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_extracts_names_from_addemoji_links() {
+        assert_eq!(
+            parse_set_ref("t.me/addemoji/emoji_set").unwrap(),
+            "emoji_set"
+        );
+        assert_eq!(
+            parse_set_ref("https://t.me/addemoji/Emoji_S2").unwrap(),
+            "Emoji_S2"
+        );
+        assert_eq!(
+            parse_set_ref("  http://t.me/addemoji/ducks  ").unwrap(),
+            "ducks"
+        );
+    }
+
+    #[test]
     fn parse_rejects_empty_refs() {
         for bad in ["", "   "] {
             let err = parse_set_ref(bad).unwrap_err();
@@ -893,7 +913,12 @@ mod tests {
 
     #[test]
     fn parse_rejects_empty_link_target() {
-        for bad in ["https://t.me/addstickers/", "https://t.me/addstickers"] {
+        for bad in [
+            "https://t.me/addstickers/",
+            "https://t.me/addstickers",
+            "https://t.me/addemoji/",
+            "https://t.me/addemoji",
+        ] {
             let err = parse_set_ref(bad).unwrap_err();
             assert!(matches!(err, TeleError::Usage(_)), "for {bad}");
         }

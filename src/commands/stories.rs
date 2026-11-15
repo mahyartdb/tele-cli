@@ -1232,22 +1232,36 @@ pub(crate) async fn views_core(
     shares.rate_limiter.acquire().await;
     let res: tl::enums::stories::StoryViews = shares
         .client
-        .invoke(&tl::functions::stories::GetStoriesViews { peer, id: ids })
+        .invoke(&tl::functions::stories::GetStoriesViews {
+            peer,
+            id: ids.clone(),
+        })
         .await
         .map_err(tele_invocation)?;
     let tl::enums::stories::StoryViews::Views(res) = res;
-    let rows: Vec<serde_json::Value> = res
-        .views
+    let mut payload = views_summary(&ids, &res.views);
+    payload["chat"] = serde_json::json!(chat_target);
+    Ok(payload)
+}
+
+fn views_summary(requested: &[i32], views: &[tl::enums::StoryViews]) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = views
         .iter()
-        .map(|v| {
+        .enumerate()
+        .map(|(index, v)| {
             let tl::enums::StoryViews::Views(counts) = v;
             serde_json::json!({
+                "id": requested.get(index),
                 "views_count": counts.views_count,
                 "forwards_count": counts.forwards_count,
                 "reactions_count": counts.reactions_count})
         })
         .collect();
-    Ok(serde_json::json!({"chat": chat_target, "views": rows}))
+    let mut payload = serde_json::json!({"views": rows});
+    if views.len() != requested.len() {
+        payload["partial"] = serde_json::json!(true);
+    }
+    payload
 }
 
 pub(crate) async fn viewers_core(
@@ -2228,6 +2242,37 @@ mod tests {
             assert_eq!(err.exit_code(), EXIT_USAGE, "for {bad:?}");
             assert!(err.message().contains("--ids"), "for {bad:?}");
         }
+    }
+
+    #[test]
+    fn views_summary_stamps_requested_ids_by_position() {
+        let views = vec![
+            fake_views(11).unwrap(),
+            fake_views(22).unwrap(),
+            fake_views(33).unwrap(),
+        ];
+        let summary = views_summary(&[4, 9, 12], &views);
+        assert_eq!(summary["views"][0]["id"], serde_json::json!(4));
+        assert_eq!(summary["views"][1]["id"], serde_json::json!(9));
+        assert_eq!(summary["views"][2]["id"], serde_json::json!(12));
+        assert_eq!(summary["views"][1]["views_count"], serde_json::json!(22));
+        assert!(summary.get("partial").is_none());
+    }
+
+    #[test]
+    fn views_summary_flags_partial_when_counts_differ() {
+        let fewer = views_summary(&[4, 9, 12], &[fake_views(11).unwrap()]);
+        assert_eq!(fewer["views"].as_array().unwrap().len(), 1);
+        assert_eq!(fewer["views"][0]["id"], serde_json::json!(4));
+        assert_eq!(fewer["partial"], serde_json::json!(true));
+
+        let none = views_summary(&[4, 9], &[]);
+        assert_eq!(none["views"], serde_json::json!([]));
+        assert_eq!(none["partial"], serde_json::json!(true));
+
+        let extra = views_summary(&[4], &[fake_views(11).unwrap(), fake_views(22).unwrap()]);
+        assert_eq!(extra["views"][1]["views_count"], serde_json::json!(22));
+        assert_eq!(extra["partial"], serde_json::json!(true));
     }
 
     #[test]

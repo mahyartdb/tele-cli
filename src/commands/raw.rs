@@ -77,7 +77,7 @@ pub async fn run(args: &RawArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         allow_raw: args.allow_raw,
     };
     validate_raw(&call)?;
-    if let Some(message) = raw_account_requirement(&name, flags) {
+    if let Some(message) = raw_account_requirement(&name, &params, flags) {
         return Err(TeleError::Usage(message));
     }
     let dry_run = flags.dry_run;
@@ -197,8 +197,28 @@ pub(crate) fn validate_raw(call: &RawCall) -> TeleResult<()> {
         )));
     }
     generated::validate_params(&call.method, &call.args)?;
+    validate_dispatch_args(&call.method, &call.args)?;
     if !call.allow_raw {
         return Err(TeleError::Usage(ALLOW_RAW_HINT.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_dispatch_args(method: &str, p: &serde_json::Value) -> TeleResult<()> {
+    match method {
+        "messages.ExportChatInvite" => {
+            if p.get("subscription_pricing").is_some() {
+                return Err(TeleError::Usage(
+                    "--args field \"subscription_pricing\" is not supported: tele raw has no argument shape for paid-invite pricing".to_string(),
+                ));
+            }
+        }
+        "messages.TranslateText" if p.get("id").is_some() && p.get("chat").is_none() => {
+            return Err(TeleError::Usage(
+                "--args field \"id\" requires \"chat\": TL stores the peer and the message ids under the same flag, so ids alone would be sent as a malformed peer".to_string(),
+            ));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -210,8 +230,12 @@ pub(crate) fn raw_serve_dry_run(args: &RawCall) -> TeleResult<serde_json::Value>
     Ok(raw_dry_run_payload(&args.method, &args.args))
 }
 
-pub(crate) fn raw_requires_bound_account(method: &str, account: &str) -> TeleResult<()> {
-    if generated::requires_explicit_account(method) && account.is_empty() {
+pub(crate) fn raw_requires_bound_account(
+    method: &str,
+    args: &serde_json::Value,
+    account: &str,
+) -> TeleResult<()> {
+    if generated::requires_explicit_account(method, args) && account.is_empty() {
         return Err(TeleError::Usage(format!(
             "raw method {method} mutates account data — the serve session pins no explicit account; bind the server to one account"
         )));
@@ -224,8 +248,12 @@ pub(crate) fn raw_requires_bound_account(method: &str, account: &str) -> TeleRes
 /// The requirement holds under `--dry-run` too: without a selection the
 /// command fans out over every session, and the preview would be
 /// emitted once per account.
-fn raw_account_requirement(method: &str, flags: &crate::executor::GlobalFlags) -> Option<String> {
-    if !generated::requires_explicit_account(method) {
+fn raw_account_requirement(
+    method: &str,
+    args: &serde_json::Value,
+    flags: &crate::executor::GlobalFlags,
+) -> Option<String> {
+    if !generated::requires_explicit_account(method, args) {
         return None;
     }
     if !flags.account.is_empty() || !flags.tag.is_empty() {
@@ -242,7 +270,7 @@ pub(crate) async fn raw_core(
 ) -> TeleResult<serde_json::Value> {
     let call = RawCall::from(&params);
     validate_raw(&call)?;
-    raw_requires_bound_account(&call.method, &shares.account)?;
+    raw_requires_bound_account(&call.method, &call.args, &shares.account)?;
     shares.rate_limiter.acquire().await;
     dispatch(
         &shares.client,
@@ -275,8 +303,8 @@ pub(crate) fn raw_serve_routes() -> Vec<crate::commands::serve::OpRoute> {
 crate::serve_runner!(run_invoke, raw_core, RawParams);
 
 #[cfg(test)]
-fn requires_explicit_account(method: &str) -> bool {
-    generated::requires_explicit_account(method)
+fn requires_explicit_account(method: &str, args: &serde_json::Value) -> bool {
+    generated::requires_explicit_account(method, args)
 }
 
 #[derive(Debug)]
@@ -353,18 +381,9 @@ async fn dispatch(
             let peer = crate::entities::input_peer(&chat)
                 .await
                 .map_err(tele_invocation)?;
-            let r: tl::enums::ExportedChatInvite = client
-                .invoke(&tl::functions::messages::ExportChatInvite {
-                    legacy_revoke_permanent: false,
-                    request_needed: bool_field(p, "request_needed")?,
-                    peer,
-                    expire_date: opt_int_field(p, "expire_date")?,
-                    usage_limit: opt_int_field(p, "usage_limit")?,
-                    title: opt_str_field(p, "title")?,
-                    subscription_pricing: None,
-                })
-                .await
-                .map_err(tele_invocation)?;
+            let request = export_chat_invite_request(p, peer)?;
+            let r: tl::enums::ExportedChatInvite =
+                client.invoke(&request).await.map_err(tele_invocation)?;
             match r {
                 tl::enums::ExportedChatInvite::ChatInviteExported(invite) => {
                     Ok(serde_json::json!({
@@ -534,38 +553,11 @@ async fn dispatch(
         }
         "messages.Search" => {
             let peer = resolved_peer(client, session, p, "chat").await?;
-            let from_id = match opt_str_field(p, "from_id")? {
-                Some(target) => {
-                    let chat = crate::entities::resolve_peer(client, session, &target).await?;
-                    Some(
-                        crate::entities::input_peer(&chat)
-                            .await
-                            .map_err(tele_invocation)?,
-                    )
-                }
-                None => None,
-            };
-            let filter = search_filter_field(p)?;
-            let r: tl::enums::messages::Messages = client
-                .invoke(&tl::functions::messages::Search {
-                    peer,
-                    q: str_field(p, "q")?,
-                    from_id,
-                    saved_peer_id: None,
-                    saved_reaction: None,
-                    top_msg_id: opt_int_field(p, "top_msg_id")?,
-                    filter,
-                    min_date: opt_int_field(p, "min_date")?.unwrap_or(0),
-                    max_date: opt_int_field(p, "max_date")?.unwrap_or(0),
-                    offset_id: opt_int_field(p, "offset_id")?.unwrap_or(0),
-                    add_offset: opt_int_field(p, "add_offset")?.unwrap_or(0),
-                    limit: opt_int_field(p, "limit")?.unwrap_or(10),
-                    max_id: opt_int_field(p, "max_id")?.unwrap_or(0),
-                    min_id: opt_int_field(p, "min_id")?.unwrap_or(0),
-                    hash: long_field(p, "hash"),
-                })
-                .await
-                .map_err(tele_invocation)?;
+            let from_id = optional_resolved_peer(client, session, p, "from_id").await?;
+            let saved_peer_id = optional_resolved_peer(client, session, p, "saved_peer_id").await?;
+            let request = search_request(p, peer, from_id, saved_peer_id)?;
+            let r: tl::enums::messages::Messages =
+                client.invoke(&request).await.map_err(tele_invocation)?;
             Ok(messages_messages_summary(&r))
         }
         "messages.GetScheduledHistory" => {
@@ -581,21 +573,9 @@ async fn dispatch(
         }
         "messages.GetMessagesViews" => {
             let peer = resolved_peer(client, session, p, "chat").await?;
-            let ids = int_list_field(p, "id")?;
-            if ids.is_empty() {
-                return Err(TeleError::Usage(
-                    "--args field \"id\" must be a non-empty array of message ids".to_string(),
-                ));
-            }
-            let increment = bool_field(p, "increment")?;
-            let r: tl::enums::messages::MessageViews = client
-                .invoke(&tl::functions::messages::GetMessagesViews {
-                    peer,
-                    id: ids,
-                    increment,
-                })
-                .await
-                .map_err(tele_invocation)?;
+            let request = get_messages_views_request(p, peer)?;
+            let r: tl::enums::messages::MessageViews =
+                client.invoke(&request).await.map_err(tele_invocation)?;
             Ok(match r {
                 tl::enums::messages::MessageViews::Views(v) => message_views_summary(&v.views),
             })
@@ -1003,6 +983,38 @@ fn bool_field(p: &serde_json::Value, key: &str) -> TeleResult<bool> {
     Ok(p.get(key).and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
+fn export_chat_invite_request(
+    p: &serde_json::Value,
+    peer: tl::enums::InputPeer,
+) -> TeleResult<tl::functions::messages::ExportChatInvite> {
+    Ok(tl::functions::messages::ExportChatInvite {
+        legacy_revoke_permanent: bool_field(p, "legacy_revoke_permanent")?,
+        request_needed: bool_field(p, "request_needed")?,
+        peer,
+        expire_date: opt_int_field(p, "expire_date")?,
+        usage_limit: opt_int_field(p, "usage_limit")?,
+        title: opt_str_field(p, "title")?,
+        subscription_pricing: None,
+    })
+}
+
+fn get_messages_views_request(
+    p: &serde_json::Value,
+    peer: tl::enums::InputPeer,
+) -> TeleResult<tl::functions::messages::GetMessagesViews> {
+    let id = int_list_field(p, "id")?;
+    if id.is_empty() {
+        return Err(TeleError::Usage(
+            "--args field \"id\" must be a non-empty array of message ids".to_string(),
+        ));
+    }
+    Ok(tl::functions::messages::GetMessagesViews {
+        peer,
+        id,
+        increment: bool_field(p, "increment")?,
+    })
+}
+
 async fn resolved_peer(
     client: &grammers_client::Client,
     session: &grammers_session::storages::SqliteSession,
@@ -1013,6 +1025,25 @@ async fn resolved_peer(
     crate::entities::input_peer(&chat)
         .await
         .map_err(tele_invocation)
+}
+
+async fn optional_resolved_peer(
+    client: &grammers_client::Client,
+    session: &grammers_session::storages::SqliteSession,
+    p: &serde_json::Value,
+    key: &str,
+) -> TeleResult<Option<tl::enums::InputPeer>> {
+    match opt_str_field(p, key)? {
+        Some(target) => {
+            let chat = crate::entities::resolve_peer(client, session, &target).await?;
+            Ok(Some(
+                crate::entities::input_peer(&chat)
+                    .await
+                    .map_err(tele_invocation)?,
+            ))
+        }
+        None => Ok(None),
+    }
 }
 
 fn json_target_string(v: &serde_json::Value) -> TeleResult<String> {
@@ -1111,6 +1142,57 @@ fn search_filter_field(p: &serde_json::Value) -> TeleResult<tl::enums::MessagesF
             "--args field \"filter\" must be a string (valid names: {SEARCH_FILTER_NAMES:?})"
         ))),
     }
+}
+
+fn reaction_filter_field(
+    p: &serde_json::Value,
+    key: &str,
+) -> TeleResult<Option<Vec<tl::enums::Reaction>>> {
+    match p.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(items)) if !items.is_empty() => items
+            .iter()
+            .map(|item| match item.as_str() {
+                Some(emoticon) if !emoticon.trim().is_empty() => {
+                    Ok(tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                        emoticon: emoticon.to_string(),
+                    }))
+                }
+                _ => Err(TeleError::Usage(format!(
+                    "--args field {key:?} must contain only non-empty emoji strings; custom-emoji reactions have no --args shape"
+                ))),
+            })
+            .collect::<TeleResult<Vec<_>>>()
+            .map(Some),
+        Some(_) => Err(TeleError::Usage(format!(
+            "--args field {key:?} must be a non-empty array of emoji strings"
+        ))),
+    }
+}
+
+fn search_request(
+    p: &serde_json::Value,
+    peer: tl::enums::InputPeer,
+    from_id: Option<tl::enums::InputPeer>,
+    saved_peer_id: Option<tl::enums::InputPeer>,
+) -> TeleResult<tl::functions::messages::Search> {
+    Ok(tl::functions::messages::Search {
+        peer,
+        q: str_field(p, "q")?,
+        from_id,
+        saved_peer_id,
+        saved_reaction: reaction_filter_field(p, "saved_reaction")?,
+        top_msg_id: opt_int_field(p, "top_msg_id")?,
+        filter: search_filter_field(p)?,
+        min_date: opt_int_field(p, "min_date")?.unwrap_or(0),
+        max_date: opt_int_field(p, "max_date")?.unwrap_or(0),
+        offset_id: opt_int_field(p, "offset_id")?.unwrap_or(0),
+        add_offset: opt_int_field(p, "add_offset")?.unwrap_or(0),
+        limit: opt_int_field(p, "limit")?.unwrap_or(10),
+        max_id: opt_int_field(p, "max_id")?.unwrap_or(0),
+        min_id: opt_int_field(p, "min_id")?.unwrap_or(0),
+        hash: long_field(p, "hash"),
+    })
 }
 
 fn messages_messages_summary(r: &tl::enums::messages::Messages) -> serde_json::Value {
@@ -1360,27 +1442,57 @@ mod tests {
             };
         let mutating = "account.UpdateProfile";
         let read_only = "users.GetUsers";
+        let no_args = serde_json::json!({});
         assert!(
-            raw_account_requirement(mutating, &flags(Vec::new(), Vec::new(), false)).is_some(),
+            raw_account_requirement(mutating, &no_args, &flags(Vec::new(), Vec::new(), false))
+                .is_some(),
             "a mutating raw method must demand an explicit account"
         );
         assert!(
-            raw_account_requirement(mutating, &flags(Vec::new(), Vec::new(), true)).is_some(),
+            raw_account_requirement(mutating, &no_args, &flags(Vec::new(), Vec::new(), true))
+                .is_some(),
             "the requirement must hold under --dry-run too"
         );
         assert!(
-            raw_account_requirement(mutating, &flags(vec!["work".to_string()], Vec::new(), true))
-                .is_none(),
+            raw_account_requirement(
+                mutating,
+                &no_args,
+                &flags(vec!["work".to_string()], Vec::new(), true)
+            )
+            .is_none(),
             "an explicit account satisfies the requirement"
         );
         assert!(
-            raw_account_requirement(mutating, &flags(Vec::new(), vec!["team".to_string()], true))
-                .is_none(),
+            raw_account_requirement(
+                mutating,
+                &no_args,
+                &flags(Vec::new(), vec!["team".to_string()], true)
+            )
+            .is_none(),
             "an explicit tag satisfies the requirement"
         );
         assert!(
-            raw_account_requirement(read_only, &flags(Vec::new(), Vec::new(), true)).is_none(),
+            raw_account_requirement(read_only, &no_args, &flags(Vec::new(), Vec::new(), true))
+                .is_none(),
             "read-only raw methods fan out by default"
+        );
+        assert!(
+            raw_account_requirement(
+                "messages.GetMessagesViews",
+                &serde_json::json!({"chat": "@x", "id": [1], "increment": true}),
+                &flags(Vec::new(), Vec::new(), true)
+            )
+            .is_some(),
+            "increment:true reads as a mutation and demands an account"
+        );
+        assert!(
+            raw_account_requirement(
+                "messages.GetMessagesViews",
+                &serde_json::json!({"chat": "@x", "id": [1], "increment": false}),
+                &flags(Vec::new(), Vec::new(), true)
+            )
+            .is_none(),
+            "increment:false is a read and fans out"
         );
     }
 
@@ -1620,20 +1732,77 @@ mod tests {
 
     #[test]
     fn mutating_methods_require_explicit_account() {
-        assert!(requires_explicit_account("account.UpdateProfile"));
-        assert!(requires_explicit_account("account.SetAuthorizationTTL"));
-        assert!(requires_explicit_account("contacts.DeleteByPhones"));
-        assert!(requires_explicit_account("messages.ExportChatInvite"));
-        assert!(requires_explicit_account("messages.AppendTodoList"));
-        assert!(requires_explicit_account("messages.SendScheduledMessages"));
-        assert!(requires_explicit_account("messages.ToggleTodoCompleted"));
-        assert!(!requires_explicit_account("messages.GetAllDrafts"));
-        assert!(!requires_explicit_account("contacts.Search"));
-        assert!(!requires_explicit_account("account.GetAuthorizations"));
-        assert!(!requires_explicit_account("messages.GetAvailableEffects"));
-        assert!(!requires_explicit_account("messages.TranslateText"));
-        assert!(!requires_explicit_account("messages.TranscribeAudio"));
-        assert!(!requires_explicit_account("messages.ComposeMessageWithAI"));
+        let no_args = serde_json::json!({});
+        assert!(requires_explicit_account("account.UpdateProfile", &no_args));
+        assert!(requires_explicit_account(
+            "account.SetAuthorizationTTL",
+            &no_args
+        ));
+        assert!(requires_explicit_account(
+            "contacts.DeleteByPhones",
+            &no_args
+        ));
+        assert!(requires_explicit_account(
+            "messages.ExportChatInvite",
+            &no_args
+        ));
+        assert!(requires_explicit_account(
+            "messages.AppendTodoList",
+            &no_args
+        ));
+        assert!(requires_explicit_account(
+            "messages.SendScheduledMessages",
+            &no_args
+        ));
+        assert!(requires_explicit_account(
+            "messages.ToggleTodoCompleted",
+            &no_args
+        ));
+        assert!(requires_explicit_account(
+            "messages.ReadMentions",
+            &serde_json::json!({"chat": "@x"})
+        ));
+        assert!(requires_explicit_account(
+            "messages.ReadReactions",
+            &serde_json::json!({"chat": "@x"})
+        ));
+        assert!(requires_explicit_account(
+            "messages.GetMessagesViews",
+            &serde_json::json!({"chat": "@x", "id": [1, 2], "increment": true})
+        ));
+        assert!(!requires_explicit_account(
+            "messages.GetMessagesViews",
+            &serde_json::json!({"chat": "@x", "id": [1, 2]})
+        ));
+        assert!(!requires_explicit_account(
+            "messages.GetMessagesViews",
+            &serde_json::json!({"chat": "@x", "id": [1, 2], "increment": false})
+        ));
+        assert!(!requires_explicit_account(
+            "messages.GetAllDrafts",
+            &no_args
+        ));
+        assert!(!requires_explicit_account("contacts.Search", &no_args));
+        assert!(!requires_explicit_account(
+            "account.GetAuthorizations",
+            &no_args
+        ));
+        assert!(!requires_explicit_account(
+            "messages.GetAvailableEffects",
+            &no_args
+        ));
+        assert!(!requires_explicit_account(
+            "messages.TranslateText",
+            &no_args
+        ));
+        assert!(!requires_explicit_account(
+            "messages.TranscribeAudio",
+            &no_args
+        ));
+        assert!(!requires_explicit_account(
+            "messages.ComposeMessageWithAI",
+            &no_args
+        ));
     }
 
     #[test]
@@ -1647,18 +1816,65 @@ mod tests {
 
     #[test]
     fn registered_mutators_are_gated() {
-        for name in REGISTERED {
-            let mutating = matches!(
-                *name,
-                "account.UpdateProfile"
-                    | "account.SetAuthorizationTTL"
-                    | "contacts.DeleteByPhones"
-                    | "messages.ExportChatInvite"
-                    | "messages.AppendTodoList"
-                    | "messages.SendScheduledMessages"
-                    | "messages.ToggleTodoCompleted"
+        for meta in registry::METHODS {
+            let empty = serde_json::json!({});
+            let gated = requires_explicit_account(meta.name, &empty);
+            match meta.mutation {
+                registry::Mutation::Never => {
+                    assert!(!gated, "{} is not classified mutating", meta.name);
+                }
+                registry::Mutation::Always => {
+                    assert!(
+                        gated,
+                        "{} is always mutating and must require an explicit account",
+                        meta.name
+                    );
+                }
+                registry::Mutation::WhenArgs(keys) => {
+                    assert!(
+                        !gated,
+                        "{} is conditional: empty args must not require an account",
+                        meta.name
+                    );
+                    for key in keys {
+                        for enabled in [true, false] {
+                            let mut args = serde_json::Map::new();
+                            args.insert(key.to_string(), serde_json::Value::Bool(enabled));
+                            let args = serde_json::Value::Object(args);
+                            assert_eq!(
+                                requires_explicit_account(meta.name, &args),
+                                enabled,
+                                "{}.{key} = {enabled}",
+                                meta.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_shaped_results_are_classified_mutating() {
+        const READ_ONLY_RESULT_EXCEPTIONS: &[&str] = &["messages.GetAllDrafts"];
+        for meta in registry::METHODS {
+            let write_shaped = matches!(
+                meta.result_ty,
+                "Updates"
+                    | "Bool"
+                    | "messages.AffectedHistory"
+                    | "messages.AffectedMessages"
+                    | "ExportedChatInvite"
             );
-            assert_eq!(requires_explicit_account(name), mutating, "{name}");
+            if write_shaped && !READ_ONLY_RESULT_EXCEPTIONS.contains(&meta.name) {
+                assert_ne!(
+                    meta.mutation,
+                    registry::Mutation::Never,
+                    "{} returns {} and must be listed in build.rs MUTATING",
+                    meta.name,
+                    meta.result_ty
+                );
+            }
         }
     }
 
@@ -1754,6 +1970,151 @@ mod tests {
             );
             assert!(err.message().contains("valid names"), "err: {err}");
         }
+    }
+
+    #[test]
+    fn export_chat_invite_request_forwards_legacy_revoke_permanent() {
+        let peer = tl::enums::InputPeer::PeerSelf;
+        let read = export_chat_invite_request(
+            &serde_json::json!({"chat": "@x", "request_needed": true}),
+            peer.clone(),
+        )
+        .unwrap();
+        assert!(!read.legacy_revoke_permanent);
+        assert!(read.request_needed);
+        let revoke = export_chat_invite_request(
+            &serde_json::json!({"chat": "@x", "legacy_revoke_permanent": true}),
+            peer,
+        )
+        .unwrap();
+        assert!(
+            revoke.legacy_revoke_permanent,
+            "legacy_revoke_permanent must reach the TL request"
+        );
+    }
+
+    #[test]
+    fn export_chat_invite_rejects_subscription_pricing_instead_of_dropping_it() {
+        let call = RawCall {
+            method: "messages.ExportChatInvite".to_string(),
+            args: serde_json::json!({
+                "chat": "@x",
+                "subscription_pricing": {"amount": 1},
+            }),
+            allow_raw: true,
+        };
+        let err = validate_raw(&call).unwrap_err();
+        assert!(matches!(err, TeleError::Usage(_)), "{err}");
+        assert!(
+            err.message().contains("subscription_pricing"),
+            "the error must name the dropped argument: {err}"
+        );
+    }
+
+    #[test]
+    fn get_messages_views_request_forwards_increment_and_ids() {
+        let peer = tl::enums::InputPeer::PeerSelf;
+        let read = get_messages_views_request(
+            &serde_json::json!({"chat": "@x", "id": [7, 9]}),
+            peer.clone(),
+        )
+        .unwrap();
+        assert_eq!(read.id, vec![7, 9]);
+        assert!(!read.increment);
+        let write = get_messages_views_request(
+            &serde_json::json!({"chat": "@x", "id": [7], "increment": true}),
+            peer,
+        )
+        .unwrap();
+        assert!(write.increment, "increment must reach the TL request");
+        assert!(matches!(
+            get_messages_views_request(
+                &serde_json::json!({"chat": "@x", "id": []}),
+                tl::enums::InputPeer::PeerSelf
+            ),
+            Err(TeleError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn search_request_wires_saved_peer_id_and_saved_reaction() {
+        let plain = search_request(
+            &serde_json::json!({"chat": "@x", "q": "hi"}),
+            tl::enums::InputPeer::PeerSelf,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(plain.saved_peer_id.is_none());
+        assert!(plain.saved_reaction.is_none());
+
+        let wired = search_request(
+            &serde_json::json!({"chat": "@x", "q": "hi", "saved_reaction": ["👍", "🔥"]}),
+            tl::enums::InputPeer::PeerSelf,
+            None,
+            Some(tl::enums::InputPeer::PeerSelf),
+        )
+        .unwrap();
+        assert_eq!(
+            wired.saved_peer_id,
+            Some(tl::enums::InputPeer::PeerSelf),
+            "saved_peer_id must reach the TL request"
+        );
+        assert_eq!(
+            wired.saved_reaction,
+            Some(vec![
+                tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                    emoticon: "👍".to_string(),
+                }),
+                tl::enums::Reaction::Emoji(tl::types::ReactionEmoji {
+                    emoticon: "🔥".to_string(),
+                }),
+            ]),
+            "saved_reaction must reach the TL request"
+        );
+
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!([42]),
+            serde_json::json!(["ok", " "]),
+            serde_json::json!("👍"),
+        ] {
+            let err = search_request(
+                &serde_json::json!({"chat": "@x", "q": "hi", "saved_reaction": bad}),
+                tl::enums::InputPeer::PeerSelf,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(err, TeleError::Usage(_)), "{err}");
+            assert!(err.message().contains("saved_reaction"), "{err}");
+        }
+    }
+
+    #[test]
+    fn translate_text_requires_chat_whenever_ids_are_present() {
+        let text_only = RawCall {
+            method: "messages.TranslateText".to_string(),
+            args: serde_json::json!({"text": ["hola"], "to_lang": "en"}),
+            allow_raw: true,
+        };
+        assert!(validate_raw(&text_only).is_ok());
+
+        let ids_without_chat = RawCall {
+            method: "messages.TranslateText".to_string(),
+            args: serde_json::json!({"id": [1], "to_lang": "en"}),
+            allow_raw: true,
+        };
+        let err = validate_raw(&ids_without_chat).unwrap_err();
+        assert!(matches!(err, TeleError::Usage(_)), "{err}");
+        assert!(err.message().contains("chat"), "{err}");
+
+        let ids_with_chat = RawCall {
+            method: "messages.TranslateText".to_string(),
+            args: serde_json::json!({"chat": "@x", "id": [1], "to_lang": "en"}),
+            allow_raw: true,
+        };
+        assert!(validate_raw(&ids_with_chat).is_ok());
     }
 
     #[test]
@@ -2618,11 +2979,22 @@ mod tests {
 
     #[test]
     fn raw_bound_account_guard_pins_mutating_methods() {
-        assert!(raw_requires_bound_account("messages.GetAllDrafts", "").is_ok());
-        assert!(raw_requires_bound_account("messages.GetAllDrafts", "work").is_ok());
-        assert!(raw_requires_bound_account("account.UpdateProfile", "work").is_ok());
-        let err = raw_requires_bound_account("account.UpdateProfile", "").unwrap_err();
+        let no_args = serde_json::json!({});
+        assert!(raw_requires_bound_account("messages.GetAllDrafts", &no_args, "").is_ok());
+        assert!(raw_requires_bound_account("messages.GetAllDrafts", &no_args, "work").is_ok());
+        assert!(raw_requires_bound_account("account.UpdateProfile", &no_args, "work").is_ok());
+        let err = raw_requires_bound_account("account.UpdateProfile", &no_args, "").unwrap_err();
         assert!(err.message().contains("explicit account"), "{err}");
+
+        let read = serde_json::json!({"chat": "@x", "id": [1]});
+        assert!(raw_requires_bound_account("messages.GetMessagesViews", &read, "").is_ok());
+        let increment = serde_json::json!({"chat": "@x", "id": [1], "increment": true});
+        let err =
+            raw_requires_bound_account("messages.GetMessagesViews", &increment, "").unwrap_err();
+        assert!(err.message().contains("explicit account"), "{err}");
+        assert!(
+            raw_requires_bound_account("messages.GetMessagesViews", &increment, "work").is_ok()
+        );
     }
 
     #[test]

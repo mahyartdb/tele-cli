@@ -712,7 +712,6 @@ fn imported_user_id(imported: &[tl::enums::ImportedContact], client_id: i64) -> 
     })
 }
 
-
 pub fn is_channel(peer: &grammers_client::peer::Peer) -> bool {
     match peer {
         grammers_client::peer::Peer::Channel(_) => true,

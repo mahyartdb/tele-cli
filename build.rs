@@ -42,6 +42,24 @@ const REGISTRY: &[&str] = &[
     "users.GetUsers",
 ];
 
+// The one place raw methods are classified by their side effects. An entry
+// with an empty slice always writes server state; an entry with field names
+// writes only when one of those --args fields is enabled. The generated
+// account gate and the generated registry metadata both read this table, so a
+// registered method cannot be gated in one place and read-only in the other.
+const MUTATING: &[(&str, &[&str])] = &[
+    ("account.SetAuthorizationTTL", &[]),
+    ("account.UpdateProfile", &[]),
+    ("contacts.DeleteByPhones", &[]),
+    ("messages.AppendTodoList", &[]),
+    ("messages.ExportChatInvite", &[]),
+    ("messages.GetMessagesViews", &["increment"]),
+    ("messages.ReadMentions", &[]),
+    ("messages.ReadReactions", &[]),
+    ("messages.SendScheduledMessages", &[]),
+    ("messages.ToggleTodoCompleted", &[]),
+];
+
 const NEEDS_PEER_RESOLVE: &[&str] = &[
     "channels.GetFullChannel",
     "messages.AppendTodoList",
@@ -77,12 +95,14 @@ const PARAM_ALIASES: &[(&str, &str, &str)] = &[
     ("messages.TranscribeAudio", "peer", "chat"),
 ];
 
+type MethodDef = (String, Vec<(String, String, bool, bool)>);
+
 fn main() {
     println!("cargo:rerun-if-changed=tl/api.tl");
     println!("cargo:rerun-if-changed=build.rs");
 
     let contents = fs::read_to_string("tl/api.tl").expect("failed to read tl/api.tl");
-    let mut methods: BTreeMap<String, Vec<(String, String, bool, bool)>> = BTreeMap::new();
+    let mut methods: BTreeMap<String, MethodDef> = BTreeMap::new();
 
     for result in parse_tl_file(&contents) {
         let def = match result {
@@ -129,7 +149,26 @@ fn main() {
                 }
             }
         }
-        methods.insert(full_name, params);
+        methods.insert(full_name, (def.ty.to_string(), params));
+    }
+
+    for (method, mutating_args) in MUTATING {
+        let (_, params) = methods.get(*method).unwrap_or_else(|| {
+            panic!("{method} is classified mutating but is missing from REGISTRY")
+        });
+        for arg in *mutating_args {
+            let known = params.iter().any(|(pname, _, _, _)| {
+                let display_name = PARAM_ALIASES
+                    .iter()
+                    .find(|(m, tl, _)| m == method && tl == pname)
+                    .map_or(pname.as_str(), |a| a.2);
+                display_name == *arg
+            });
+            assert!(
+                known,
+                "{method} is classified mutating on {arg:?}, which is not one of its --args keys"
+            );
+        }
     }
 
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -146,8 +185,17 @@ fn main() {
     writeln!(f, "        pub bool_flag: bool,").unwrap();
     writeln!(f, "    }}").unwrap();
     writeln!(f, "    #[allow(dead_code)]").unwrap();
+    writeln!(f, "    #[derive(Clone, Copy, PartialEq, Eq, Debug)]").unwrap();
+    writeln!(f, "    pub enum Mutation {{").unwrap();
+    writeln!(f, "        Never,").unwrap();
+    writeln!(f, "        Always,").unwrap();
+    writeln!(f, "        WhenArgs(&'static [&'static str]),").unwrap();
+    writeln!(f, "    }}").unwrap();
+    writeln!(f, "    #[allow(dead_code)]").unwrap();
     writeln!(f, "    pub struct MethodMeta {{").unwrap();
     writeln!(f, "        pub name: &'static str,").unwrap();
+    writeln!(f, "        pub result_ty: &'static str,").unwrap();
+    writeln!(f, "        pub mutation: Mutation,").unwrap();
     writeln!(f, "        pub args: &'static [ArgMeta],").unwrap();
     writeln!(f, "        pub needs_peer: bool,").unwrap();
     writeln!(f, "        pub required_ints: &'static [&'static str],").unwrap();
@@ -155,10 +203,21 @@ fn main() {
     writeln!(f, "    pub const NO_REQUIRED_INTS: &[&str] = &[];").unwrap();
     writeln!(f, "    pub static METHODS: &[MethodMeta] = &[").unwrap();
     for name in REGISTRY {
-        let args = methods.get(*name).unwrap();
+        let (result_ty, args) = methods.get(*name).unwrap();
         let needs = NEEDS_PEER_RESOLVE.contains(name);
         writeln!(f, "        MethodMeta {{").unwrap();
         writeln!(f, "            name: {:?},", name).unwrap();
+        writeln!(f, "            result_ty: {:?},", result_ty).unwrap();
+        match MUTATING.iter().find(|(m, _)| m == name) {
+            None => writeln!(f, "            mutation: Mutation::Never,").unwrap(),
+            Some((_, [])) => writeln!(f, "            mutation: Mutation::Always,").unwrap(),
+            Some((_, mutating_args)) => writeln!(
+                f,
+                "            mutation: Mutation::WhenArgs(&{:?}),",
+                mutating_args
+            )
+            .unwrap(),
+        }
         writeln!(f, "            args: &[").unwrap();
         for (pname, tl_type, optional, bool_flag) in args {
             let display_name = PARAM_ALIASES
@@ -417,13 +476,56 @@ fn main() {
     writeln!(f).unwrap();
     writeln!(
         f,
-        "pub fn requires_explicit_account(method: &str) -> bool {{"
+        "pub fn requires_explicit_account(method: &str, args: &serde_json::Value) -> bool {{"
     )
     .unwrap();
     writeln!(
         f,
-        "    matches!(method, \"account.UpdateProfile\" | \"account.SetAuthorizationTTL\" | \"contacts.DeleteByPhones\" | \"messages.ExportChatInvite\" | \"messages.AppendTodoList\" | \"messages.SendScheduledMessages\" | \"messages.ToggleTodoCompleted\")"
+        "    match registry::lookup(method).map(|m| m.mutation) {{"
     )
     .unwrap();
+    writeln!(f, "        Some(registry::Mutation::Always) => true,").unwrap();
+    writeln!(
+        f,
+        "        Some(registry::Mutation::WhenArgs(keys)) => keys.iter().any(|key| arg_enabled(args, key)),"
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "        Some(registry::Mutation::Never) | None => false,"
+    )
+    .unwrap();
+    writeln!(f, "    }}").unwrap();
+    writeln!(f, "}}").unwrap();
+    writeln!(f).unwrap();
+    writeln!(
+        f,
+        "fn arg_enabled(args: &serde_json::Value, key: &str) -> bool {{"
+    )
+    .unwrap();
+    writeln!(f, "    match args.get(key) {{").unwrap();
+    writeln!(
+        f,
+        "        Some(serde_json::Value::Bool(enabled)) => *enabled,"
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),"
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "        Some(serde_json::Value::Number(value)) => value.as_f64().is_some_and(|v| v != 0.0),"
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "        Some(serde_json::Value::Array(items)) => !items.is_empty(),"
+    )
+    .unwrap();
+    writeln!(f, "        Some(serde_json::Value::Object(_)) => true,").unwrap();
+    writeln!(f, "        None | Some(serde_json::Value::Null) => false,").unwrap();
+    writeln!(f, "    }}").unwrap();
     writeln!(f, "}}").unwrap();
 }
