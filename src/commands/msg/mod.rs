@@ -2686,6 +2686,18 @@ async fn search(args: SearchArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                 ClientGuard::connect(&name, creds_api_id()?, config_path.as_deref()).await?;
             client::authorize(&guard.client).await?;
             let result = search_core(&guard.shares(), SearchParams::from(&args)).await?;
+            if result["truncated"].as_bool() == Some(true) {
+                // Without this, a truncated scan is indistinguishable from
+                // "no matches" in human mode.
+                let scanned = result["scanned"].as_u64().unwrap_or(0);
+                crate::output::log_line(
+                    "warn",
+                    &format!(
+                        "search stopped after {scanned} scanned message(s) without reaching --limit; \
+                         raise --limit or narrow --from/--since/--until to widen the scan"
+                    ),
+                );
+            }
             if !output::machine_mode(json, jsonl) {
                 let empty = Vec::new();
                 let msgs = result["messages"].as_array().unwrap_or(&empty);
