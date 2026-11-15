@@ -265,17 +265,17 @@ fn export_state(dir: &std::path::Path) -> String {
     format!("contacts.json: {contacts}, messages.jsonl: {messages}, dialogs.json: {dialogs}")
 }
 
-fn export_error_message(dir: &std::path::Path, cause: &str) -> String {
+fn export_error_message(dir: &std::path::Path) -> String {
     format!(
-        "takeout export failed; export dir {}: {}; server-side takeout session kept alive for resume: re-run `tele takeout export` to resume automatically from the saved per-dialog checkpoints (completed dialogs are skipped, messages.jsonl is appended, not truncated), or `tele takeout finish --abandon` to drop the stale session and clear the local takeout.json so `tele takeout start` works again; cause: {cause}",
+        "takeout export failed; export dir {}: {}; server-side takeout session kept alive for resume: re-run `tele takeout export` to resume automatically from the saved per-dialog checkpoints (completed dialogs are skipped, messages.jsonl is appended, not truncated), or `tele takeout finish --abandon` to drop the stale session and clear the local takeout.json so `tele takeout start` works again",
         dir.to_string_lossy(),
         export_state(dir),
     )
 }
 
-fn export_expired_message(dir: &std::path::Path, cause: &str) -> String {
+fn export_expired_message(dir: &std::path::Path) -> String {
     format!(
-        "takeout export failed; export dir {}: {}; the server-side takeout session expired (TAKEOUT_INVALID/TAKEOUT_REQUIRED), so re-running `tele takeout export` cannot resume and the saved checkpoints cannot be reused: clear the stale local takeout.json with `tele takeout finish --abandon`, then run `tele takeout start` again to begin a new session; cause: {cause}",
+        "takeout export failed; export dir {}: {}; the server-side takeout session expired (TAKEOUT_INVALID/TAKEOUT_REQUIRED), so re-running `tele takeout export` cannot resume and the saved checkpoints cannot be reused: clear the stale local takeout.json with `tele takeout finish --abandon`, then run `tele takeout start` again to begin a new session",
         dir.to_string_lossy(),
         export_state(dir),
     )
@@ -290,9 +290,9 @@ fn takeout_session_expired(err: &TeleError) -> bool {
 
 fn export_failure(dir: &std::path::Path, err: TeleError) -> TeleError {
     let guidance = if takeout_session_expired(&err) {
-        export_expired_message(dir, &err.message())
+        export_expired_message(dir)
     } else {
-        export_error_message(dir, &err.message())
+        export_error_message(dir)
     };
     err.with_guidance(&guidance)
 }
@@ -1265,7 +1265,7 @@ mod tests {
         let dir = temp_dir("err-resume");
         std::fs::write(dir.join("contacts.json"), "[]").unwrap();
         std::fs::write(dir.join("messages.jsonl"), "{}").unwrap();
-        let msg = export_error_message(&dir, "FLOOD_WAIT");
+        let msg = export_error_message(&dir);
         assert!(
             msg.contains(&dir.to_string_lossy().to_string()),
             "msg: {msg}"
@@ -1277,7 +1277,6 @@ mod tests {
             "msg: {msg}"
         );
         assert!(msg.contains("`tele takeout start`"), "msg: {msg}");
-        assert!(msg.contains("FLOOD_WAIT"), "msg: {msg}");
         assert!(msg.contains("resume automatically"), "msg: {msg}");
         assert!(msg.contains("per-dialog checkpoints"), "msg: {msg}");
         assert!(msg.contains("appended, not truncated"), "msg: {msg}");
@@ -1288,13 +1287,12 @@ mod tests {
     fn export_error_message_names_state_and_resume_path() {
         let dir = temp_dir("err");
         std::fs::write(dir.join("contacts.json"), "[]").unwrap();
-        let msg = export_error_message(&dir, "FLOOD_WAIT");
+        let msg = export_error_message(&dir);
         assert!(msg.contains("contacts.json: written"), "msg: {msg}");
         assert!(msg.contains("messages.jsonl: missing"), "msg: {msg}");
         assert!(msg.contains("dialogs.json: missing"), "msg: {msg}");
         assert!(msg.contains("kept alive"), "msg: {msg}");
         assert!(msg.contains("takeout export"), "msg: {msg}");
-        assert!(msg.contains("FLOOD_WAIT"), "msg: {msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

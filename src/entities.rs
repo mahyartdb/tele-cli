@@ -42,7 +42,6 @@ pub async fn resolve_peer(
                 "warn",
                 "looking up phone number; privacy settings may hide the account",
             );
-            let digits_for_cleanup = digits.clone();
             let client_id = digits.parse::<i64>().expect(
                 "phone digits fit i64: the target classifier caps phone digit strings at 15 digits",
             );
@@ -84,7 +83,20 @@ pub async fn resolve_peer(
                         }
                     }
                     None => {
-                        if let Err(e) = cleanup_temp_contact(client, &digits_for_cleanup).await {
+                        // The import created the contact but the server did
+                        // not echo the user (privacy). Deleting by the
+                        // known user id is reliable; scanning the contact
+                        // list by phone is not, because a user whose phone
+                        // is hidden comes back without one.
+                        if let Err(e) = client
+                            .invoke(&tl::functions::contacts::DeleteContacts {
+                                id: vec![tl::enums::InputUser::User(tl::types::InputUser {
+                                    user_id,
+                                    access_hash: 0,
+                                })],
+                            })
+                            .await
+                        {
                             crate::output::log_line(
                                 "warn",
                                 &format!("failed to clean up temporary import: {e}"),
@@ -700,31 +712,6 @@ fn imported_user_id(imported: &[tl::enums::ImportedContact], client_id: i64) -> 
     })
 }
 
-async fn cleanup_temp_contact(client: &Client, digits: &str) -> Result<(), InvocationError> {
-    let raw: tl::enums::contacts::Contacts = client
-        .invoke(&tl::functions::contacts::GetContacts { hash: 0 })
-        .await?;
-    let users = match raw {
-        tl::enums::contacts::Contacts::NotModified => Vec::new(),
-        tl::enums::contacts::Contacts::Contacts(c) => c.users,
-    };
-    let target_digits: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
-    for user in &users {
-        let phone = match user {
-            tl::enums::User::User(u) => u.phone.as_deref().unwrap_or_default(),
-            tl::enums::User::Empty(_) => continue,
-        };
-        let phone_digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
-        if phone_digits == target_digits {
-            let input = imported_user_to_input_user(user);
-            client
-                .invoke(&tl::functions::contacts::DeleteContacts { id: vec![input] })
-                .await?;
-            return Ok(());
-        }
-    }
-    Ok(())
-}
 
 pub fn is_channel(peer: &grammers_client::peer::Peer) -> bool {
     match peer {
