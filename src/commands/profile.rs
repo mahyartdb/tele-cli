@@ -37,7 +37,10 @@ pub struct GetArgs {
 
 #[derive(Args, Clone)]
 pub struct SetArgs {
-    #[arg(long, help = "new display name (first and last; 64 chars each)")]
+    #[arg(
+        long,
+        help = "new display name (first and last; a single word clears the surname; 64 chars each)"
+    )]
     name: Option<String>,
     #[arg(long, help = "new bio/about text (max 70 chars)")]
     bio: Option<String>,
@@ -84,6 +87,7 @@ async fn get(args: GetArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     let dry_run = flags.dry_run;
     let json = flags.json;
     let jsonl = flags.jsonl;
+    let multi = crate::executor::select_accounts(flags)?.len() > 1;
     let envelope = run_fanout(flags, move |name| {
         let config_path = config_path.clone();
         let args = args.clone();
@@ -96,6 +100,9 @@ async fn get(args: GetArgs, flags: &GlobalFlags) -> TeleResult<i32> {
             client::authorize(&guard.client).await?;
             let row = get_core(&guard.shares(), GetParams::from(&args)).await?;
             if !output::machine_mode(json, jsonl) {
+                if multi {
+                    output::print_line(&format!("== {name} =="))?;
+                }
                 if let Some(fields) = row.as_object() {
                     for (k, v) in fields {
                         output::print_line(&format!("{k}: {v}"))?;
@@ -258,6 +265,14 @@ fn split_full_name(raw: &str) -> (Option<String>, Option<String>) {
         }
         None => (Some(trimmed.to_string()), None),
     }
+}
+
+// A one-word --name clears the surname instead of keeping it: leaving the
+// last-name flag unset makes account.UpdateProfile merge the requested name
+// with the stored surname ("John Smith" -> "Johnny Smith").
+fn name_update_fields(raw: &str) -> (Option<String>, Option<String>) {
+    let (first, last) = split_full_name(raw);
+    (first, Some(last.unwrap_or_default()))
 }
 
 fn redact_phone(phone: Option<&str>, show_phone: bool) -> Option<&str> {
@@ -881,7 +896,7 @@ pub(crate) async fn set_core(
     let username_raw = params.username.clone();
     if new_name.is_some() || new_bio.is_some() {
         let (first, last) = match &new_name {
-            Some(n) => split_full_name(n),
+            Some(n) => name_update_fields(n),
             None => (None, None),
         };
         let about = match &new_bio {
@@ -1145,6 +1160,22 @@ mod tests {
         assert_eq!(
             split_full_name(" Mary Jane Watson "),
             (Some("Mary".to_string()), Some("Jane Watson".to_string()))
+        );
+    }
+
+    #[test]
+    fn name_update_clears_surname_for_single_word() {
+        assert_eq!(
+            name_update_fields("Johnny"),
+            (Some("Johnny".to_string()), Some(String::new()))
+        );
+        assert_eq!(
+            name_update_fields(" Johnny "),
+            (Some("Johnny".to_string()), Some(String::new()))
+        );
+        assert_eq!(
+            name_update_fields("John Smith"),
+            (Some("John".to_string()), Some("Smith".to_string()))
         );
     }
 

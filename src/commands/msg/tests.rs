@@ -491,17 +491,32 @@ fn delete_batches_ids_by_100() {
 }
 
 #[test]
-fn forward_request_sets_silent_without_notifications() {
+fn forward_request_notifies_by_default() {
     let req = build_forward_request(
         tl::enums::InputPeer::Empty,
         &[1, 2, 3],
         &[11, 22, 33],
         tl::enums::InputPeer::Empty,
+        false,
     );
-    assert!(req.silent);
+    assert!(!req.silent);
     assert!(!req.background);
     assert_eq!(req.id, vec![1, 2, 3]);
     assert_eq!(req.random_id, vec![11, 22, 33]);
+}
+
+#[test]
+fn forward_request_sets_silent_when_flagged() {
+    let req = build_forward_request(
+        tl::enums::InputPeer::Empty,
+        &[1],
+        &[11],
+        tl::enums::InputPeer::Empty,
+        true,
+    );
+    assert!(req.silent);
+    assert!(!req.background);
+    assert_eq!(req.id, vec![1]);
 }
 
 fn forward_updates_with_id_map(pairs: &[(i64, i32)]) -> tl::enums::Updates {
@@ -820,6 +835,7 @@ fn forward_requires_ids() {
         from: crate::chat_target::ChatTarget::new_unchecked("a".to_string()),
         ids: Vec::new(),
         to: crate::chat_target::ChatTarget::new_unchecked("b".to_string()),
+        silent: false,
     };
     assert!(matches!(validate_forward(&args), Err(TeleError::Usage(_))));
     let mut with_ids = args;
@@ -1105,12 +1121,14 @@ fn non_get_commands_reject_deep_link_message_ids() {
         from: crate::chat_target::ChatTarget::new_unchecked(link.to_string()),
         ids: vec![1],
         to: crate::chat_target::ChatTarget::new_unchecked("b".to_string()),
+        silent: false,
     };
     assert!(matches!(validate_forward(&fwd), Err(TeleError::Usage(_))));
     let fwd_to = ForwardArgs {
         from: crate::chat_target::ChatTarget::new_unchecked("a".to_string()),
         ids: vec![1],
         to: crate::chat_target::ChatTarget::new_unchecked(link.to_string()),
+        silent: false,
     };
     assert!(matches!(
         validate_forward(&fwd_to),
@@ -1249,6 +1267,7 @@ fn msg_validators_reject_empty_or_whitespace_chat() {
             from: crate::chat_target::ChatTarget::new_unchecked(chat.to_string()),
             ids: vec![1],
             to: crate::chat_target::ChatTarget::new_unchecked("b".to_string()),
+            silent: false,
         };
         assert!(
             matches!(validate_forward(&fwd_from), Err(TeleError::Usage(_))),
@@ -1258,6 +1277,7 @@ fn msg_validators_reject_empty_or_whitespace_chat() {
             from: crate::chat_target::ChatTarget::new_unchecked("a".to_string()),
             ids: vec![1],
             to: crate::chat_target::ChatTarget::new_unchecked(chat.to_string()),
+            silent: false,
         };
         assert!(
             matches!(validate_forward(&fwd_to), Err(TeleError::Usage(_))),
@@ -3077,6 +3097,27 @@ fn parse_as_media_and_poll_mode_helpers() {
     assert_eq!(parse_poll_mode(None).unwrap(), None);
     assert_eq!(parse_poll_mode(Some("quiz")).unwrap(), Some("quiz"));
     assert!(parse_poll_mode(Some("multiple")).is_err());
+}
+
+#[test]
+fn validate_send_rejects_media_ttl_and_thumbnail_with_copy_from() {
+    let mut copy = send_args("plain");
+    copy.text = None;
+    copy.copy_from = Some("@src".to_string());
+    copy.copy_id = Some(1);
+    copy.media_ttl = Some(60);
+    assert!(
+        matches!(validate_send(&copy), Err(TeleError::Usage(m)) if m.contains("--media-ttl") && m.contains("--copy-from")),
+        "media-ttl + copy-from must fail as usage"
+    );
+    copy.media_ttl = None;
+    copy.thumbnail = Some("thumb.jpg".to_string());
+    assert!(
+        matches!(validate_send(&copy), Err(TeleError::Usage(m)) if m.contains("--thumbnail") && m.contains("--copy-from")),
+        "thumbnail + copy-from must fail as usage"
+    );
+    copy.thumbnail = None;
+    assert!(validate_send(&copy).is_ok());
 }
 
 #[test]
@@ -5435,6 +5476,7 @@ fn validate_forward_rejects_nonpositive_ids() {
         from: crate::chat_target::ChatTarget::new_unchecked("a".to_string()),
         ids: vec![3],
         to: crate::chat_target::ChatTarget::new_unchecked("b".to_string()),
+        silent: false,
     };
     assert!(validate_forward(&base).is_ok());
     for bad in [vec![0], vec![-2]] {
@@ -5449,6 +5491,7 @@ fn validate_forward_rejects_nonpositive_ids() {
         from: "a".to_string(),
         ids: vec![0],
         to: "b".to_string(),
+        silent: false,
         dry_run: false,
     };
     assert!(matches!(
@@ -5898,17 +5941,27 @@ fn delete_dry_run_carries_chat() {
 }
 
 #[test]
-fn forward_dry_run_carries_from_and_to() {
+fn forward_dry_run_carries_from_to_and_silent() {
     let args = ForwardArgs {
         from: crate::chat_target::ChatTarget::new_unchecked("a".to_string()),
         ids: vec![3],
         to: crate::chat_target::ChatTarget::new_unchecked("b".to_string()),
+        silent: false,
     };
     let value = forward_serve_dry_run(&args).unwrap();
     assert_eq!(value["dry_run"], serde_json::json!(true));
     assert_eq!(value["from"], serde_json::json!("a"));
     assert_eq!(value["to"], serde_json::json!("b"));
     assert_eq!(value["ids"], serde_json::json!([3]));
+    assert_eq!(value["silent"], serde_json::json!(false));
+    let quiet = ForwardArgs {
+        silent: true,
+        ..args
+    };
+    assert_eq!(
+        forward_serve_dry_run(&quiet).unwrap()["silent"],
+        serde_json::json!(true)
+    );
 }
 
 #[test]

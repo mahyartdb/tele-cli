@@ -193,6 +193,7 @@ async fn get(args: GetArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     let dry_run = flags.dry_run;
     let json = flags.json;
     let jsonl = flags.jsonl;
+    let multi = crate::executor::select_accounts(flags)?.len() > 1;
     let envelope = run_fanout(flags, move |name| {
         let config_path = config_path.clone();
         let args = args.clone();
@@ -205,7 +206,12 @@ async fn get(args: GetArgs, flags: &GlobalFlags) -> TeleResult<i32> {
             client::authorize(&guard.client).await?;
             let data = get_core(&guard.shares(), GetParams::from(&args)).await?;
             if !output::machine_mode(json, jsonl) {
-                output::print_table(&["key", "rule", "peers"], &privacy_table_rows(&data))?;
+                output::print_account_table(
+                    &name,
+                    multi,
+                    &["key", "rule", "peers"],
+                    &privacy_table_rows(&data),
+                )?;
             }
             Ok(data)
         })

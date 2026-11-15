@@ -235,6 +235,10 @@ Filters: `--from SENDER` (same target syntax as `--chat`) keeps only that sender
 
 Rows gain additive `"username"` (a string, empty when none). The human table appends a matching `username` column; existing column order is unchanged. `--redact-phones` replaces every `phone` value with `"[REDACTED]"` (machine and human output alike); the serve/MCP `contact list` op accepts the same `redact_phones` param.
 
+## `msg forward`
+
+`tele msg forward --from X --to Y --ids 1,2` re-sends the messages and notifies the destination by default; `--silent` forwards without a notification (serve/MCP: `ForwardParams.silent`, default `false`). Dry-run rows echo `silent` alongside `from`/`to`/`ids`.
+
 ## `msg send`
 
 - `--file` is repeatable: one path sends a single media, and 2-10 paths send an album (`{"album": [message objects]}`). Albums do not support `--schedule` (including `--schedule online`) or `--thumbnail`.
@@ -243,7 +247,7 @@ Rows gain additive `"username"` (a string, empty when none). The human table app
 - `--media-ttl <secs>` sets an auto-destruct timer on sent media.
 - `--thumbnail <path>` attaches a custom thumbnail to single-document uploads.
 - `--url <url> --kind photo|document` uploads remote media by URL instead of a local file.
-- `--copy-from <chat> --copy-id <id>` re-sends an existing message's media without the forward header.
+- `--copy-from <chat> --copy-id <id>` re-sends an existing message's media without the forward header. `--media-ttl` and `--thumbnail` are rejected with a Usage error here: copied media keeps its own TTL and cannot carry a new thumbnail.
 - `--topic <id>` posts into a forum topic. It is mutually exclusive with `--reply`: both set the reply-to header, and replying to the topic root lands the message in that topic. Reads scoped to a topic are available through `tele raw messages.Search` (`top_msg_id`), because grammers 0.10 exposes no topic filters on its history or search iterators.
 - `--caption <text>` attaches a caption to uploaded file(s) and requires `--file`.
 - `--format plain|markdown` (default `plain`) controls text formatting for outgoing text. Plain text sends are capped by Telegram at 4096 UTF-16 units (and captions at 1024); oversized text fails with the server's MESSAGE_TOO_LONG.
@@ -327,6 +331,10 @@ Notes:
 ## `profile get`
 
 Phone numbers stay redacted (`"phone": null`) unless `--show-phone` is passed. `--redact-phones` forces redaction even alongside `--show-phone`; the serve/MCP `profile get` op accepts the same `redact_phones` param.
+
+## `profile set --name`
+
+`--name` carries the complete display name: the first space splits the first name from the last name, so `--name "John Smith"` sets both, and a single word clears the surname (`--name Johnny` on an account named "John Smith" leaves "Johnny"). There is no keep-surname switch — repeat the surname in `--name` to keep it, because the server merges an unset last name with the stored one. Each field caps at 64 UTF-16 units.
 
 ## `profile set --username`
 

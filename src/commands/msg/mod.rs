@@ -516,6 +516,7 @@ pub(crate) fn forward_serve_dry_run(args: &ForwardArgs) -> TeleResult<serde_json
         "from": args.from,
         "to": args.to,
         "ids": args.ids,
+        "silent": args.silent,
         "would": format!("forward {} message(s) to chat {}", args.ids.len(), args.to)
     }))
 }
@@ -547,9 +548,10 @@ pub(crate) fn build_forward_request(
     ids: &[i32],
     random_ids: &[i64],
     to_peer: grammers_client::tl::enums::InputPeer,
+    silent: bool,
 ) -> grammers_client::tl::functions::messages::ForwardMessages {
     grammers_client::tl::functions::messages::ForwardMessages {
-        silent: true,
+        silent,
         background: false,
         with_my_score: false,
         drop_author: false,
@@ -639,6 +641,7 @@ pub(crate) async fn forward_core(
     validate_forward(&ForwardArgs::from(&params))?;
     shares.rate_limiter.acquire().await;
     let ids = params.ids;
+    let silent = params.silent;
     let from =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.from).await?;
     let to = entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.to).await?;
@@ -657,6 +660,7 @@ pub(crate) async fn forward_core(
                 chunk,
                 &random_ids,
                 to_peer.clone(),
+                silent,
             ))
             .await
             .map_err(tele_invocation);

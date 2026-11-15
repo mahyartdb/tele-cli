@@ -249,6 +249,8 @@ pub struct ForwardArgs {
     pub(crate) ids: Vec<i32>,
     #[arg(long, value_parser = clap::value_parser!(ChatTarget), help = "destination chat to forward to")]
     pub(crate) to: ChatTarget,
+    #[arg(long, help = "forward without notifying the recipient")]
+    pub(crate) silent: bool,
 }
 
 #[derive(Args, Clone)]
@@ -776,6 +778,8 @@ pub(crate) struct ForwardParams {
     pub(crate) ids: Vec<i32>,
     pub(crate) to: String,
     #[serde(default)]
+    pub(crate) silent: bool,
+    #[serde(default)]
     pub(crate) dry_run: bool,
 }
 
@@ -785,6 +789,7 @@ impl From<&ForwardArgs> for ForwardParams {
             from: a.from.as_str().to_string(),
             ids: a.ids.clone(),
             to: a.to.as_str().to_string(),
+            silent: a.silent,
             dry_run: false,
         }
     }
@@ -796,6 +801,7 @@ impl From<&ForwardParams> for ForwardArgs {
             from: ChatTarget::new_unchecked(p.from.clone()),
             ids: p.ids.clone(),
             to: ChatTarget::new_unchecked(p.to.clone()),
+            silent: p.silent,
         }
     }
 }

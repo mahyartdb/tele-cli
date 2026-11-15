@@ -242,6 +242,11 @@ pub(crate) fn validate_send(args: &SendArgs) -> TeleResult<()> {
             return Err(TeleError::Usage("--media-ttl must be positive".to_string()));
         }
     }
+    if args.media_ttl.is_some() && args.copy_from.is_some() {
+        return Err(TeleError::Usage(
+            "--media-ttl is not supported with --copy-from".to_string(),
+        ));
+    }
     if let Some(text) = &args.text {
         if text.trim().is_empty() {
             return Err(TeleError::Usage("--text must not be empty".to_string()));
@@ -317,6 +322,11 @@ pub(crate) fn validate_send(args: &SendArgs) -> TeleResult<()> {
         ));
     }
     if let Some(thumb) = &args.thumbnail {
+        if args.copy_from.is_some() {
+            return Err(TeleError::Usage(
+                "--thumbnail is not supported with --copy-from".to_string(),
+            ));
+        }
         super::validate::validate_upload_path(thumb)?;
         if args.files.len() > 1 {
             return Err(TeleError::Usage(
