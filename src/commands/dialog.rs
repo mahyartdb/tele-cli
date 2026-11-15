@@ -236,52 +236,17 @@ pub(crate) async fn dialog_list_core(
     params: ListParams,
 ) -> TeleResult<serde_json::Value> {
     shares.rate_limiter.acquire().await;
-    if let Some(folder) = params.folder {
-        return dialog_list_folder_core(shares, params.limit, folder).await;
-    }
-    let folder = 0;
-    let mut iter = shares.client.iter_dialogs();
-    let mut rows = Vec::new();
-    let mut count = 0u32;
-    let mut seen = 0usize;
-    while count < params.limit {
-        match iter.next().await.map_err(tele_invocation)? {
-            Some(dialog) => {
-                if !is_dialog_row(&dialog.raw) {
-                    continue;
-                }
-                let d = match &dialog.raw {
-                    tl::enums::Dialog::Dialog(d) => d,
-                    tl::enums::Dialog::Folder(_) => continue,
-                };
-                if !matches_folder(&dialog.raw, folder) {
-                    continue;
-                }
-                seen += 1;
-                shares.rate_limiter.acquire_for_items(seen).await;
-                let draft = match &d.draft {
-                    Some(tl::enums::DraftMessage::Message(dm)) => dm.message.clone(),
-                    _ => String::new(),
-                };
-                let last = dialog
-                    .last_message
-                    .as_ref()
-                    .map(|m| m.text().to_string())
-                    .unwrap_or_default();
-                let last_message_date = dialog.last_message.as_ref().map(|m| m.date().to_rfc3339());
-                rows.push(dialog_row(
-                    d,
-                    crate::serialize::peer_key(&dialog.peer),
-                    draft,
-                    last,
-                    last_message_date,
-                ));
-                count += 1;
-            }
-            None => break,
-        }
-    }
-    Ok(serde_json::json!({"dialogs": rows}))
+    // Folder 0 (main) is requested from the server rather than filtered
+    // locally: the server orders dialogs from every folder, so an account
+    // with many archived dialogs spent page slots on rows that were then
+    // dropped -- and could return nothing at all while main-folder
+    // dialogs existed.
+    let folder = dialog_list_folder(params.folder);
+    dialog_list_folder_core(shares, params.limit, folder).await
+}
+
+pub(crate) fn dialog_list_folder(folder: Option<i32>) -> i32 {
+    folder.unwrap_or(0)
 }
 
 async fn dialog_list_folder_core(
@@ -601,13 +566,6 @@ fn dialog_row(
         "draft": draft,
         "last_message": last_message,
         "last_message_date": last_message_date})
-}
-
-fn matches_folder(raw: &tl::enums::Dialog, folder: i32) -> bool {
-    match raw {
-        tl::enums::Dialog::Dialog(d) => d.folder_id.unwrap_or(0) == folder,
-        tl::enums::Dialog::Folder(_) => false,
-    }
 }
 
 fn drafts_dry_run_data(limit: usize) -> serde_json::Value {
@@ -2498,19 +2456,14 @@ mod tests {
     }
 
     #[test]
-    fn folder_zero_matches_main_rows_only() {
-        assert!(matches_folder(&raw_dialog(Some(0)), 0));
-        assert!(matches_folder(&raw_dialog(None), 0));
-        assert!(!matches_folder(&raw_dialog(Some(1)), 0));
-        assert!(!matches_folder(&phantom_dialog(), 0));
-    }
-
-    #[test]
-    fn folder_one_matches_only_archive_rows() {
-        assert!(matches_folder(&raw_dialog(Some(1)), 1));
-        assert!(!matches_folder(&raw_dialog(Some(0)), 1));
-        assert!(!matches_folder(&raw_dialog(None), 1));
-        assert!(!matches_folder(&phantom_dialog(), 1));
+    fn folder_selection_is_server_side() {
+        // The folder filter moved to the server: the default listing asks
+        // for folder 0 instead of walking every folder and dropping the
+        // archived rows locally (which could return nothing while
+        // main-folder dialogs existed).
+        assert_eq!(dialog_list_folder(Some(0)), 0);
+        assert_eq!(dialog_list_folder(Some(1)), 1);
+        assert_eq!(dialog_list_folder(None), 0);
     }
 
     #[test]

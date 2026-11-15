@@ -144,7 +144,11 @@ pub(crate) async fn participants(args: ParticipantsArgs, flags: &GlobalFlags) ->
                     .iter_participants(chat_ref)
                     .filter(participant_filter(role, search.as_deref()));
                 while count < limit {
-                    guard.rate_limiter.acquire().await;
+                    // One token per PAGE, not per participant: grammers
+                    // fetches participants 100 at a time, so spending a
+                    // token per row made a 500-member group cost 500
+                    // tokens (minutes of limiter wait) for five round trips.
+                    guard.rate_limiter.acquire_for_items(count as usize).await;
                     match iter.next().await.map_err(tele_invocation)? {
                         Some(p) => {
                             let peer = grammers_client::peer::Peer::User(p.user);

@@ -3045,7 +3045,8 @@ pub(crate) async fn chat_participants_core(
             .iter_participants(chat_ref)
             .filter(participant_filter(role, search.as_deref()));
         while count < params.limit {
-            shares.rate_limiter.acquire().await;
+            // One token per PAGE, not per participant (see the CLI twin).
+            shares.rate_limiter.acquire_for_items(count as usize).await;
             match iter.next().await.map_err(tele_invocation)? {
                 Some(p) => {
                     let peer = grammers_client::peer::Peer::User(p.user);
