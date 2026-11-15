@@ -68,6 +68,21 @@ a live account), curve 2 (fan-out `--parallel` sweep, to confirm the
 dispatcher change costs nothing), curve 8 (resync replay after a
 simulated outage).
 
+## Known limits with no curve yet
+
+- **Bulk media download is strictly sequential** (`src/commands/msg/download.rs`):
+  one file at a time, and grammers keeps exactly one `upload.getFile` in
+  flight, so a 100 MB file is ~200 serialized 512 KB chunks. Pipelining
+  would need raw `upload.getFile` calls (offset-parallel), which is a
+  grammers-level change. No curve covers download throughput yet: add
+  one and record the baseline before attempting it.
+- **Album uploads bypass the per-account token bucket**
+  (`src/commands/msg/send.rs`): `send_core` takes one token and the
+  `SaveBigFilePart`/`SaveFilePart` RPCs that follow are invisible to the
+  limiter, so a large upload spends far more server calls than its
+  budget allows. Documented here rather than changed, because counting
+  upload RPCs would change the limiter's meaning (ADR-008).
+
 ## First-cut scope notes
 
 - FTS5: the `messages_au` update trigger closed the open "no update trigger"
