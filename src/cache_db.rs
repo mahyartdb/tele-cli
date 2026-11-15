@@ -44,7 +44,42 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
 END;
 ";
 
+/// Connections opened in this process, keyed by account.
+///
+/// The serve and MCP lanes serve many cache requests from one long-lived
+/// process. Re-opening the database, re-running the schema DDL and
+/// re-tightening the file permissions on every request cost more than
+/// the queries themselves. The schema and the permission pass now happen
+/// once per account per process; the connection itself is an
+/// `Arc<dyn Conn + Send + Sync>` handle (SQLite in serialized mode), so
+/// sharing it between concurrent requests is safe.
+static CONNECTIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, libsql::Connection>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// How many times a database was actually opened (not served from the
+/// connection cache). Used by the tests to prove the cache works.
+static DB_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 async fn open_db(account: &str) -> TeleResult<libsql::Connection> {
+    {
+        let cache = CONNECTIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(conn) = cache.get(account) {
+            return Ok(conn.clone());
+        }
+    }
+    let conn = open_db_uncached(account).await?;
+    let mut cache = CONNECTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(account.to_string(), conn.clone());
+    Ok(conn)
+}
+
+async fn open_db_uncached(account: &str) -> TeleResult<libsql::Connection> {
+    DB_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = cache_dir()?;
     // Directory creation and permission hardening are blocking FS calls; run
     // them off the async worker threads (create_dir_private walks metadata
@@ -689,6 +724,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.len(), 1);
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_connection_is_reused_across_operations() {
+        // The serve and MCP lanes serve many cache requests from one
+        // process; re-opening the database and re-running the schema DDL
+        // on every request cost more than the queries did.
+        let _guard = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "telecli-cache-reuse-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TELE_APP_DIR", &dir);
+        let account = test_account("reuse");
+        let before = DB_OPENS.load(std::sync::atomic::Ordering::Relaxed);
+        open_db(&account).await.unwrap();
+        open_db(&account).await.unwrap();
+        let opened = DB_OPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(
+            opened, 1,
+            "the second open must reuse the cached connection"
+        );
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
