@@ -375,23 +375,21 @@ pub(crate) async fn invite(args: InviteArgs, flags: &GlobalFlags) -> TeleResult<
 }
 
 pub(crate) fn invite_edit_merge(
-    current: &tl::enums::ExportedChatInvite,
+    current: &tl::types::ChatInviteExported,
     plan: &ValidatedInvite,
 ) -> ValidatedInvite {
     let mut resolved = plan.clone();
-    if let tl::enums::ExportedChatInvite::ChatInviteExported(cur) = current {
-        if resolved.expire_date.is_none() {
-            resolved.expire_date = cur.expire_date;
-        }
-        if resolved.usage_limit.is_none() {
-            resolved.usage_limit = cur.usage_limit;
-        }
-        if resolved.request_needed.is_none() {
-            resolved.request_needed = Some(cur.request_needed);
-        }
-        if resolved.title.is_none() {
-            resolved.title = cur.title.clone();
-        }
+    if resolved.expire_date.is_none() {
+        resolved.expire_date = current.expire_date;
+    }
+    if resolved.usage_limit.is_none() {
+        resolved.usage_limit = current.usage_limit;
+    }
+    if resolved.request_needed.is_none() {
+        resolved.request_needed = Some(current.request_needed);
+    }
+    if resolved.title.is_none() {
+        resolved.title = current.title.clone();
     }
     resolved
 }
@@ -435,20 +433,18 @@ where
         return Ok(plan.clone());
     }
     let found = fetch.await?;
-    let current = found.invite();
-    if matches!(
-        current,
-        tl::enums::ExportedChatInvite::ChatInvitePublicJoinRequests
-    ) {
+    match found.invite() {
+        tl::enums::ExportedChatInvite::ChatInviteExported(current) => {
+            Ok(invite_edit_merge(&current, plan))
+        }
         // The public join-request entry carries no editable options, so the
         // merge would send every option unset and the server would replace
         // them. Refuse instead of editing blind.
-        return Err(TeleError::Usage(
+        tl::enums::ExportedChatInvite::ChatInvitePublicJoinRequests => Err(TeleError::Usage(
             "--edit LINK resolved to the public join-request link; it has no editable options"
                 .to_string(),
-        ));
+        )),
     }
-    Ok(invite_edit_merge(&current, plan))
 }
 
 pub(crate) fn invite_dry_run_payload(chat: &str, plan: &ValidatedInvite) -> serde_json::Value {

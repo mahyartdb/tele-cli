@@ -1087,13 +1087,13 @@ fn invite_args(chat: &str) -> InviteArgs {
     }
 }
 
-fn current_invite(
+fn current_export(
     expire_date: Option<i32>,
     usage_limit: Option<i32>,
     request_needed: bool,
     title: Option<String>,
-) -> tl::enums::ExportedChatInvite {
-    tl::enums::ExportedChatInvite::ChatInviteExported(tl::types::ChatInviteExported {
+) -> tl::types::ChatInviteExported {
+    tl::types::ChatInviteExported {
         revoked: false,
         permanent: true,
         request_needed,
@@ -1108,13 +1108,27 @@ fn current_invite(
         subscription_expired: None,
         title,
         subscription_pricing: None,
-    })
+    }
+}
+
+fn current_invite(
+    expire_date: Option<i32>,
+    usage_limit: Option<i32>,
+    request_needed: bool,
+    title: Option<String>,
+) -> tl::enums::ExportedChatInvite {
+    tl::enums::ExportedChatInvite::ChatInviteExported(current_export(
+        expire_date,
+        usage_limit,
+        request_needed,
+        title,
+    ))
 }
 
 #[test]
 fn invite_edit_merge_prefills_everything_unset_from_current() {
     let resolved = invite_edit_merge(
-        &current_invite(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
+        &current_export(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
         &ValidatedInvite {
             mode: InviteMode::Edit,
             revoked: false,
@@ -1130,7 +1144,7 @@ fn invite_edit_merge_prefills_everything_unset_from_current() {
 #[test]
 fn invite_edit_merge_plan_wins_over_current() {
     let resolved = invite_edit_merge(
-        &current_invite(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
+        &current_export(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
         &ValidatedInvite {
             mode: InviteMode::Edit,
             expire_date: Some(1_900_000_000),
@@ -1149,7 +1163,7 @@ fn invite_edit_merge_plan_wins_over_current() {
 #[test]
 fn invite_edit_merge_is_per_field() {
     let resolved = invite_edit_merge(
-        &current_invite(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
+        &current_export(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
         &ValidatedInvite {
             mode: InviteMode::Edit,
             expire_date: Some(1_900_000_000),
@@ -1165,7 +1179,7 @@ fn invite_edit_merge_is_per_field() {
 #[test]
 fn invite_edit_merge_keeps_plan_revoked() {
     let resolved = invite_edit_merge(
-        &current_invite(Some(1_800_000_000), None, false, None),
+        &current_export(Some(1_800_000_000), None, false, None),
         &ValidatedInvite {
             mode: InviteMode::Edit,
             revoked: true,
