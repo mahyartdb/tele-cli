@@ -148,7 +148,9 @@ fn sweep_session_artifacts(name: &str) -> anyhow::Result<()> {
     if let Ok(entries) = std::fs::read_dir(session_dir()) {
         for entry in entries.flatten() {
             let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.starts_with(&tmp_prefix) || file_name.starts_with(&export_tmp_prefix) {
+            if tmp_sweep_matches(&file_name, &tmp_prefix)
+                || tmp_sweep_matches(&file_name, &export_tmp_prefix)
+            {
                 targets.push(entry.path());
             }
         }
@@ -161,6 +163,30 @@ fn sweep_session_artifacts(name: &str) -> anyhow::Result<()> {
             Err(e) => Err(e),
         })?;
     Ok(())
+}
+
+// Swept temp names are {prefix}{digits} for a session tmp,
+// {prefix}{digits}-{nanos}-{seq} (digits and dashes) for an export tmp, and a
+// digits-only head plus -journal/-wal/-shm for a session tmp sidecar. An
+// account legitimately named "work.session.tmp-42" owns
+// "work.session.tmp-42.session", whose remainder contains a dot, so nothing
+// with a dot may ever match the sweep.
+fn tmp_sweep_matches(file_name: &str, prefix: &str) -> bool {
+    let Some(rest) = file_name
+        .strip_prefix(prefix)
+        .filter(|rest| !rest.is_empty())
+    else {
+        return false;
+    };
+    if rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        && rest.bytes().any(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    SESSION_SIDECAR_SUFFIXES.iter().any(|suffix| {
+        rest.strip_suffix(suffix)
+            .is_some_and(|head| !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 pub async fn remove_session(name: &str) -> anyhow::Result<()> {
@@ -1911,6 +1937,53 @@ mod tests {
             "symlink target must not be written through"
         );
         remove_session("work").await.unwrap();
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_session_spares_lookalike_account_live_files() {
+        let _guard = lock_env();
+        let dir = test_dir("remove-lookalike");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        seed_test_env(&dir);
+        let lookalike_live = session_dir().join("work.session.tmp-42.session");
+        let lookalike_lock = session_dir().join("work.session.tmp-42.session.lock");
+        let lookalike_export = session_dir().join(".work.session.export.tmp-42.session.export");
+        std::fs::write(&lookalike_live, b"live-session").unwrap();
+        std::fs::write(&lookalike_lock, b"").unwrap();
+        std::fs::write(&lookalike_export, b"live-export").unwrap();
+        let real_tmp = session_dir().join("work.session.tmp-1234");
+        let real_tmp_sidecar = session_dir().join("work.session.tmp-1234-wal");
+        let real_export_tmp = session_dir().join(".work.session.export.tmp-1234-1750000000-1");
+        std::fs::write(&real_tmp, b"tmp").unwrap();
+        std::fs::write(&real_tmp_sidecar, b"tmp").unwrap();
+        std::fs::write(&real_export_tmp, b"tmp").unwrap();
+
+        sweep_session_artifacts("work").unwrap();
+
+        assert!(
+            lookalike_live.exists(),
+            "the live session of account work.session.tmp-42 must survive a removal of work"
+        );
+        assert!(
+            lookalike_lock.exists(),
+            "the lock file of account work.session.tmp-42 must survive a removal of work"
+        );
+        assert!(
+            lookalike_export.exists(),
+            "the export of account work.session.tmp-42 must survive a removal of work"
+        );
+        assert!(!real_tmp.exists(), "a digits-only tmp file must be swept");
+        assert!(
+            !real_tmp_sidecar.exists(),
+            "a digits tmp sidecar must be swept"
+        );
+        assert!(
+            !real_export_tmp.exists(),
+            "a digits export tmp must be swept"
+        );
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
