@@ -341,6 +341,8 @@ fn row_to_message(row: &libsql::Row) -> TeleResult<CachedMessage> {
 
 pub async fn cache_stats(account: &str) -> TeleResult<serde_json::Value> {
     let gate = account_gate(account);
+    #[cfg(test)]
+    GATE_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _read = gate.read().await;
     let conn = open_db(account).await?;
     let mut rows = conn
@@ -383,6 +385,8 @@ pub async fn cache_stats(account: &str) -> TeleResult<serde_json::Value> {
 
 pub async fn clear_cache(account: &str) -> TeleResult<serde_json::Value> {
     let gate = account_gate(account);
+    #[cfg(test)]
+    GATE_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _write = gate.write().await;
     let conn = open_db(account).await?;
     let deleted = conn
@@ -845,6 +849,71 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, 2);
+    }
+
+    #[tokio::test]
+    async fn cache_stats_waits_for_an_in_flight_write_batch() {
+        let _dir = TestAppDir::new("statsgate");
+        let account = test_account("statsgate");
+        store_messages(&account, &[atomic_message(1, "gate hold")])
+            .await
+            .unwrap();
+        let gate = account_gate(&account);
+        let write = gate.write().await;
+        let before = GATE_WAITS.load(std::sync::atomic::Ordering::SeqCst);
+        let mut stats = tokio::spawn({
+            let account = account.clone();
+            async move { cache_stats(&account).await }
+        });
+        wait_for_gate_wait(before).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut stats)
+                .await
+                .is_err(),
+            "a stats read must wait while a write batch holds the gate"
+        );
+        drop(write);
+        let value = tokio::time::timeout(std::time::Duration::from_secs(5), stats)
+            .await
+            .expect("stats must finish once the write guard drops")
+            .expect("stats task panicked")
+            .expect("stats failed");
+        assert_eq!(value["messages"], 1);
+    }
+
+    #[tokio::test]
+    async fn cache_clear_waits_for_an_in_flight_read() {
+        let _dir = TestAppDir::new("cleargate");
+        let account = test_account("cleargate");
+        store_messages(&account, &[atomic_message(1, "gate hold")])
+            .await
+            .unwrap();
+        let gate = account_gate(&account);
+        let read = gate.read().await;
+        let before = GATE_WAITS.load(std::sync::atomic::Ordering::SeqCst);
+        let mut clear = tokio::spawn({
+            let account = account.clone();
+            async move { clear_cache(&account).await }
+        });
+        wait_for_gate_wait(before).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut clear)
+                .await
+                .is_err(),
+            "a clear must wait while a read guard is held"
+        );
+        drop(read);
+        let value = tokio::time::timeout(std::time::Duration::from_secs(5), clear)
+            .await
+            .expect("clear must finish once the read guard drops")
+            .expect("clear task panicked")
+            .expect("clear failed");
+        assert_eq!(value["deleted"], 1);
+        let found = search_cache(&account, "", None, 10).await.unwrap();
+        assert!(
+            found.is_empty(),
+            "the gated clear must have removed the row"
+        );
     }
 
     #[tokio::test]
