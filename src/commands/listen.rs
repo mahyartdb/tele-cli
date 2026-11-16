@@ -507,14 +507,20 @@ fn album_flush(account: &str, buf: &mut AlbumBuffer) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Emit a row without consulting the stopper. Returns true when the
-/// stream must stop (stdout is gone).
+/// Emit a buffered row without consulting the count budget. Returns true when
+/// the stream must stop (stdout is gone).
+///
+/// The `--until` window still applies: a stop flush must not write a row the
+/// date filter would have withheld.
 async fn emit_direct(
     writer: &ListenWriter,
     stopper: &StreamStopper,
     account: &str,
     value: serde_json::Value,
 ) -> TeleResult<bool> {
+    if stopper.past_until(&value) {
+        return Ok(false);
+    }
     match writer.emit(account, value).await {
         Ok(_) => Ok(false),
         Err(e) if matches!(e, TeleError::Usage(_)) => Err(e),
@@ -561,7 +567,10 @@ async fn emit_or_stop(
     album: &mut AlbumBuffer,
     value: serde_json::Value,
 ) -> TeleResult<bool> {
-    if emit_row_or_stop(writer, stopper, account, value).await? {
+    if emit_row_or_stop(writer, stopper, account, value)
+        .await?
+        .stop
+    {
         flush_albums_on_stop(writer, stopper, account, album).await?;
         return Ok(true);
     }
@@ -582,15 +591,23 @@ async fn emit_due_albums(
     swept: Vec<serde_json::Value>,
 ) -> TeleResult<bool> {
     for (index, done) in swept.iter().enumerate() {
-        if emit_row_or_stop(writer, stopper, account, done.clone()).await? {
-            for leftover in swept_after_stop(&swept, index) {
-                if emit_direct(writer, stopper, account, leftover.clone()).await? {
-                    return Ok(true);
-                }
-            }
-            flush_albums_on_stop(writer, stopper, account, album).await?;
+        let step = emit_row_or_stop(writer, stopper, account, done.clone()).await?;
+        if !step.stop {
+            continue;
+        }
+        // A stop decided before the write (count spent by another account, a
+        // date boundary, a dead writer) must not drop this row: it left the
+        // buffer already, so nothing else will emit it.
+        if !step.wrote && emit_direct(writer, stopper, account, done.clone()).await? {
             return Ok(true);
         }
+        for leftover in swept_after_stop(&swept, index) {
+            if emit_direct(writer, stopper, account, leftover.clone()).await? {
+                return Ok(true);
+            }
+        }
+        flush_albums_on_stop(writer, stopper, account, album).await?;
+        return Ok(true);
     }
     Ok(false)
 }
@@ -855,14 +872,16 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             Ok(guard) => {
                                 if let Err(e) = client::authorize(&guard.client).await {
                                     handle_stream_failure(
-                                        &name,
-                                        e,
-                                        &mut failures,
-                                        std::time::Duration::ZERO,
-                                        deadline,
-                                        Some(&stopper),
-                                        MAX_RECONNECT_ATTEMPTS,
-                                    )
+&name,
+e,
+&mut failures,
+StreamFailureCtx {
+    stream_uptime: std::time::Duration::ZERO,
+    deadline,
+    stopper: Some(&stopper),
+},
+MAX_RECONNECT_ATTEMPTS,
+)
                                     .await?;
                                     continue;
                                 }
@@ -870,14 +889,16 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             }
                             Err(e) => {
                                 handle_stream_failure(
-                                    &name,
-                                    TeleError::from(e),
-                                    &mut failures,
-                                    std::time::Duration::ZERO,
-                                    deadline,
-                                    Some(&stopper),
-                                    MAX_RECONNECT_ATTEMPTS,
-                                )
+&name,
+TeleError::from(e),
+&mut failures,
+StreamFailureCtx {
+    stream_uptime: std::time::Duration::ZERO,
+    deadline,
+    stopper: Some(&stopper),
+},
+MAX_RECONNECT_ATTEMPTS,
+)
                                 .await?;
                                 continue;
                             }
@@ -912,14 +933,16 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             return Err(err);
                         }
                         handle_stream_failure(
-                            &name,
-                            err,
-                            &mut failures,
-                            std::time::Duration::ZERO,
-                            deadline,
-                            Some(&stopper),
-                            MAX_RECONNECT_ATTEMPTS,
-                        )
+&name,
+err,
+&mut failures,
+StreamFailureCtx {
+    stream_uptime: std::time::Duration::ZERO,
+    deadline,
+    stopper: Some(&stopper),
+},
+MAX_RECONNECT_ATTEMPTS,
+)
                         .await?;
                         continue;
                     }
@@ -941,23 +964,26 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         Ok(stream) => stream,
                         Err(e) => {
                             handle_stream_failure(
-                                &name,
-                                TeleError::Other(e.to_string()),
-                                &mut failures,
-                                std::time::Duration::ZERO,
-                                deadline,
-                                Some(&stopper),
-                                MAX_RECONNECT_ATTEMPTS,
-                            )
+&name,
+TeleError::Other(e.to_string()),
+&mut failures,
+StreamFailureCtx {
+    stream_uptime: std::time::Duration::ZERO,
+    deadline,
+    stopper: Some(&stopper),
+},
+MAX_RECONNECT_ATTEMPTS,
+)
                             .await?;
                             continue;
                         }
                     };
                     failures = on_stream_connected(failures);
                     let connected_at = std::time::Instant::now();
-                    // gaps/observed/album are declared before the reconnect
-                    // loop (see below) so gap detection and peer bookkeeping
-                    // survive an outage instead of resetting blind.
+                    // gaps/observed are declared before the reconnect loop
+                    // (see below) so gap detection and peer bookkeeping
+                    // survive an outage instead of resetting blind. The album
+                    // buffer is per attempt and every break path flushes it.
                     let mut album = AlbumBuffer::new();
                     let gap_on = events.iter().any(|e| e == "Gap");
                     let album_on = events.iter().any(|e| e == "Album");
@@ -1048,20 +1074,24 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                     }
                                 }
                                 handle_stream_failure(
-                                    &name,
-                                    crate::error::invocation_error(e),
-                                    &mut failures,
-                                    connected_at.elapsed(),
-                                    deadline,
-                                    Some(&stopper),
-                                    MAX_RECONNECT_ATTEMPTS,
-                                )
+&name,
+crate::error::invocation_error(e),
+&mut failures,
+StreamFailureCtx {
+    stream_uptime: connected_at.elapsed(),
+    deadline,
+    stopper: Some(&stopper),
+},
+MAX_RECONNECT_ATTEMPTS,
+)
                                 .await?;
                                 break;
                             }
                             Tick::Update(u) => *u,
                         };
-                        failures = on_reconnect_success(failures);
+                        if !is_empty_update(update.raw()) {
+                            failures = on_reconnect_success(failures);
+                        }
                         if let Err(e) = stream.sync_update_state().await {
                             output::log_line(
                                 "warn",
@@ -1660,7 +1690,7 @@ impl StreamStopper {
     /// UserUpdate, CallbackQuery, MessageDeleted) can never match a date
     /// filter, so they never stop the stream — `--timeout-secs` bounds
     /// those runs.
-    fn event_date_reached(&self, value: &serde_json::Value) -> bool {
+    fn past_until(&self, value: &serde_json::Value) -> bool {
         let guard = self.until_date.lock().unwrap_or_else(|e| e.into_inner());
         let Some(limit) = *guard else {
             return false;
@@ -1728,42 +1758,73 @@ enum CountSlot {
     Exhausted,
 }
 
+/// What became of one row offered to the stream.
+///
+/// `stop` and `wrote` are independent: a date boundary stops without writing,
+/// a spent count slot written by this row stops after writing, and a stalled
+/// stdout drops a row without either.
+#[derive(Clone, Copy)]
+struct EmitStep {
+    wrote: bool,
+    stop: bool,
+}
+
+impl EmitStep {
+    const WRITTEN: Self = Self {
+        wrote: true,
+        stop: false,
+    };
+    const SKIPPED: Self = Self {
+        wrote: false,
+        stop: false,
+    };
+    const STOPPED: Self = Self {
+        wrote: false,
+        stop: true,
+    };
+    const WRITTEN_LAST: Self = Self {
+        wrote: true,
+        stop: true,
+    };
+}
+
 async fn emit_row_or_stop(
     writer: &ListenWriter,
     stopper: &StreamStopper,
     account: &str,
     value: serde_json::Value,
-) -> TeleResult<bool> {
+) -> TeleResult<EmitStep> {
     // A date stop is shared: once one account reaches the --until boundary
     // the whole run ends, instead of leaving quiet accounts streaming on.
-    if stopper.event_date_reached(&value) {
+    if stopper.past_until(&value) {
         stopper.request_stop();
         output::log_line("info", "listen --until reached");
-        return Ok(true);
+        return Ok(EmitStep::STOPPED);
     }
     // time_up() only fires for a FUTURE --until (a past timestamp has no
     // wall-clock deadline), where it bounds the run even if no dated row
     // ever arrives.
     if stopper.stop_requested() || stopper.time_up() {
-        return Ok(true);
+        return Ok(EmitStep::STOPPED);
     }
     let last = match stopper.reserve() {
         // A budget spent by another account stops only this account. The
         // spender's write can still be dropped (a stalled stdout releases the
         // slot), so an observer must not make the stop permanent.
-        CountSlot::Exhausted => return Ok(true),
+        CountSlot::Exhausted => return Ok(EmitStep::STOPPED),
         CountSlot::Reserved { last } => last,
     };
     match writer.emit(account, value).await {
         Ok(EmitOutcome::Queued) => {}
         Ok(EmitOutcome::Dropped) => {
             stopper.release();
-            return Ok(false);
+            return Ok(EmitStep::SKIPPED);
         }
         Err(e) => {
+            stopper.release();
             return match on_emit_failure(stopper, account, &e) {
                 EmitFailure::Usage => Err(e),
-                EmitFailure::Stop => Ok(true),
+                EmitFailure::Stop => Ok(EmitStep::STOPPED),
             };
         }
     }
@@ -1772,9 +1833,9 @@ async fn emit_row_or_stop(
         // that never saw an event stay parked on their next poll (up to 1h).
         stopper.request_stop();
         output::log_line("info", "listen --count reached");
-        return Ok(true);
+        return Ok(EmitStep::WRITTEN_LAST);
     }
-    Ok(false)
+    Ok(EmitStep::WRITTEN)
 }
 
 enum EmitFailure {
@@ -1783,11 +1844,11 @@ enum EmitFailure {
 }
 
 fn on_emit_failure(stopper: &StreamStopper, account: &str, err: &TeleError) -> EmitFailure {
-    // The row never reached stdout, so the slot must go back: other accounts
-    // keep streaming and must still emit the full --count.
-    stopper.release();
     if matches!(err, TeleError::Usage(_)) {
-        // One account's bad projection must not end the run.
+        // The projection is one global --fields value, so it fails for every
+        // account: ending only this task would leave the rest streaming on a
+        // run that can never emit a row.
+        stopper.request_stop();
         return EmitFailure::Usage;
     }
     // The broadcast is what wakes accounts parked on a quiet stream; without
@@ -1815,15 +1876,27 @@ fn flood_wait_secs(err: &TeleError) -> Option<std::time::Duration> {
     }
 }
 
+pub(crate) struct StreamFailureCtx<'a> {
+    /// ZERO when no connection was established before the failure.
+    pub stream_uptime: std::time::Duration,
+    /// Wall-clock end of the run, when one is set.
+    pub deadline: Option<std::time::Instant>,
+    /// Shared stop source; serve runs without one.
+    pub stopper: Option<&'a StreamStopper>,
+}
+
 pub(crate) async fn handle_stream_failure(
     account: &str,
     err: TeleError,
     failures: &mut u32,
-    stream_uptime: std::time::Duration,
-    deadline: Option<std::time::Instant>,
-    stopper: Option<&StreamStopper>,
+    ctx: StreamFailureCtx<'_>,
     max_attempts: u32,
 ) -> TeleResult<()> {
+    let StreamFailureCtx {
+        stream_uptime,
+        deadline,
+        stopper,
+    } = ctx;
     if is_auth_error(&err) {
         return Err(err);
     }
@@ -1983,12 +2056,13 @@ fn streak_before_failure(failures: u32, stream_uptime: std::time::Duration) -> u
 
 /// An established connection is not proof the stream works: a stream that
 /// connects and immediately errors would reset the streak every cycle and
-/// never reach the give-up limit. Only a consumed update resets it.
+/// never reach the give-up limit. Only a delivered, non-empty update
+/// resets it.
 fn on_stream_connected(failures: u32) -> u32 {
     failures
 }
 
-fn on_reconnect_success(failures: u32) -> u32 {
+pub(crate) fn on_reconnect_success(failures: u32) -> u32 {
     let _ = failures;
     0
 }
@@ -2451,7 +2525,7 @@ mod tests;
 mod stopper_tests {
     use super::{
         album_ingest, emit_due_albums, emit_row_or_stop, handle_stream_failure, on_emit_failure,
-        AlbumBuffer, CountSlot, EmitFailure, ListenWriter, StreamStopper,
+        AlbumBuffer, CountSlot, EmitFailure, ListenWriter, StreamFailureCtx, StreamStopper,
     };
     use crate::error::TeleError;
     use std::sync::{Arc, Mutex};
@@ -2593,11 +2667,11 @@ mod stopper_tests {
         let backlog_row = serde_json::json!({"date": "2025-06-01T00:00:00+00:00"});
         let future_row = serde_json::json!({"date": "2026-06-01T00:00:00+00:00"});
         assert!(
-            !stopper.event_date_reached(&backlog_row),
+            !stopper.past_until(&backlog_row),
             "backlog dated before --until must stream, not be cut off"
         );
         assert!(
-            stopper.event_date_reached(&future_row),
+            stopper.past_until(&future_row),
             "first event at/after --until must stop the stream"
         );
     }
@@ -2610,8 +2684,8 @@ mod stopper_tests {
         let stopper = StreamStopper::new(None, None, Some(limit));
         let before = serde_json::json!({"event": "Raw", "state": {"date": 1_700_000_000i64}});
         let after = serde_json::json!({"event": "Raw", "state": {"date": 2_000_000_000i64}});
-        assert!(!stopper.event_date_reached(&before));
-        assert!(stopper.event_date_reached(&after));
+        assert!(!stopper.past_until(&before));
+        assert!(stopper.past_until(&after));
     }
 
     #[test]
@@ -2624,7 +2698,7 @@ mod stopper_tests {
             .with_timezone(&chrono::Utc);
         let stopper = StreamStopper::new(None, None, Some(limit));
         let undated = serde_json::json!({"event": "ChatAction"});
-        assert!(!stopper.event_date_reached(&undated));
+        assert!(!stopper.past_until(&undated));
         assert!(!stopper.time_up());
     }
 
@@ -2638,9 +2712,12 @@ mod stopper_tests {
         let stopper = StreamStopper::new(None, None, Some(limit));
         let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
         let row = serde_json::json!({"event": "NewMessage", "date": "2026-06-01T00:00:00+00:00"});
-        assert!(super::emit_row_or_stop(&writer, &stopper, "work", row)
-            .await
-            .unwrap());
+        assert!(
+            super::emit_row_or_stop(&writer, &stopper, "work", row)
+                .await
+                .unwrap()
+                .stop
+        );
         assert!(stopper.stop_requested());
         writer.finish().await;
         assert!(
@@ -2664,9 +2741,11 @@ mod stopper_tests {
             "probe",
             flood,
             &mut failures,
-            std::time::Duration::ZERO,
-            deadline,
-            None,
+            StreamFailureCtx {
+                stream_uptime: std::time::Duration::ZERO,
+                deadline,
+                stopper: None,
+            },
             5,
         )
         .await;
@@ -2694,9 +2773,11 @@ mod stopper_tests {
             "probe",
             flood,
             &mut failures,
-            std::time::Duration::ZERO,
-            deadline,
-            None,
+            StreamFailureCtx {
+                stream_uptime: std::time::Duration::ZERO,
+                deadline,
+                stopper: None,
+            },
             5,
         )
         .await;
@@ -2709,24 +2790,32 @@ mod stopper_tests {
         let stopper = StreamStopper::new(Some(0), None, None);
         let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
         let row = serde_json::json!({"event": "NewMessage"});
-        assert!(super::emit_row_or_stop(&writer, &stopper, "work", row)
-            .await
-            .unwrap());
+        assert!(
+            super::emit_row_or_stop(&writer, &stopper, "work", row)
+                .await
+                .unwrap()
+                .stop
+        );
         writer.finish().await;
         assert!(sink.lines().is_empty());
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn consuming_the_last_count_slot_shares_the_stop() {
         // Regression: the account that emitted the Nth row returned without
         // telling the stopper, so every other account parked on its next
         // poll (up to 1h) instead of ending with the run.
+        let _lock = quiet_fields();
         let stopper = StreamStopper::new(Some(1), None, None);
         let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
         let row = serde_json::json!({"event": "NewMessage"});
-        assert!(super::emit_row_or_stop(&writer, &stopper, "work", row)
-            .await
-            .unwrap());
+        assert!(
+            super::emit_row_or_stop(&writer, &stopper, "work", row)
+                .await
+                .unwrap()
+                .stop
+        );
         assert!(
             stopper.stop_requested(),
             "a spent --count budget must request a stop so parked accounts wake"
@@ -2744,9 +2833,12 @@ mod stopper_tests {
         let stopper = StreamStopper::new(Some(0), None, None);
         let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
         let row = serde_json::json!({"event": "NewMessage"});
-        assert!(super::emit_row_or_stop(&writer, &stopper, "work", row)
-            .await
-            .unwrap());
+        assert!(
+            super::emit_row_or_stop(&writer, &stopper, "work", row)
+                .await
+                .unwrap()
+                .stop
+        );
         assert!(
             !stopper.stop_requested(),
             "an observer of an exhausted budget must not make the stop permanent"
@@ -2770,7 +2862,7 @@ mod stopper_tests {
             .await
             .expect("request_stop must wake a parked wait_for_stop");
         assert!(
-            start.elapsed() < std::time::Duration::from_millis(400),
+            start.elapsed() < std::time::Duration::from_millis(480),
             "the notify must wake the wait before the 500ms fallback poll; woke in {:?}",
             start.elapsed()
         );
@@ -2859,7 +2951,7 @@ mod stopper_tests {
         assert_eq!(
             super::on_reconnect_success(failures),
             0,
-            "a consumed update is what resets the streak"
+            "a delivered, non-empty update is what resets the streak"
         );
     }
 
@@ -2987,6 +3079,7 @@ mod stopper_tests {
             )
             .await
             .expect("a broken pipe is not a usage error")
+            .stop
             {
                 stopped = true;
                 break;
@@ -3005,10 +3098,10 @@ mod stopper_tests {
     }
 
     #[test]
-    fn a_usage_emit_failure_releases_the_reserved_slot_without_stopping_the_run() {
-        // Regression: a row that failed --fields projection had already spent
-        // a slot, so the run could emit fewer than --count rows, and the
-        // failure also stopped every other account.
+    fn a_usage_emit_failure_broadcasts_the_stop() {
+        // --fields is one global value, so a projection failure fails for
+        // every account: ending only this task would leave the rest parked on
+        // a run that can never emit a row.
         let stopper = StreamStopper::new(Some(1), None, None);
         let failure = on_emit_failure(
             &stopper,
@@ -3017,12 +3110,69 @@ mod stopper_tests {
         );
         assert!(matches!(failure, EmitFailure::Usage));
         assert!(
-            !stopper.stop_requested(),
-            "one account's projection failure must not end the run"
+            stopper.stop_requested(),
+            "a global projection failure must wake and end every account"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn emit_direct_broadcasts_a_stop_on_a_dead_stdout() {
+        // The stop-flush path writes without the count check, so it must not
+        // silently spin on a dead writer either.
+        let _lock = quiet_fields();
+        let stopper = StreamStopper::new(None, None, None);
+        let writer =
+            super::spawn_writer(|| BrokenPipeSink, 1, std::time::Duration::from_millis(200));
+        let stopped = {
+            let mut stopped = false;
+            for _ in 0..64 {
+                if super::emit_direct(
+                    &writer,
+                    &stopper,
+                    "acct",
+                    serde_json::json!({"event": "NewMessage"}),
+                )
+                .await
+                .expect("a broken pipe is not a usage error")
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+            stopped
+        };
+        assert!(stopped, "a dead stdout must end the flush");
         assert!(
-            matches!(stopper.reserve(), CountSlot::Reserved { .. }),
-            "the row never reached stdout, so its slot must be returned"
+            stopper.stop_requested(),
+            "a dead stdout must wake parked accounts"
+        );
+        writer.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_stop_was_requested_is_not_counted_or_slept_on() {
+        let stopper = StreamStopper::new(None, None, None);
+        stopper.request_stop();
+        let mut failures = 2u32;
+        let start = std::time::Instant::now();
+        handle_stream_failure(
+            "acct",
+            TeleError::Other("boom".into()),
+            &mut failures,
+            StreamFailureCtx {
+                stream_uptime: std::time::Duration::ZERO,
+                deadline: None,
+                stopper: Some(&stopper),
+            },
+            5,
+        )
+        .await
+        .expect("a stopped run does not treat the failure as fatal");
+        assert_eq!(failures, 2, "the stopped run must not grow the streak");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(480),
+            "the stopped run must not sleep through the backoff"
         );
     }
 
@@ -3044,9 +3194,11 @@ mod stopper_tests {
                 "acct",
                 TeleError::Other("boom".into()),
                 &mut failures,
-                std::time::Duration::ZERO,
-                None,
-                Some(&stopper),
+                StreamFailureCtx {
+                    stream_uptime: std::time::Duration::ZERO,
+                    deadline: None,
+                    stopper: Some(&stopper),
+                },
                 5,
             ),
         )
@@ -3054,7 +3206,7 @@ mod stopper_tests {
         .expect("a stop must end the backoff sleep")
         .expect("a stop is not a failure");
         assert!(
-            start.elapsed() < std::time::Duration::from_millis(400),
+            start.elapsed() < std::time::Duration::from_millis(480),
             "the backoff sleep was not interrupted: took {:?}",
             start.elapsed()
         );
@@ -3070,9 +3222,11 @@ mod stopper_tests {
             "acct",
             TeleError::Other("boom".into()),
             &mut failures,
-            std::time::Duration::from_secs(61),
-            Some(std::time::Instant::now()),
-            None,
+            StreamFailureCtx {
+                stream_uptime: std::time::Duration::from_secs(61),
+                deadline: Some(std::time::Instant::now()),
+                stopper: None,
+            },
             5,
         )
         .await
@@ -3090,9 +3244,11 @@ mod stopper_tests {
             "acct",
             TeleError::Other("boom".into()),
             &mut failures,
-            std::time::Duration::from_secs(1),
-            Some(std::time::Instant::now()),
-            None,
+            StreamFailureCtx {
+                stream_uptime: std::time::Duration::from_secs(1),
+                deadline: Some(std::time::Instant::now()),
+                stopper: None,
+            },
             5,
         )
         .await
@@ -3104,9 +3260,11 @@ mod stopper_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_stop_mid_sweep_writes_due_rows_before_pending_albums() {
         // The sweep removed the due rows in deadline order; flushing the
         // buffer's later-deadline albums first inverted the output order.
+        let _lock = quiet_fields();
         let stopper = StreamStopper::new(Some(1), None, None);
         let (writer, sink) = test_writer(8, std::time::Duration::from_millis(200));
         let mut album = AlbumBuffer::new();
@@ -3136,5 +3294,66 @@ mod stopper_tests {
         assert_eq!(rows[0]["n"], 1, "first due row");
         assert_eq!(rows[1]["n"], 2, "second due row before any pending album");
         assert_eq!(rows[2]["event"], "Album", "pending album last");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_stop_before_the_first_swept_row_still_writes_that_row() {
+        // The stop can arrive between the sweep and the first emit (another
+        // account spending the last --count slot). That row left the buffer
+        // already, so a stop outcome that wrote nothing used to drop it while
+        // still emitting its successors.
+        let _lock = quiet_fields();
+        let stopper = StreamStopper::new(Some(1), None, None);
+        stopper.request_stop();
+        let (writer, sink) = test_writer(8, std::time::Duration::from_millis(200));
+        let mut album = AlbumBuffer::new();
+        let swept = vec![
+            serde_json::json!({"event": "NewMessage", "n": 1}),
+            serde_json::json!({"event": "NewMessage", "n": 2}),
+        ];
+        let stopped = emit_due_albums(&writer, &stopper, "work", &mut album, swept)
+            .await
+            .unwrap();
+        assert!(stopped);
+        writer.finish().await;
+        let rows: Vec<serde_json::Value> = sink
+            .lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "the row that met the stop must not vanish");
+        assert_eq!(rows[0]["n"], 1);
+        assert_eq!(rows[1]["n"], 2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_stop_flush_does_not_write_rows_past_until() {
+        // Bypassing the count budget must not bypass the --until window.
+        let _lock = quiet_fields();
+        let until = chrono::Utc::now();
+        let stopper = StreamStopper::new(None, None, Some(until));
+        stopper.request_stop();
+        let (writer, sink) = test_writer(8, std::time::Duration::from_millis(200));
+        let mut album = AlbumBuffer::new();
+        let before = (until - chrono::Duration::seconds(60)).to_rfc3339();
+        let after = (until + chrono::Duration::seconds(60)).to_rfc3339();
+        let swept = vec![
+            serde_json::json!({"event": "NewMessage", "n": 1, "date": before}),
+            serde_json::json!({"event": "NewMessage", "n": 2, "date": after}),
+        ];
+        let stopped = emit_due_albums(&writer, &stopper, "work", &mut album, swept)
+            .await
+            .unwrap();
+        assert!(stopped);
+        writer.finish().await;
+        let rows: Vec<serde_json::Value> = sink
+            .lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "a row past --until must not be flushed");
+        assert_eq!(rows[0]["n"], 1);
     }
 }

@@ -8,8 +8,8 @@ use std::pin::Pin;
 
 use crate::client::ServeShares;
 use crate::commands::listen::{
-    event_row, getstate_probe_error, handle_stream_failure, is_empty_update, poll_timeout,
-    update_peer,
+    event_row, getstate_probe_error, handle_stream_failure, is_empty_update, on_reconnect_success,
+    poll_timeout, update_peer, StreamFailureCtx,
 };
 use crate::error::{TeleError, TeleResult, EXIT_OK};
 use crate::executor::GlobalFlags;
@@ -1657,9 +1657,11 @@ async fn account_task(
                         &name,
                         TeleError::from(e),
                         &mut failures,
-                        std::time::Duration::ZERO,
-                        None,
-                        None,
+                        StreamFailureCtx {
+                            stream_uptime: std::time::Duration::ZERO,
+                            deadline: None,
+                            stopper: None,
+                        },
                         SERVE_MAX_RECONNECT_ATTEMPTS,
                     )
                     .await
@@ -1703,9 +1705,11 @@ async fn account_task(
                 &name,
                 err,
                 &mut failures,
-                std::time::Duration::ZERO,
-                None,
-                None,
+                StreamFailureCtx {
+                    stream_uptime: std::time::Duration::ZERO,
+                    deadline: None,
+                    stopper: None,
+                },
                 SERVE_MAX_RECONNECT_ATTEMPTS,
             )
             .await
@@ -1788,9 +1792,11 @@ async fn account_task(
                         &name,
                         crate::error::invocation_error(e),
                         &mut failures,
-                        connected_at.elapsed(),
-                        None,
-                        None,
+                        StreamFailureCtx {
+                            stream_uptime: connected_at.elapsed(),
+                            deadline: None,
+                            stopper: None,
+                        },
                         SERVE_MAX_RECONNECT_ATTEMPTS,
                     )
                     .await
@@ -1802,18 +1808,19 @@ async fn account_task(
                     break;
                 }
                 Tick::Update(update) => {
-                    // A connect is not proof the stream works: a connect-then-drop loop
-                    // must still reach the give-up limit.
-                    failures = 0;
                     if let Err(e) = stream.sync_update_state().await {
                         output::log_line("warn", &format!("serve: sync_update_state failed: {e}"));
                     }
-                    let Some(kind) = event_kind_allowed(&update, &events) else {
-                        continue;
-                    };
                     if is_empty_update(update.raw()) {
                         continue;
                     }
+                    // A connect is not proof the stream works: only a
+                    // delivered, non-empty update resets the streak, so a
+                    // connect-then-drop loop still reaches the give-up limit.
+                    failures = on_reconnect_success(failures);
+                    let Some(kind) = event_kind_allowed(&update, &events) else {
+                        continue;
+                    };
                     let message = match &*update {
                         Update::NewMessage(m) | Update::MessageEdited(m) => m,
                         _ => continue,
@@ -3800,9 +3807,11 @@ mod tests {
                 "acct",
                 TeleError::Other("boom".into()),
                 &mut failures,
-                std::time::Duration::ZERO,
-                Some(std::time::Instant::now()),
-                None,
+                StreamFailureCtx {
+                    stream_uptime: std::time::Duration::ZERO,
+                    deadline: Some(std::time::Instant::now()),
+                    stopper: None,
+                },
                 SERVE_MAX_RECONNECT_ATTEMPTS,
             )
             .await;
@@ -3818,9 +3827,11 @@ mod tests {
             "acct",
             TeleError::Other("boom".into()),
             &mut failures,
-            std::time::Duration::ZERO,
-            Some(std::time::Instant::now()),
-            None,
+            StreamFailureCtx {
+                stream_uptime: std::time::Duration::ZERO,
+                deadline: Some(std::time::Instant::now()),
+                stopper: None,
+            },
             SERVE_MAX_RECONNECT_ATTEMPTS,
         )
         .await
