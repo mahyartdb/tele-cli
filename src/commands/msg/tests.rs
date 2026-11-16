@@ -6126,6 +6126,64 @@ fn msg_send_serve_planner_applies_stdin_guard() {
 }
 
 #[test]
+fn msg_pin_serve_planner_rejects_notify_with_unpin() {
+    // clap cannot see serve/MCP params, so this conflict must be enforced (and
+    // tested) through the route planner rather than the CLI parser.
+    let route = msg_serve_routes()
+        .into_iter()
+        .find(|r| r.op == "msg pin")
+        .expect("msg pin route is registered");
+    let err = (route.planner)(
+        "msg pin",
+        serde_json::json!({"chat": "me", "id": 1, "notify": true, "unpin": true, "dry_run": true}),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("--notify and --unpin"), "{err}");
+    let err = (route.planner)(
+        "msg pin",
+        serde_json::json!({"chat": "me", "show": true, "notify": true, "dry_run": true}),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("--notify is mutually exclusive"),
+        "{err}"
+    );
+    assert!(
+        (route.planner)(
+            "msg pin",
+            serde_json::json!({"chat": "me", "id": 1, "dry_run": true})
+        )
+        .is_ok(),
+        "a plain pin dry run must still plan"
+    );
+}
+
+#[test]
+fn msg_read_serve_planner_rejects_mentions_with_mark_unread() {
+    let route = msg_serve_routes()
+        .into_iter()
+        .find(|r| r.op == "msg read")
+        .expect("msg read route is registered");
+    let err = (route.planner)(
+        "msg read",
+        serde_json::json!({"chat": "me", "mentions": true, "mark_unread": true, "dry_run": true}),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("--mentions and --mark-unread"),
+        "{err}"
+    );
+    assert!(
+        (route.planner)(
+            "msg read",
+            serde_json::json!({"chat": "me", "dry_run": true})
+        )
+        .is_ok(),
+        "a plain read dry run must still plan"
+    );
+}
+
+#[test]
 fn send_params_default_stdin_upload_allowed_to_false() {
     let p: SendParams =
         serde_json::from_value(serde_json::json!({"chat": "@x", "text": "hi", "files": ["-"]}))
