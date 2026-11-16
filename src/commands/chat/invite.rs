@@ -184,6 +184,18 @@ pub(crate) async fn invite(args: InviteArgs, flags: &GlobalFlags) -> TeleResult<
                         vec![exported_invite_row(&r)]
                     } else {
                         let link = plan.link.clone().unwrap_or_default();
+                        let plan = resolved_edit_plan(&plan, async {
+                            guard.rate_limiter.acquire().await;
+                            guard
+                                .client
+                                .invoke(&tl::functions::messages::GetExportedChatInvite {
+                                    peer: peer.clone(),
+                                    link: link.clone(),
+                                })
+                                .await
+                                .map_err(tele_invocation)
+                        })
+                        .await?;
                         let r: tl::enums::messages::ExportedChatInvite = guard
                             .client
                             .invoke(&tl::functions::messages::EditExportedChatInvite {
@@ -367,6 +379,54 @@ pub(crate) async fn invite(args: InviteArgs, flags: &GlobalFlags) -> TeleResult<
     })
     .await?;
     crate::executor::finish(flags, &envelope)
+}
+
+pub(crate) fn invite_edit_merge(
+    current: &tl::enums::ExportedChatInvite,
+    plan: &ValidatedInvite,
+) -> ValidatedInvite {
+    let mut resolved = plan.clone();
+    if let tl::enums::ExportedChatInvite::ChatInviteExported(cur) = current {
+        if resolved.expire_date.is_none() {
+            resolved.expire_date = cur.expire_date;
+        }
+        if resolved.usage_limit.is_none() {
+            resolved.usage_limit = cur.usage_limit;
+        }
+        if resolved.request_needed.is_none() {
+            resolved.request_needed = Some(cur.request_needed);
+        }
+        if resolved.title.is_none() {
+            resolved.title = cur.title.clone();
+        }
+    }
+    resolved
+}
+
+pub(crate) fn needs_prefill(plan: &ValidatedInvite) -> bool {
+    let any_set = plan.expire_date.is_some()
+        || plan.usage_limit.is_some()
+        || plan.request_needed.is_some()
+        || plan.title.is_some();
+    let all_set = plan.expire_date.is_some()
+        && plan.usage_limit.is_some()
+        && plan.request_needed.is_some()
+        && plan.title.is_some();
+    any_set && !all_set
+}
+
+pub(crate) async fn resolved_edit_plan<F>(
+    plan: &ValidatedInvite,
+    fetch: F,
+) -> TeleResult<ValidatedInvite>
+where
+    F: std::future::Future<Output = TeleResult<tl::enums::messages::ExportedChatInvite>>,
+{
+    if !needs_prefill(plan) {
+        return Ok(plan.clone());
+    }
+    let found = fetch.await?;
+    Ok(invite_edit_merge(&found.invite(), plan))
 }
 
 pub(crate) fn invite_dry_run_payload(chat: &str, plan: &ValidatedInvite) -> serde_json::Value {

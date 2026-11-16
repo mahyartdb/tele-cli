@@ -1668,7 +1668,14 @@ impl From<&PermissionsParams> for PermissionsArgs {
 fn validate_participants(args: &ParticipantsArgs) -> TeleResult<()> {
     crate::chat_target::ChatTarget::parse_flag(&args.chat, "chat")?;
     crate::commands::validate_limit(args.limit, 10_000, "limit")?;
-    parse_participant_role(args.role.as_deref())?;
+    let role = parse_participant_role(args.role.as_deref())?;
+    validate_role_search_combo(
+        role,
+        args.search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    )?;
     Ok(())
 }
 
@@ -2335,6 +2342,7 @@ pub(crate) async fn chat_kick_core(
             .map_err(tele_invocation)?;
         return Ok(serde_json::json!({"chat": params.chat, "user": params.user, "kicked": true}));
     }
+    reject_duration_on_basic(&chat, until_secs)?;
     if needs_raw_ban(&rights_entries) {
         if matches!(&chat, grammers_client::peer::Peer::Group(_)) && !entities::is_channel(&chat) {
             return Err(TeleError::Usage(
@@ -2714,6 +2722,18 @@ pub(crate) async fn chat_invite_core(
                 vec![exported_invite_row(&r)]
             } else {
                 let link = plan.link.clone().unwrap_or_default();
+                let plan = invite::resolved_edit_plan(&plan, async {
+                    shares.rate_limiter.acquire().await;
+                    shares
+                        .client
+                        .invoke(&tl::functions::messages::GetExportedChatInvite {
+                            peer: peer.clone(),
+                            link: link.clone(),
+                        })
+                        .await
+                        .map_err(tele_invocation)
+                })
+                .await?;
                 let r: tl::enums::messages::ExportedChatInvite = shares
                     .client
                     .invoke(&tl::functions::messages::EditExportedChatInvite {
@@ -2992,6 +3012,7 @@ pub(crate) async fn chat_participants_core(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    validate_role_search_combo(role, search.as_deref())?;
     shares.rate_limiter.acquire().await;
     let chat =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.chat).await?;

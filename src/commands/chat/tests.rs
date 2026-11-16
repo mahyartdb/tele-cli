@@ -1087,6 +1087,203 @@ fn invite_args(chat: &str) -> InviteArgs {
     }
 }
 
+fn current_invite(
+    expire_date: Option<i32>,
+    usage_limit: Option<i32>,
+    request_needed: bool,
+    title: Option<String>,
+) -> tl::enums::ExportedChatInvite {
+    tl::enums::ExportedChatInvite::ChatInviteExported(tl::types::ChatInviteExported {
+        revoked: false,
+        permanent: true,
+        request_needed,
+        link: "https://t.me/+abc123".to_string(),
+        admin_id: 1,
+        date: 1_700_000_000,
+        start_date: None,
+        expire_date,
+        usage_limit,
+        usage: None,
+        requested: None,
+        subscription_expired: None,
+        title,
+        subscription_pricing: None,
+    })
+}
+
+#[test]
+fn invite_edit_merge_prefills_everything_unset_from_current() {
+    let resolved = invite_edit_merge(
+        &current_invite(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
+        &ValidatedInvite {
+            mode: InviteMode::Edit,
+            revoked: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(resolved.expire_date, Some(1_800_000_000));
+    assert_eq!(resolved.usage_limit, Some(5));
+    assert_eq!(resolved.request_needed, Some(true));
+    assert_eq!(resolved.title.as_deref(), Some("old"));
+}
+
+#[test]
+fn invite_edit_merge_plan_wins_over_current() {
+    let resolved = invite_edit_merge(
+        &current_invite(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
+        &ValidatedInvite {
+            mode: InviteMode::Edit,
+            expire_date: Some(1_900_000_000),
+            usage_limit: Some(10),
+            request_needed: Some(false),
+            title: Some("new".to_string()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(resolved.expire_date, Some(1_900_000_000));
+    assert_eq!(resolved.usage_limit, Some(10));
+    assert_eq!(resolved.request_needed, Some(false));
+    assert_eq!(resolved.title.as_deref(), Some("new"));
+}
+
+#[test]
+fn invite_edit_merge_is_per_field() {
+    let resolved = invite_edit_merge(
+        &current_invite(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
+        &ValidatedInvite {
+            mode: InviteMode::Edit,
+            expire_date: Some(1_900_000_000),
+            ..Default::default()
+        },
+    );
+    assert_eq!(resolved.expire_date, Some(1_900_000_000));
+    assert_eq!(resolved.usage_limit, Some(5));
+    assert_eq!(resolved.request_needed, Some(true));
+    assert_eq!(resolved.title.as_deref(), Some("old"));
+}
+
+#[test]
+fn invite_edit_merge_keeps_plan_revoked_and_public_variant_has_nothing() {
+    let resolved = invite_edit_merge(
+        &current_invite(Some(1_800_000_000), None, false, None),
+        &ValidatedInvite {
+            mode: InviteMode::Edit,
+            revoked: true,
+            ..Default::default()
+        },
+    );
+    assert!(resolved.revoked);
+    assert_eq!(resolved.expire_date, Some(1_800_000_000));
+    assert_eq!(resolved.usage_limit, None);
+    assert_eq!(resolved.request_needed, Some(false));
+    assert_eq!(resolved.title, None);
+
+    let resolved = invite_edit_merge(
+        &tl::enums::ExportedChatInvite::ChatInvitePublicJoinRequests,
+        &ValidatedInvite::default(),
+    );
+    assert_eq!(resolved.expire_date, None);
+    assert_eq!(resolved.usage_limit, None);
+    assert_eq!(resolved.request_needed, None);
+    assert_eq!(resolved.title, None);
+}
+
+#[test]
+fn needs_prefill_skips_revoke_only_and_fully_specified_edits() {
+    let all_none = ValidatedInvite {
+        mode: InviteMode::Edit,
+        ..Default::default()
+    };
+    assert!(!needs_prefill(&all_none));
+
+    assert!(!needs_prefill(&ValidatedInvite {
+        mode: InviteMode::Edit,
+        expire_date: Some(1_900_000_000),
+        usage_limit: Some(5),
+        request_needed: Some(false),
+        title: Some("new".to_string()),
+        ..Default::default()
+    }));
+
+    let mut only_expire_date = all_none.clone();
+    only_expire_date.expire_date = Some(1_900_000_000);
+    assert!(needs_prefill(&only_expire_date));
+
+    let mut only_usage_limit = all_none.clone();
+    only_usage_limit.usage_limit = Some(5);
+    assert!(needs_prefill(&only_usage_limit));
+
+    let mut only_request_needed = all_none.clone();
+    only_request_needed.request_needed = Some(true);
+    assert!(needs_prefill(&only_request_needed));
+
+    let mut only_title = all_none.clone();
+    only_title.title = Some("new".to_string());
+    assert!(needs_prefill(&only_title));
+}
+
+#[tokio::test]
+async fn prefill_fetch_is_not_awaited_when_no_edit_field_is_set() {
+    let plan = ValidatedInvite {
+        mode: InviteMode::Edit,
+        link: Some("https://t.me/+abc123".to_string()),
+        revoked: true,
+        ..Default::default()
+    };
+    let resolved = resolved_edit_plan(&plan, async { panic!("must not fetch") })
+        .await
+        .expect("revoke-only edit needs no prefill");
+    assert!(resolved.revoked);
+    assert_eq!(resolved.link, plan.link);
+    assert_eq!(resolved.expire_date, None);
+    assert_eq!(resolved.usage_limit, None);
+    assert_eq!(resolved.request_needed, None);
+    assert_eq!(resolved.title, None);
+}
+
+#[tokio::test]
+async fn prefill_fetch_is_not_awaited_when_every_edit_field_is_set() {
+    let plan = ValidatedInvite {
+        mode: InviteMode::Edit,
+        link: Some("https://t.me/+abc123".to_string()),
+        expire_date: Some(1_900_000_000),
+        usage_limit: Some(5),
+        request_needed: Some(false),
+        title: Some("new".to_string()),
+        ..Default::default()
+    };
+    let resolved = resolved_edit_plan(&plan, async { panic!("must not fetch") })
+        .await
+        .expect("fully specified edit needs no prefill");
+    assert_eq!(resolved.expire_date, Some(1_900_000_000));
+    assert_eq!(resolved.usage_limit, Some(5));
+    assert_eq!(resolved.request_needed, Some(false));
+    assert_eq!(resolved.title.as_deref(), Some("new"));
+    assert!(!resolved.revoked);
+}
+
+#[tokio::test]
+async fn prefill_fetch_merges_omitted_fields() {
+    let plan = ValidatedInvite {
+        mode: InviteMode::Edit,
+        link: Some("https://t.me/+abc123".to_string()),
+        title: Some("new".to_string()),
+        ..Default::default()
+    };
+    let fetched =
+        tl::enums::messages::ExportedChatInvite::Invite(tl::types::messages::ExportedChatInvite {
+            invite: current_invite(Some(123), Some(10), false, Some("old".to_string())),
+            users: Vec::new(),
+        });
+    let resolved = resolved_edit_plan(&plan, async { Ok(fetched) })
+        .await
+        .expect("partial edit prefills omitted fields");
+    assert_eq!(resolved.title.as_deref(), Some("new"));
+    assert_eq!(resolved.usage_limit, Some(10));
+    assert_eq!(resolved.expire_date, Some(123));
+    assert_eq!(resolved.request_needed, Some(false));
+}
+
 #[test]
 fn invite_mode_matrix_routes_each_flag_combination() {
     let mut a = invite_args("@c");
@@ -2139,6 +2336,52 @@ fn reject_basic_group_for_stats_usage() {
 }
 
 #[test]
+fn reject_duration_on_basic_group_usage() {
+    let client = offline_client();
+    let group_peer = grammers_client::peer::Peer::Group(grammers_client::peer::Group::from_raw(
+        &client,
+        tl::enums::Chat::Empty(tl::types::ChatEmpty { id: 1 }),
+    ));
+    let err = reject_duration_on_basic(&group_peer, Some(60)).unwrap_err();
+    assert!(matches!(err, TeleError::Usage(_)));
+    assert_eq!(err.exit_code(), crate::error::EXIT_USAGE);
+    assert!(err.message().contains("--duration"));
+    assert!(err.message().contains("basic groups"));
+
+    assert!(reject_duration_on_basic(&group_peer, None).is_ok());
+
+    let channel_peer = grammers_client::peer::Peer::from_raw(
+        &client,
+        tl::enums::Chat::Channel(preview_channel(42, "News")),
+    );
+    assert!(reject_duration_on_basic(&channel_peer, Some(60)).is_ok());
+    assert!(reject_duration_on_basic(&channel_peer, None).is_ok());
+}
+
+#[test]
+fn admin_role_with_search_is_rejected_but_other_roles_pass() {
+    let err = validate_role_search_combo(Some(ParticipantRole::Admin), Some("bob")).unwrap_err();
+    assert!(matches!(err, TeleError::Usage(_)));
+    assert_eq!(err.exit_code(), crate::error::EXIT_USAGE);
+    assert!(err.message().contains("--role admin"));
+
+    for role in [
+        None,
+        Some(ParticipantRole::Recent),
+        Some(ParticipantRole::Banned),
+        Some(ParticipantRole::Kicked),
+    ] {
+        assert!(
+            validate_role_search_combo(role, Some("bob")).is_ok(),
+            "role {role:?} + search must stay allowed"
+        );
+    }
+
+    assert!(validate_role_search_combo(Some(ParticipantRole::Admin), None).is_ok());
+    assert!(validate_role_search_combo(Some(ParticipantRole::Admin), Some("  ")).is_ok());
+}
+
+#[test]
 fn kick_duration_requires_ban_or_rights() {
     let base = |duration: Option<String>, ban: bool, rights: Option<String>| KickArgs {
         chat: "@c".to_string(),
@@ -3159,6 +3402,17 @@ mod chat_serve_tests {
             .find(|r| r.op == op)
             .unwrap_or_else(|| panic!("route missing for {op}"));
         (route.planner)(op, params)
+    }
+
+    #[test]
+    fn serve_participants_rejects_admin_role_with_search() {
+        let err = plan_chat_op(
+            "chat participants",
+            serde_json::json!({"chat": "@c", "role": "admin", "search": "bob"}),
+        )
+        .unwrap_err();
+        assert_eq!(err["type"], "UsageError", "{err}");
+        assert!(err["message"].as_str().unwrap().contains("--role admin"));
     }
 
     fn serve_error(err: serde_json::Value) -> String {

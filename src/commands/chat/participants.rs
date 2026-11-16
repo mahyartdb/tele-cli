@@ -57,6 +57,19 @@ pub(crate) fn participant_filter(
     }
 }
 
+pub(crate) fn validate_role_search_combo(
+    role: Option<ParticipantRole>,
+    search: Option<&str>,
+) -> TeleResult<()> {
+    let has_search = search.is_some_and(|s| !s.trim().is_empty());
+    if role == Some(ParticipantRole::Admin) && has_search {
+        return Err(TeleError::Usage(
+            "--search does not combine with --role admin: the Telegram admin filter has no search parameter".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn participants(args: ParticipantsArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     crate::chat_target::ChatTarget::parse_flag(&args.chat, "chat")?;
     crate::commands::validate_limit(args.limit, 10_000, "limit")?;
@@ -67,6 +80,7 @@ pub(crate) async fn participants(args: ParticipantsArgs, flags: &GlobalFlags) ->
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    validate_role_search_combo(role, search.as_deref())?;
     let config_path = flags.config_path.clone();
     let dry_run = flags.dry_run;
     let json = flags.json;
@@ -339,6 +353,21 @@ pub(crate) fn ban_defaults_view_messages(ban: bool, rights_entries: &[(String, b
         .any(|(right, _)| right == "view_messages")
 }
 
+pub(crate) fn reject_duration_on_basic(
+    peer: &grammers_client::peer::Peer,
+    until_secs: Option<u32>,
+) -> TeleResult<()> {
+    if until_secs.is_some()
+        && matches!(peer, grammers_client::peer::Peer::Group(_))
+        && !entities::is_channel(peer)
+    {
+        return Err(TeleError::Usage(
+            "--duration is not supported on basic groups: Telegram timed bans apply to channels and supergroups only".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_kick(args: &KickArgs) -> TeleResult<()> {
     crate::chat_target::ChatTarget::parse_flag(&args.chat, "chat")?;
     crate::chat_target::ChatTarget::parse_flag(&args.user, "user")?;
@@ -409,6 +438,7 @@ pub(crate) async fn kick(args: KickArgs, flags: &GlobalFlags) -> TeleResult<i32>
                     .map_err(tele_invocation)?;
                 return Ok(serde_json::json!({"chat": target, "user": user, "kicked": true}));
             }
+            reject_duration_on_basic(&chat, until_secs)?;
             if needs_raw_ban(&rights_entries) {
                 if matches!(&chat, grammers_client::peer::Peer::Group(_))
                     && !entities::is_channel(&chat)
