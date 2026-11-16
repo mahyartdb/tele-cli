@@ -543,11 +543,11 @@ fn validate_emoji(emoji: Option<&str>) -> TeleResult<()> {
         ));
     }
 
-    let grapheme_count = emoji.chars().count();
+    let codepoint_count = emoji.chars().count();
 
-    if grapheme_count != 1 {
+    if codepoint_count != 1 {
         return Err(TeleError::Usage(format!(
-            "--emoji \"{emoji}\" must be a single codepoint or a custom-emoji document id (got {grapheme_count} codepoints)",
+            "--emoji \"{emoji}\" must be a single codepoint or a custom-emoji document id (got {codepoint_count} codepoints)",
         )));
     }
 
@@ -577,6 +577,10 @@ pub(crate) async fn lookup_custom_emoji_id(
         })
         .await
         .map_err(tele_invocation)?;
+    first_custom_emoji_id(found, emoticon)
+}
+
+fn first_custom_emoji_id(found: tl::enums::EmojiList, emoticon: &str) -> TeleResult<i64> {
     match found {
         tl::enums::EmojiList::List(list) => {
             list.document_id.first().copied().ok_or_else(|| {
@@ -1685,6 +1689,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn custom_emoji_lookup_uses_the_first_document_id() {
+        let list = tl::enums::EmojiList::List(tl::types::EmojiList {
+            hash: 0,
+            document_id: vec![7, 8],
+        });
+        assert_eq!(first_custom_emoji_id(list, "star").unwrap(), 7);
+    }
+
+    #[test]
+    fn custom_emoji_lookup_rejects_an_empty_list() {
+        let list = tl::enums::EmojiList::List(tl::types::EmojiList {
+            hash: 0,
+            document_id: Vec::new(),
+        });
+        let err = first_custom_emoji_id(list, "star").unwrap_err();
+        assert!(matches!(err, TeleError::Invocation(..)), "{err:?}");
+        assert!(err.message().contains("no custom emoji found"), "{err}");
+    }
+
+    #[test]
+    fn custom_emoji_lookup_reports_not_modified() {
+        let err = first_custom_emoji_id(tl::enums::EmojiList::NotModified, "star").unwrap_err();
+        assert!(matches!(err, TeleError::Invocation(..)), "{err:?}");
+        assert!(err.message().contains("not-modified"), "{err}");
+    }
+
     fn fake_topic(id: i32) -> tl::enums::ForumTopic {
         fake_topic_at(id, id, id * 10)
     }
@@ -1805,6 +1836,40 @@ mod tests {
                 message_id: 77,
                 topic_id: 9
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_forum_topics_cursor_falls_back_when_the_top_message_is_empty() {
+        let mut calls = Vec::new();
+        let topics = collect_forum_topics(5, |cursor, page_limit| {
+            let page_index = calls.len();
+            calls.push((cursor, page_limit));
+            async move {
+                if page_index == 0 {
+                    Ok(ForumTopicsPage {
+                        topics: vec![fake_topic_at(9, 1_700_000_000, 77)],
+                        messages: vec![tl::enums::Message::Empty(tl::types::MessageEmpty {
+                            id: 77,
+                            peer_id: None,
+                        })],
+                    })
+                } else {
+                    Ok(empty_page())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(
+            calls[1].0,
+            ForumCursor {
+                date: 1_700_000_000,
+                message_id: 77,
+                topic_id: 9
+            },
+            "an empty top-message tombstone must fall back to the topic date, not offset 0"
         );
     }
 
