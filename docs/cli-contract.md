@@ -221,6 +221,8 @@ Filters: `--from SENDER` (same target syntax as `--chat`) keeps only that sender
 
 `tele cache search [--query Q] [--chat-id N] [--limit N]` runs an FTS5 query against the account's local message cache with no network call. `--query` defaults to empty (recent cached messages), and `--chat-id N` restricts hits to one numeric chat id. Serve/MCP: `cache search` op (read_only), whose `SearchParams` carries the same `query`/`chat_id`/`limit`.
 
+Cache writes (`cache sync`, serve/MCP cache writes) store one batch per transaction on a per-account connection cached by the process. A write batch that fails or is dropped mid-batch (serve/MCP op timeout) rolls its transaction back as it is dropped, so the cached connection is not left inside a transaction. Reads and writes on that connection are serialized per account by an async gate: a read that runs during a write batch waits for it to finish or roll back instead of observing uncommitted rows.
+
 ## `contact add`
 
 `tele contact add --user U [--phone P --first F --last L]` adds U to the account's contact list. `--phone` must be a full international number (`+` prefix, at least 5 digits); anything else fails with a Usage error before connect.

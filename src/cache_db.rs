@@ -49,13 +49,29 @@ END;
 /// The serve and MCP lanes serve many cache requests from one long-lived
 /// process. Re-opening the database, re-running the schema DDL and
 /// re-tightening the file permissions on every request cost more than
-/// the queries themselves. The schema and the permission pass now happen
-/// once per account per process; the connection itself is an
-/// `Arc<dyn Conn + Send + Sync>` handle (SQLite in serialized mode), so
-/// sharing it between concurrent requests is safe.
+/// the queries themselves, so each account keeps one connection for the
+/// process lifetime. Sharing the handle is safe for concurrency, but a read
+/// issued while another task's write transaction is open sees that
+/// transaction's uncommitted rows — rows a rollback then discards — so
+/// `account_gate` serialises readers against writers.
 static CONNECTIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, libsql::Connection>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Per-account readers-writer gate over the cached connection.
+///
+/// Process-local only: it orders tasks inside this process and claims
+/// nothing about other processes using the same cache file.
+static ACCOUNT_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::RwLock<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn account_gate(account: &str) -> std::sync::Arc<tokio::sync::RwLock<()>> {
+    let mut gates = ACCOUNT_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    gates.entry(account.to_string()).or_default().clone()
+}
 
 /// How many times a database was actually opened (not served from the
 /// connection cache). Used by the tests to prove the cache works.
@@ -160,18 +176,24 @@ pub struct CachedMessage {
     pub media_kind: Option<String>,
 }
 
+async fn begin_write(conn: &libsql::Connection) -> libsql::Result<libsql::Transaction> {
+    conn.transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await
+}
+
 pub async fn store_messages(account: &str, msgs: &[CachedMessage]) -> TeleResult<usize> {
     if msgs.is_empty() {
         return Ok(0);
     }
+    let gate = account_gate(account);
+    let _write = gate.write().await;
     let conn = open_db(account).await?;
-    conn.execute_batch("BEGIN IMMEDIATE")
+    let tx = begin_write(&conn)
         .await
         .map_err(|e| TeleError::Other(format!("cache begin failed: {e}")))?;
     let mut stored = 0usize;
-    let mut failure: Option<TeleError> = None;
     for m in msgs {
-        match conn
+        match tx
             .execute(
                 "INSERT OR REPLACE INTO messages (id, chat_id, chat_name, sender_id, sender_name, date, text, media_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 libsql::params![
@@ -188,24 +210,15 @@ pub async fn store_messages(account: &str, msgs: &[CachedMessage]) -> TeleResult
             .await
         {
             Ok(n) => stored += n as usize,
-            Err(e) => {
-                failure = Some(TeleError::Other(format!("cache insert failed: {e}")));
-                break;
-            }
+            // The `tx` drop rolls back synchronously, so a failed insert
+            // cannot strand the shared cached connection inside a transaction.
+            Err(e) => return Err(TeleError::Other(format!("cache insert failed: {e}"))),
         }
     }
-    match failure {
-        Some(e) => {
-            let _ = conn.execute_batch("ROLLBACK").await;
-            Err(e)
-        }
-        None => {
-            conn.execute_batch("COMMIT")
-                .await
-                .map_err(|e| TeleError::Other(format!("cache commit failed: {e}")))?;
-            Ok(stored)
-        }
-    }
+    tx.commit()
+        .await
+        .map_err(|e| TeleError::Other(format!("cache commit failed: {e}")))?;
+    Ok(stored)
 }
 
 pub async fn search_cache(
@@ -214,6 +227,8 @@ pub async fn search_cache(
     chat_id: Option<i64>,
     limit: u32,
 ) -> TeleResult<Vec<CachedMessage>> {
+    let gate = account_gate(account);
+    let _read = gate.read().await;
     let conn = open_db(account).await?;
     let mut out = Vec::new();
     if query.trim().is_empty() {
@@ -315,6 +330,8 @@ fn row_to_message(row: &libsql::Row) -> TeleResult<CachedMessage> {
 }
 
 pub async fn cache_stats(account: &str) -> TeleResult<serde_json::Value> {
+    let gate = account_gate(account);
+    let _read = gate.read().await;
     let conn = open_db(account).await?;
     let mut rows = conn
         .query(
@@ -355,6 +372,8 @@ pub async fn cache_stats(account: &str) -> TeleResult<serde_json::Value> {
 }
 
 pub async fn clear_cache(account: &str) -> TeleResult<serde_json::Value> {
+    let gate = account_gate(account);
+    let _write = gate.write().await;
     let conn = open_db(account).await?;
     let deleted = conn
         .execute("DELETE FROM messages", libsql::params![])
@@ -648,19 +667,39 @@ mod tests {
         }
     }
 
+    /// Restores TELE_APP_DIR and removes the temp dir even when an assert
+    /// fails, so a panic cannot leak the env var into the next test.
+    struct TestAppDir {
+        dir: std::path::PathBuf,
+    }
+
+    impl TestAppDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "telecli-cache-{tag}-{}-{}",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::env::set_var("TELE_APP_DIR", &dir);
+            TestAppDir { dir }
+        }
+    }
+
+    impl Drop for TestAppDir {
+        fn drop(&mut self) {
+            std::env::remove_var("TELE_APP_DIR");
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[tokio::test]
     async fn store_messages_batch_is_atomic() {
         let _guard = crate::config::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "telecli-cache-atomic-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("TELE_APP_DIR", &dir);
+        let _dir = TestAppDir::new("atomic");
         let account = test_account("atomic");
         store_messages(&account, &[atomic_message(1, "baseline")])
             .await
@@ -681,8 +720,113 @@ mod tests {
         conn.execute_batch("DROP TRIGGER IF EXISTS cache_atomic_probe;")
             .await
             .unwrap();
-        std::env::remove_var("TELE_APP_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_write_transaction_leaves_the_connection_usable() {
+        // serve/MCP op timeouts drop the store_messages future mid-batch.
+        // The write transaction must roll back as it drops, so the shared
+        // cached connection is usable immediately — no retry loop.
+        let _guard = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _dir = TestAppDir::new("strand");
+        let account = test_account("strand");
+        store_messages(&account, &[atomic_message(1, "baseline")])
+            .await
+            .unwrap();
+        let conn = open_db(&account).await.unwrap();
+        let tx = begin_write(&conn).await.unwrap();
+        tx.execute(
+            "INSERT INTO messages (id, chat_id, chat_name, sender_id, sender_name, date, text, media_kind) VALUES (9, 100, 'team', 5, 'alice', 1, 'rolled back', '')",
+            (),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(
+            conn.is_autocommit(),
+            "dropping a write transaction must roll it back before the connection is reused"
+        );
+        let stored = store_messages(&account, &[atomic_message(2, "after the drop")])
+            .await
+            .unwrap();
+        assert_eq!(stored, 1);
+        let found = search_cache(&account, "", None, 10).await.unwrap();
+        assert_eq!(
+            found.len(),
+            2,
+            "baseline + the post-drop row; the dropped transaction's row must be gone"
+        );
+        assert!(found.iter().all(|m| m.text != "rolled back"));
+    }
+
+    #[tokio::test]
+    async fn a_read_waits_for_an_in_flight_write_batch() {
+        let _guard = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _dir = TestAppDir::new("readwait");
+        let account = test_account("readwait");
+        store_messages(&account, &[atomic_message(1, "gate hold")])
+            .await
+            .unwrap();
+        let gate = account_gate(&account);
+        let write = gate.write().await;
+        let mut search = tokio::spawn({
+            let account = account.clone();
+            async move { search_cache(&account, "", None, 10).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut search)
+                .await
+                .is_err(),
+            "a read must wait while a write batch holds the gate"
+        );
+        drop(write);
+        let found = tokio::time::timeout(std::time::Duration::from_secs(5), search)
+            .await
+            .expect("the read must finish once the write guard drops")
+            .expect("search task panicked")
+            .expect("search failed");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "gate hold");
+    }
+
+    #[tokio::test]
+    async fn a_write_waits_for_an_in_flight_read() {
+        let _guard = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _dir = TestAppDir::new("writewait");
+        let account = test_account("writewait");
+        store_messages(&account, &[atomic_message(1, "baseline")])
+            .await
+            .unwrap();
+        let gate = account_gate(&account);
+        let read = gate.read().await;
+        let mut store = tokio::spawn({
+            let account = account.clone();
+            async move { store_messages(&account, &[atomic_message(2, "gated write")]).await }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut store)
+                .await
+                .is_err(),
+            "a write must wait while a read guard is held"
+        );
+        drop(read);
+        let stored = tokio::time::timeout(std::time::Duration::from_secs(5), store)
+            .await
+            .expect("the write must finish once the read guard drops")
+            .expect("store task panicked")
+            .expect("store failed");
+        assert_eq!(stored, 1);
+        let found = search_cache(&account, "gated write", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, 2);
     }
 
     #[tokio::test]
@@ -690,14 +834,7 @@ mod tests {
         let _guard = crate::config::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "telecli-cache-vacuum-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("TELE_APP_DIR", &dir);
+        let _dir = TestAppDir::new("vacuum");
         let account = test_account("vacuum");
         let bulk: Vec<CachedMessage> = (0..200)
             .map(|i| CachedMessage {
@@ -730,8 +867,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found.len(), 1);
-        std::env::remove_var("TELE_APP_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
