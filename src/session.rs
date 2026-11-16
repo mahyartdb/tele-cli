@@ -1992,7 +1992,7 @@ mod tests {
         std::fs::write(&lookalike_export, b"live-export").unwrap();
         let real_tmp = session_dir().join("work.session.tmp-1234");
         let real_tmp_sidecar = session_dir().join("work.session.tmp-1234-wal");
-        let real_export_tmp = session_dir().join(".work.session.export.tmp-1234-1750000000-1");
+        let real_export_tmp = export_temp_path(&default_export_dest("work")).unwrap();
         std::fs::write(&real_tmp, b"tmp").unwrap();
         std::fs::write(&real_tmp_sidecar, b"tmp").unwrap();
         std::fs::write(&real_export_tmp, b"tmp").unwrap();
@@ -2060,11 +2060,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_session_tolerates_an_unsweepable_tmp() {
-        let _guard = lock_env();
-        let dir = test_dir("remove-stuck-tmp");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("sessions")).unwrap();
-        seed_test_env(&dir);
+        let _app = TestAppDir::new("remove-stuck-tmp");
         {
             let held = open_session("work").await.unwrap();
             drop(held);
@@ -2080,8 +2076,6 @@ mod tests {
             "an unsweepable leftover must not be reported as a failed removal"
         );
         std::fs::remove_dir(&stuck).unwrap();
-        std::env::remove_var("TELE_APP_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
