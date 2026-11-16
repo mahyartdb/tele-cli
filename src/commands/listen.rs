@@ -1453,7 +1453,12 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
             }
         }
     }
-    writer.finish().await;
+    if let Some(err) = writer.finish().await {
+        // A non-broken-pipe stdout failure was swallowed as a stopped stream
+        // by every account task; without this the run reports success with a
+        // truncated output file. Broken pipes stay at exit 0 by convention.
+        failed.push(err.exit_code());
+    }
     if until.is_some() && stopper.time_up() && stopper.report_until_reached() {
         output::log_line("info", "listen --until reached");
     }
@@ -1533,7 +1538,7 @@ impl ListenWriter {
 
     /// Close the writer and wait until every queued row is flushed. Account
     /// tasks must be joined first so their writer clones are gone.
-    async fn finish(self) {
+    async fn finish(self) -> Option<TeleError> {
         let stranded = self.take_dropped();
         let ListenWriter {
             tx, error, handle, ..
@@ -1575,7 +1580,7 @@ impl ListenWriter {
             );
         }
         let err = error.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(err) = err {
+        if let Some(err) = &err {
             if !err.is_broken_pipe() {
                 output::log_line(
                     "error",
@@ -1583,6 +1588,7 @@ impl ListenWriter {
                 );
             }
         }
+        err.filter(|e| !e.is_broken_pipe())
     }
 
     fn take_dropped(&self) -> u32 {
@@ -2671,6 +2677,18 @@ mod stopper_tests {
         }
     }
 
+    struct DiskFullSink;
+
+    impl std::io::Write for DiskFullSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct GatedSink {
         gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
         out: CapturedLines,
@@ -2879,7 +2897,7 @@ mod stopper_tests {
         .await
         .unwrap();
         assert!(!stopped);
-        writer.finish().await;
+        let _ = writer.finish().await;
         let lines = sink.lines();
         assert_eq!(
             lines.len(),
@@ -2961,7 +2979,7 @@ mod stopper_tests {
         )
         .await
         .unwrap());
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert!(
             sink.lines().is_empty(),
             "suppressed raw updates must not reach stdout"
@@ -2999,7 +3017,7 @@ mod stopper_tests {
                 .stop
         );
         assert!(stopper.stop_requested());
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert!(
             sink.lines().is_empty(),
             "the row that reaches --until must not be written"
@@ -3026,7 +3044,7 @@ mod stopper_tests {
             !stopper.report_until_reached(),
             "the row path must claim the one-shot notice, so the end-of-run check stays silent"
         );
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert!(sink.lines().is_empty());
     }
 
@@ -3092,7 +3110,7 @@ mod stopper_tests {
                 .unwrap()
                 .stop
         );
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert!(sink.lines().is_empty());
     }
 
@@ -3116,7 +3134,7 @@ mod stopper_tests {
             stopper.stop_requested(),
             "a spent --count budget must request a stop so parked accounts wake"
         );
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert_eq!(sink.lines().len(), 1);
     }
 
@@ -3139,7 +3157,7 @@ mod stopper_tests {
             !stopper.stop_requested(),
             "an observer of an exhausted budget must not make the stop permanent"
         );
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert!(sink.lines().is_empty());
     }
 
@@ -3260,7 +3278,7 @@ mod stopper_tests {
                 stopped += 1;
             }
         }
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert_eq!(
             sink.lines().len(),
             5,
@@ -3332,7 +3350,7 @@ mod stopper_tests {
             .await
             .expect("the last count slot must wake parked accounts without a poll delay")
             .expect("waiter task panicked");
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert_eq!(sink.lines().len(), 1);
     }
 
@@ -3347,7 +3365,7 @@ mod stopper_tests {
                 .await
                 .unwrap();
         }
-        writer.finish().await;
+        let _ = writer.finish().await;
         let lines = sink.lines();
         assert_eq!(lines.len(), 200, "every row must be written exactly once");
         for (expected, line) in lines.iter().enumerate() {
@@ -3382,7 +3400,38 @@ mod stopper_tests {
             "a broken pipe must still stop the stream"
         );
         assert_eq!(err.exit_code(), crate::error::EXIT_OK);
-        writer.finish().await;
+        let _ = writer.finish().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn finish_surfaces_a_non_broken_pipe_failure_for_the_exit_code() {
+        let _lock = quiet_fields();
+        let writer = super::spawn_writer(|| DiskFullSink, 4, std::time::Duration::from_millis(200));
+        let _ = writer
+            .emit("acct", serde_json::json!({"event": "NewMessage"}))
+            .await;
+        for _ in 0..400 {
+            if writer.tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            writer.tx.is_closed(),
+            "the writer thread must exit on a write failure"
+        );
+        let err = writer
+            .emit("acct", serde_json::json!({"event": "NewMessage"}))
+            .await
+            .err()
+            .expect("the second emit must see the failed writer");
+        assert!(!err.is_broken_pipe(), "err: {err}");
+        let failure = writer
+            .finish()
+            .await
+            .expect("finish must surface the failure so the run cannot exit 0");
+        assert_eq!(failure.exit_code(), crate::error::EXIT_ALL_FAILED);
     }
 
     #[tokio::test]
@@ -3423,7 +3472,7 @@ mod stopper_tests {
             .emit("acct", serde_json::json!({"event": "NewMessage", "id": 4}))
             .await
             .unwrap();
-        writer.finish().await;
+        let _ = writer.finish().await;
 
         let lines = sink.lines();
         assert_eq!(lines.len(), 3, "the dropped row must never reach stdout");
@@ -3494,7 +3543,7 @@ mod stopper_tests {
             matches!(stopper.reserve(), CountSlot::Reserved { last: true }),
             "one queued row and one returned slot leave two of three slots"
         );
-        writer.finish().await;
+        let _ = writer.finish().await;
     }
 
     #[test]
@@ -3528,30 +3577,39 @@ mod stopper_tests {
         let stopper = StreamStopper::new(None, None, None);
         let writer =
             super::spawn_writer(|| BrokenPipeSink, 1, std::time::Duration::from_millis(200));
-        let stopped = {
-            let mut stopped = false;
-            for _ in 0..64 {
-                if super::emit_direct(
-                    &writer,
-                    &stopper,
-                    "acct",
-                    serde_json::json!({"event": "NewMessage"}),
-                )
-                .await
-                .expect("a broken pipe is not a usage error")
-                {
-                    stopped = true;
-                    break;
-                }
+        let first = super::emit_direct(
+            &writer,
+            &stopper,
+            "acct",
+            serde_json::json!({"event": "NewMessage"}),
+        )
+        .await
+        .expect("the first row is queued before the writer sees the pipe");
+        assert!(!first);
+        for _ in 0..400 {
+            if writer.tx.is_closed() {
+                break;
             }
-            stopped
-        };
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            writer.tx.is_closed(),
+            "the writer thread must exit on a broken pipe"
+        );
+        let stopped = super::emit_direct(
+            &writer,
+            &stopper,
+            "acct",
+            serde_json::json!({"event": "NewMessage"}),
+        )
+        .await
+        .expect("a broken pipe is not a usage error");
         assert!(stopped, "a dead stdout must end the flush");
         assert!(
             stopper.stop_requested(),
             "a dead stdout must wake parked accounts"
         );
-        writer.finish().await;
+        let _ = writer.finish().await;
     }
 
     #[tokio::test]
@@ -3581,7 +3639,7 @@ mod stopper_tests {
             stopper.stop_requested(),
             "the projection stop must wake parked accounts"
         );
-        writer.finish().await;
+        let _ = writer.finish().await;
         assert!(sink.lines().is_empty());
     }
 
@@ -3702,7 +3760,7 @@ mod stopper_tests {
             .await
             .unwrap();
         assert!(stopped);
-        writer.finish().await;
+        let _ = writer.finish().await;
         let rows: Vec<serde_json::Value> = sink
             .lines()
             .iter()
@@ -3734,7 +3792,7 @@ mod stopper_tests {
             .await
             .unwrap();
         assert!(stopped);
-        writer.finish().await;
+        let _ = writer.finish().await;
         let rows: Vec<serde_json::Value> = sink
             .lines()
             .iter()
@@ -3765,7 +3823,7 @@ mod stopper_tests {
             .await
             .unwrap();
         assert!(stopped);
-        writer.finish().await;
+        let _ = writer.finish().await;
         let rows: Vec<serde_json::Value> = sink
             .lines()
             .iter()
