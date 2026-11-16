@@ -681,10 +681,14 @@ mod tests {
     /// fails, so a panic cannot leak the env var into the next test.
     struct TestAppDir {
         dir: std::path::PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestAppDir {
         fn new(tag: &str) -> Self {
+            let guard = crate::config::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!(
                 "telecli-cache-{tag}-{}-{}",
                 std::process::id(),
@@ -693,7 +697,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             std::env::set_var("TELE_APP_DIR", &dir);
-            TestAppDir { dir }
+            TestAppDir { dir, _guard: guard }
         }
     }
 
@@ -706,9 +710,6 @@ mod tests {
 
     #[tokio::test]
     async fn store_messages_batch_is_atomic() {
-        let _guard = crate::config::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _dir = TestAppDir::new("atomic");
         let account = test_account("atomic");
         store_messages(&account, &[atomic_message(1, "baseline")])
@@ -738,9 +739,6 @@ mod tests {
         // future safe: dropping its Transaction rolls back synchronously, so
         // the shared cached connection is usable immediately - no retry loop.
         // The batch-atomicity test covers store_messages itself.
-        let _guard = crate::config::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _dir = TestAppDir::new("strand");
         let account = test_account("strand");
         store_messages(&account, &[atomic_message(1, "baseline")])
@@ -785,9 +783,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_waits_for_an_in_flight_write_batch() {
-        let _guard = crate::config::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _dir = TestAppDir::new("readwait");
         let account = test_account("readwait");
         store_messages(&account, &[atomic_message(1, "gate hold")])
@@ -819,9 +814,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_waits_for_an_in_flight_read() {
-        let _guard = crate::config::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _dir = TestAppDir::new("writewait");
         let account = test_account("writewait");
         store_messages(&account, &[atomic_message(1, "baseline")])
@@ -857,9 +849,6 @@ mod tests {
 
     #[tokio::test]
     async fn clear_reclaims_file_bytes() {
-        let _guard = crate::config::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _dir = TestAppDir::new("vacuum");
         let account = test_account("vacuum");
         let bulk: Vec<CachedMessage> = (0..200)
