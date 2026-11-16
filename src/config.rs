@@ -131,7 +131,7 @@ fn app_data_dir_from_env(
     app_data_dir_named(APP_DIR_NAME, &mut get)
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProxyConfig {
     #[serde(default)]
     pub r#type: String,
@@ -839,13 +839,13 @@ pub fn update_config(
     let before = (
         cfg.parallel_max,
         cfg.flood_sleep_threshold,
-        cfg.proxy.is_some(),
+        cfg.proxy.clone(),
     );
     apply(&mut cfg)?;
     let after = (
         cfg.parallel_max,
         cfg.flood_sleep_threshold,
-        cfg.proxy.is_some(),
+        cfg.proxy.clone(),
     );
     if before != after {
         return Err(TeleError::Other(
@@ -2061,6 +2061,55 @@ mod tests {
         assert_eq!(back.accounts.len(), 2);
         assert_eq!(back.accounts["work"].tags, Vec::<String>::new());
         assert_eq!(back.accounts["new"].tags, vec!["team".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_config_rejects_proxy_value_change() {
+        let dir = atomic_dir("update-proxy-value");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n",
+        )
+        .unwrap();
+        let err = update_config(Some(&path), |cfg| {
+            cfg.proxy = Some(socks5("10.0.0.1", 1080));
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            err.message().contains("not persisted"),
+            "proxy value swap must be rejected like other top-level changes: {err}"
+        );
+        let back = read_config(&path).unwrap();
+        assert_eq!(
+            back.proxy,
+            Some(socks5("127.0.0.1", 9050)),
+            "rejected update must leave the proxy on disk untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_config_allows_unchanged_proxy() {
+        let dir = atomic_dir("update-proxy-same");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[proxy]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 9050\n",
+        )
+        .unwrap();
+        update_config(Some(&path), |cfg| {
+            cfg.proxy = Some(socks5("127.0.0.1", 9050));
+            cfg.accounts
+                .insert("alpha".to_string(), AccountConfig::default());
+            Ok(())
+        })
+        .unwrap();
+        let back = read_config(&path).unwrap();
+        assert_eq!(back.proxy, Some(socks5("127.0.0.1", 9050)));
+        assert!(back.accounts.contains_key("alpha"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
