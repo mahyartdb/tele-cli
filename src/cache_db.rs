@@ -77,6 +77,10 @@ fn account_gate(account: &str) -> std::sync::Arc<tokio::sync::RwLock<()>> {
 /// connection cache). Used by the tests to prove the cache works.
 static DB_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many times an operation reached its per-account gate. Used by the
+/// tests to prove a blocked task really contended on the gate.
+static GATE_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 async fn open_db(account: &str) -> TeleResult<libsql::Connection> {
     {
         let cache = CONNECTIONS
@@ -186,6 +190,7 @@ pub async fn store_messages(account: &str, msgs: &[CachedMessage]) -> TeleResult
         return Ok(0);
     }
     let gate = account_gate(account);
+    GATE_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _write = gate.write().await;
     let conn = open_db(account).await?;
     let tx = begin_write(&conn)
@@ -228,6 +233,7 @@ pub async fn search_cache(
     limit: u32,
 ) -> TeleResult<Vec<CachedMessage>> {
     let gate = account_gate(account);
+    GATE_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _read = gate.read().await;
     let conn = open_db(account).await?;
     let mut out = Vec::new();
@@ -761,6 +767,17 @@ mod tests {
         assert!(found.iter().all(|m| m.text != "rolled back"));
     }
 
+    async fn wait_for_gate_wait(after: usize) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        while GATE_WAITS.load(std::sync::atomic::Ordering::SeqCst) <= after {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task never reached the cache gate"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
     async fn a_read_waits_for_an_in_flight_write_batch() {
         let _guard = crate::config::TEST_ENV_LOCK
@@ -773,10 +790,12 @@ mod tests {
             .unwrap();
         let gate = account_gate(&account);
         let write = gate.write().await;
+        let before = GATE_WAITS.load(std::sync::atomic::Ordering::SeqCst);
         let mut search = tokio::spawn({
             let account = account.clone();
             async move { search_cache(&account, "", None, 10).await }
         });
+        wait_for_gate_wait(before).await;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), &mut search)
                 .await
@@ -805,10 +824,12 @@ mod tests {
             .unwrap();
         let gate = account_gate(&account);
         let read = gate.read().await;
+        let before = GATE_WAITS.load(std::sync::atomic::Ordering::SeqCst);
         let mut store = tokio::spawn({
             let account = account.clone();
             async move { store_messages(&account, &[atomic_message(2, "gated write")]).await }
         });
+        wait_for_gate_wait(before).await;
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), &mut store)
                 .await
