@@ -1229,22 +1229,26 @@ mod tests {
         .unwrap();
     }
 
-    struct TestAppDir(PathBuf);
+    struct TestAppDir {
+        dir: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl TestAppDir {
         fn new(tag: &str) -> Self {
+            let guard = lock_env();
             let dir = test_dir(tag);
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(session_dir_for_test(&dir)).unwrap();
             seed_test_env(&dir);
-            Self(dir)
+            Self { dir, _guard: guard }
         }
     }
 
     impl Drop for TestAppDir {
         fn drop(&mut self) {
             std::env::remove_var("TELE_APP_DIR");
-            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -1962,7 +1966,6 @@ mod tests {
 
     #[tokio::test]
     async fn remove_session_spares_lookalike_account_live_files() {
-        let _guard = lock_env();
         let _app = TestAppDir::new("remove-lookalike");
         let lookalike_live = session_dir().join("work.session.tmp-42.session");
         let lookalike_lock = session_dir().join("work.session.tmp-42.session.lock");
