@@ -4,18 +4,22 @@ use std::path::Path;
 // u16), so two calls in the same microsecond would otherwise build the same
 // temp name and remove_dir_all each other's directory. The atomic counter
 // removes that collision within the process.
+fn next_tmp_seq() -> u64 {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
 fn tmp_dir_name(stem: &std::ffi::OsStr) -> std::ffi::OsString {
     let rand: u16 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u16)
         .unwrap_or(0);
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::ffi::OsString::from(format!(
-        ".{}_tmp-{}-{}-{seq}",
+        ".{}_tmp-{}-{}-{}",
         stem.to_string_lossy(),
         std::process::id(),
-        rand
+        rand,
+        next_tmp_seq()
     ))
 }
 
@@ -789,6 +793,16 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tmp_seq_increments_on_every_call() {
+        let first = next_tmp_seq();
+        let second = next_tmp_seq();
+        assert!(
+            second > first,
+            "the per-process counter must advance on every call: {first} -> {second}"
+        );
     }
 
     #[test]

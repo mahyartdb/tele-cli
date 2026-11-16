@@ -1229,6 +1229,25 @@ mod tests {
         .unwrap();
     }
 
+    struct TestAppDir(PathBuf);
+
+    impl TestAppDir {
+        fn new(tag: &str) -> Self {
+            let dir = test_dir(tag);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(session_dir_for_test(&dir)).unwrap();
+            seed_test_env(&dir);
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestAppDir {
+        fn drop(&mut self) {
+            std::env::remove_var("TELE_APP_DIR");
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[tokio::test]
     async fn open_session_lock_is_released_on_drop() {
         let _guard = lock_env();
@@ -1944,10 +1963,7 @@ mod tests {
     #[tokio::test]
     async fn remove_session_spares_lookalike_account_live_files() {
         let _guard = lock_env();
-        let dir = test_dir("remove-lookalike");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("sessions")).unwrap();
-        seed_test_env(&dir);
+        let _app = TestAppDir::new("remove-lookalike");
         let lookalike_live = session_dir().join("work.session.tmp-42.session");
         let lookalike_lock = session_dir().join("work.session.tmp-42.session.lock");
         let lookalike_export = session_dir().join(".work.session.export.tmp-42.session.export");
@@ -1984,8 +2000,6 @@ mod tests {
             !real_export_tmp.exists(),
             "a digits export tmp must be swept"
         );
-        std::env::remove_var("TELE_APP_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
