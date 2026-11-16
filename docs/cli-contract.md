@@ -201,7 +201,7 @@ Human mode (no `--json`) prints rich tables on stdout and uses the same exit cod
 
 ## `msg pin`, `msg read`, `msg download`
 
-- `msg pin --show` emits `results[].data.pinned_message` (a message object or null). `msg pin --all` emits `{"unpinned_all": true}`. Both flags are mutually exclusive with each other and with `--id` and `--unpin`, in the CLI and in the serve/MCP lane alike.
+- `msg pin --show` emits `results[].data.pinned_message` (a message object or null). `msg pin --all` emits `{"unpinned_all": true}`. Both flags are mutually exclusive with each other and with `--id` and `--unpin`, in the CLI and in the serve/MCP lane alike. `--notify` is mutually exclusive with `--unpin`, `--show`, and `--all` in both lanes.
 - `msg pin --notify` pins with a member notification (the default stays silent) through the raw `messages.updatePinnedMessage` path. Dry-run rows echo `notify` alongside `id`/`unpin`/`show`/`all`.
 - `msg read --mentions` clears only the mention badge (`{"mentions_cleared": true}`) and is mutually exclusive with `--mark-unread`.
 - `msg download --chunk-size-kb <4-512, multiple of 4>` streams the media through chunked `iter_download` into the same temp+commit flow. Without the flag, the default one-shot download behaves as before.
@@ -244,10 +244,10 @@ Rows gain additive `"username"` (a string, empty when none). The human table app
 ## `msg send`
 
 - `--file` is repeatable: one path sends a single media, and 2-10 paths send an album (`{"album": [message objects]}`). Albums do not support `--schedule` (including `--schedule online`) or `--thumbnail`.
-- `--file -` streams the file from stdin via grammers' `upload_stream` instead of reading a path. It requires `--file-size <BYTES>` (the exact stdin byte count; the part uploader reads exactly that many bytes) and `--file-name <NAME>` (the name the recipient sees), cannot be combined with other `--file` paths or albums, and is capped at the same 2 GiB limit. `--file-size`/`--file-name` are rejected when no stdin upload is present.
+- `--file -` streams the file from stdin via grammers' `upload_stream` instead of reading a path. It requires `--file-size <BYTES>` (the exact stdin byte count; the part uploader reads exactly that many bytes) and `--file-name <NAME>` (the name the recipient sees), cannot be combined with other `--file` paths or albums, and is capped at the same 2 GiB limit. `--file-size`/`--file-name` are rejected when no stdin upload is present. Stdin upload is CLI-only: the serve/MCP `msg send` op rejects `files: ["-"]` with a Usage error, in dry-run as well as execute, because over those transports stdin carries the protocol stream itself; the stdin switch is not part of the published parameter schema, so a driver cannot opt into it on the wire.
 - `--schedule online` schedules delivery for when the peer comes online (dry-run `data.schedule` is `0` for online).
-- `--media-ttl <secs>` sets an auto-destruct timer on sent media.
-- `--thumbnail <path>` attaches a custom thumbnail to single-document uploads.
+- `--media-ttl <secs>` sets an auto-destruct timer on sent media. It applies to `--file` and `--url` sends; combined with a text-only send it is rejected with a Usage error instead of being silently ignored.
+- `--thumbnail <path>` attaches a custom thumbnail to single-document uploads. It applies to `--file` sends only; combined with a text-only or `--url` send it is rejected with a Usage error instead of being silently ignored.
 - `--url <url> --kind photo|document` uploads remote media by URL instead of a local file.
 - `--copy-from <chat> --copy-id <id>` re-sends an existing message's media without the forward header. `--media-ttl` and `--thumbnail` are rejected with a Usage error here: copied media keeps its own TTL and cannot carry a new thumbnail.
 - `--topic <id>` posts into a forum topic. It is mutually exclusive with `--reply`: both set the reply-to header, and replying to the topic root lands the message in that topic. Reads scoped to a topic are available through `tele raw messages.Search` (`top_msg_id`), because grammers 0.10 exposes no topic filters on its history or search iterators.

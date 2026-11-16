@@ -42,7 +42,7 @@ pub(crate) use params::{
     PinParams, ReactParams, ReadParams, ScheduledDeleteParams, ScheduledParams,
     ScheduledSendParams, SearchParams, SendParams, TypingParams, VoteParams,
 };
-pub(crate) use send::validate_send;
+pub(crate) use send::validate_send_serve;
 pub use validate::validate_upload_path;
 
 #[derive(Subcommand)]
@@ -857,6 +857,16 @@ pub(crate) fn validate_pin(args: &PinArgs) -> TeleResult<()> {
             "--all and --id are mutually exclusive".to_string(),
         ));
     }
+    if args.notify && args.unpin {
+        return Err(TeleError::Usage(
+            "--notify and --unpin are mutually exclusive".to_string(),
+        ));
+    }
+    if args.notify && (args.show || args.all) {
+        return Err(TeleError::Usage(
+            "--notify is mutually exclusive with --show/--all".to_string(),
+        ));
+    }
     if args.show || args.all {
         return Ok(());
     }
@@ -953,7 +963,13 @@ fn get_batch_ids(params: &GetParams) -> TeleResult<Option<Vec<i32>>> {
 }
 
 pub(crate) fn validate_read(args: &ReadArgs) -> TeleResult<()> {
-    crate::chat_target::ChatTarget::parse_flag(args.chat.as_str(), "chat").map(|_| ())
+    crate::chat_target::ChatTarget::parse_flag(args.chat.as_str(), "chat")?;
+    if args.mentions && args.mark_unread {
+        return Err(TeleError::Usage(
+            "--mentions and --mark-unread are mutually exclusive".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn get_serve_dry_run(args: &GetArgs) -> TeleResult<serde_json::Value> {
@@ -3480,7 +3496,7 @@ pub(crate) fn msg_serve_routes() -> Vec<crate::commands::serve::OpRoute> {
             "send a text message to a chat",
             SendParams,
             SendArgs,
-            validate_send,
+            validate_send_serve,
             send_serve_dry_run,
             run_send,
             crate::commands::serve::params_schema::<SendParams>
@@ -3702,6 +3718,7 @@ crate::serve_runner!(
 );
 
 pub(crate) fn validate_scheduled(args: &ScheduledArgs) -> TeleResult<()> {
+    crate::chat_target::ChatTarget::parse_flag(args.chat.as_str(), "chat")?;
     crate::commands::validate_limit(args.limit, 10_000, "limit")?;
     Ok(())
 }
@@ -3711,6 +3728,7 @@ pub(crate) fn scheduled_serve_dry_run(args: &ScheduledArgs) -> TeleResult<serde_
 }
 
 pub(crate) fn validate_scheduled_delete(args: &ScheduledDeleteArgs) -> TeleResult<()> {
+    crate::chat_target::ChatTarget::parse_flag(args.chat.as_str(), "chat")?;
     if args.ids.is_empty() {
         return Err(TeleError::Usage(
             "--ids must list at least one message id".to_string(),
@@ -3731,6 +3749,7 @@ pub(crate) fn scheduled_delete_serve_dry_run(
 }
 
 pub(crate) fn validate_scheduled_send(args: &ScheduledSendArgs) -> TeleResult<()> {
+    crate::chat_target::ChatTarget::parse_flag(args.chat.as_str(), "chat")?;
     if args.ids.is_empty() {
         return Err(TeleError::Usage(
             "--ids must list at least one message id".to_string(),

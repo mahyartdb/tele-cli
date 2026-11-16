@@ -76,6 +76,21 @@ fn effective_preview(args: &SendArgs) -> bool {
     args.preview && !args.no_preview
 }
 
+pub(crate) fn validate_stdin_source(files: &[String], stdin_ok: bool) -> TeleResult<()> {
+    if !stdin_ok && files.iter().any(|f| f == "-") {
+        return Err(TeleError::Usage(
+            "stdin upload (--file -) is CLI-only: serve/MCP stdin carries the protocol stream"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_send_serve(args: &SendArgs) -> TeleResult<()> {
+    validate_send(args)?;
+    validate_stdin_source(&args.files, false)
+}
+
 pub(crate) fn validate_send(args: &SendArgs) -> TeleResult<()> {
     crate::chat_target::ChatTarget::parse_flag(args.chat.as_str(), "chat")?;
     if let Some(units) = args.split {
@@ -101,6 +116,11 @@ pub(crate) fn validate_send(args: &SendArgs) -> TeleResult<()> {
         if topic <= 0 {
             return Err(TeleError::Usage(
                 "--topic must be a positive topic ID".to_string(),
+            ));
+        }
+        if args.reply.is_some() {
+            return Err(TeleError::Usage(
+                "--reply and --topic are mutually exclusive".to_string(),
             ));
         }
     }
@@ -237,6 +257,15 @@ pub(crate) fn validate_send(args: &SendArgs) -> TeleResult<()> {
             "albums support at most 10 files; send larger sets in batches".to_string(),
         ));
     }
+    if args.media_ttl.is_some()
+        && args.files.is_empty()
+        && args.url.is_none()
+        && args.copy_from.is_none()
+    {
+        return Err(TeleError::Usage(
+            "--media-ttl requires --file or --url".to_string(),
+        ));
+    }
     if let Some(ttl) = args.media_ttl {
         if ttl <= 0 {
             return Err(TeleError::Usage("--media-ttl must be positive".to_string()));
@@ -326,6 +355,9 @@ pub(crate) fn validate_send(args: &SendArgs) -> TeleResult<()> {
             return Err(TeleError::Usage(
                 "--thumbnail is not supported with --copy-from".to_string(),
             ));
+        }
+        if args.files.is_empty() {
+            return Err(TeleError::Usage("--thumbnail requires --file".to_string()));
         }
         super::validate::validate_upload_path(thumb)?;
         if args.files.len() > 1 {
@@ -1069,6 +1101,7 @@ pub(crate) async fn send_core(
     params: SendParams,
 ) -> TeleResult<serde_json::Value> {
     validate_send(&SendArgs::from(&params))?;
+    validate_stdin_source(&params.files, params.stdin_ok)?;
     for path in &params.files {
         super::validate::validate_upload_path(path)?;
     }

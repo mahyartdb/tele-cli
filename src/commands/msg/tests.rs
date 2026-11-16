@@ -10,7 +10,8 @@ use crate::commands::msg::params::{ClickArgs, SendArgs};
 use crate::commands::msg::send::{
     album_row, file_message, message_random_id, parse_as_media, parse_effect, parse_poll_mode,
     parse_schedule, send_as_media_message, send_dry_run_payload, send_poll_message,
-    sent_updates_row, split_chunk_opts, split_text_utf16, url_message,
+    sent_updates_row, split_chunk_opts, split_text_utf16, url_message, validate_send,
+    validate_send_serve, validate_stdin_source,
 };
 use crate::commands::msg::validate::{
     check_upload_size, is_reserved_device_name, is_sensitive_basename, validate_download_dir,
@@ -5707,6 +5708,84 @@ fn validate_scheduled_send_rejects_nonpositive_ids() {
     ));
 }
 
+#[test]
+fn validate_scheduled_rejects_empty_chat() {
+    let base = ScheduledArgs {
+        chat: crate::chat_target::ChatTarget::new_unchecked("me".to_string()),
+        limit: 20,
+    };
+    assert!(validate_scheduled(&base).is_ok());
+    for bad in ["", "   "] {
+        let mut args = base.clone();
+        args.chat = crate::chat_target::ChatTarget::new_unchecked(bad.to_string());
+        assert!(
+            matches!(validate_scheduled(&args), Err(TeleError::Usage(m)) if m.contains("--chat")),
+            "chat {bad:?} must fail as usage"
+        );
+    }
+    let params = ScheduledParams {
+        chat: "   ".to_string(),
+        limit: 20,
+        dry_run: false,
+    };
+    assert!(matches!(
+        validate_scheduled(&ScheduledArgs::from(&params)),
+        Err(TeleError::Usage(_))
+    ));
+}
+
+#[test]
+fn validate_scheduled_delete_rejects_empty_chat() {
+    let base = ScheduledDeleteArgs {
+        chat: crate::chat_target::ChatTarget::new_unchecked("me".to_string()),
+        ids: vec![2],
+    };
+    assert!(validate_scheduled_delete(&base).is_ok());
+    for bad in ["", "   "] {
+        let mut args = base.clone();
+        args.chat = crate::chat_target::ChatTarget::new_unchecked(bad.to_string());
+        assert!(
+            matches!(validate_scheduled_delete(&args), Err(TeleError::Usage(m)) if m.contains("--chat")),
+            "chat {bad:?} must fail as usage"
+        );
+    }
+    let params = ScheduledDeleteParams {
+        chat: String::new(),
+        ids: vec![2],
+        dry_run: false,
+    };
+    assert!(matches!(
+        validate_scheduled_delete(&ScheduledDeleteArgs::from(&params)),
+        Err(TeleError::Usage(_))
+    ));
+}
+
+#[test]
+fn validate_scheduled_send_rejects_empty_chat() {
+    let base = ScheduledSendArgs {
+        chat: crate::chat_target::ChatTarget::new_unchecked("me".to_string()),
+        ids: vec![2],
+    };
+    assert!(validate_scheduled_send(&base).is_ok());
+    for bad in ["", "   "] {
+        let mut args = base.clone();
+        args.chat = crate::chat_target::ChatTarget::new_unchecked(bad.to_string());
+        assert!(
+            matches!(validate_scheduled_send(&args), Err(TeleError::Usage(m)) if m.contains("--chat")),
+            "chat {bad:?} must fail as usage"
+        );
+    }
+    let params = ScheduledSendParams {
+        chat: String::new(),
+        ids: vec![2],
+        dry_run: false,
+    };
+    assert!(matches!(
+        validate_scheduled_send(&ScheduledSendArgs::from(&params)),
+        Err(TeleError::Usage(_))
+    ));
+}
+
 fn offline_msg_client() -> grammers_client::Client {
     let session = std::sync::Arc::new(grammers_session::storages::MemorySession::default());
     let pool = grammers_client::sender::SenderPool::new(session, 12345);
@@ -5976,6 +6055,244 @@ fn react_dry_run_carries_chat() {
     assert_eq!(value["dry_run"], serde_json::json!(true));
     assert_eq!(value["chat"], serde_json::json!("me"));
     assert_eq!(value["id"], serde_json::json!(5));
+}
+
+#[test]
+fn validate_stdin_source_rejects_dash_without_cli_stdin() {
+    let err = validate_stdin_source(&["-".to_string()], false).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_)) && msg.contains("stdin"),
+        "{msg}"
+    );
+    assert!(validate_stdin_source(&["-".to_string()], true).is_ok());
+    assert!(validate_stdin_source(&["/x".to_string()], false).is_ok());
+    assert!(validate_stdin_source(&[], false).is_ok());
+}
+
+#[test]
+fn validate_send_serve_rejects_stdin_while_cli_accepts_it() {
+    let mut stdin_upload = send_args("plain");
+    stdin_upload.text = None;
+    stdin_upload.files = vec!["-".to_string()];
+    stdin_upload.file_size = Some(10);
+    stdin_upload.file_name = Some("payload.bin".to_string());
+    assert!(
+        validate_send(&stdin_upload).is_ok(),
+        "CLI stdin upload must stay valid"
+    );
+    let err = validate_send_serve(&stdin_upload).unwrap_err();
+    assert!(matches!(err, TeleError::Usage(_)));
+    assert!(err.message().contains("stdin"), "{}", err.message());
+
+    let mut normal = send_args("plain");
+    normal.text = None;
+    normal.files = vec!["notes.txt".to_string()];
+    assert!(validate_send_serve(&normal).is_ok());
+}
+
+#[test]
+fn msg_send_serve_planner_applies_stdin_guard() {
+    let route = msg_serve_routes()
+        .into_iter()
+        .find(|r| r.op == "msg send")
+        .expect("msg send route is registered");
+    let err = (route.planner)(
+        "msg send",
+        serde_json::json!({
+            "chat": "@x", "files": ["-"], "file_size": 10, "file_name": "a.bin", "dry_run": true
+        }),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("stdin"), "{err}");
+    assert!(
+        (route.planner)(
+            "msg send",
+            serde_json::json!({"chat": "@x", "text": "hi", "dry_run": true})
+        )
+        .is_ok(),
+        "a plain text dry run must still plan"
+    );
+}
+
+#[test]
+fn send_params_default_stdin_ok_to_false() {
+    let p: SendParams =
+        serde_json::from_value(serde_json::json!({"chat": "@x", "text": "hi", "files": ["-"]}))
+            .unwrap();
+    assert!(!p.stdin_ok);
+}
+
+#[test]
+fn send_params_wire_cannot_set_stdin_ok() {
+    let parsed = serde_json::from_value::<SendParams>(serde_json::json!({
+        "chat": "@x", "text": "hi", "files": ["-"], "stdin_ok": true
+    }));
+    let err = parsed.unwrap_err();
+    assert!(err.to_string().contains("stdin_ok"), "{err}");
+}
+
+#[test]
+fn send_params_schema_omits_stdin_ok() {
+    let schema = crate::commands::serve::params_schema::<SendParams>();
+    assert!(
+        !schema.to_string().contains("stdin_ok"),
+        "schema advertises stdin_ok: {schema}"
+    );
+}
+
+#[test]
+fn send_args_to_params_sets_stdin_ok_for_cli() {
+    let params = SendParams::from(&send_args("plain"));
+    assert!(params.stdin_ok);
+}
+
+#[test]
+fn validate_send_rejects_thumbnail_without_media_path() {
+    let dir = upload_fixture("thumbnail-misuse", &["thumb.jpg"]);
+    let thumb = dir.join("thumb.jpg").to_string_lossy().into_owned();
+    let mut text_only = send_args("plain");
+    text_only.thumbnail = Some(thumb.clone());
+    let err = validate_send(&text_only).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_)) && msg.contains("thumbnail"),
+        "{msg}"
+    );
+
+    let mut url_send = clone_without_text_for_tests(&send_args("plain"));
+    url_send.url = Some("https://example.com/x.jpg".to_string());
+    url_send.kind = Some("photo".to_string());
+    url_send.thumbnail = Some(thumb);
+    let err = validate_send(&url_send).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_)) && msg.contains("thumbnail"),
+        "{msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn validate_send_accepts_thumbnail_with_single_file() {
+    let dir = upload_fixture("thumbnail-file", &["a.pdf", "thumb.jpg"]);
+    let mut args = clone_without_text_for_tests(&send_args("plain"));
+    args.files = vec![dir.join("a.pdf").to_string_lossy().into_owned()];
+    args.thumbnail = Some(dir.join("thumb.jpg").to_string_lossy().into_owned());
+    assert!(validate_send(&args).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn validate_send_rejects_media_ttl_on_text_only() {
+    let mut args = send_args("plain");
+    args.media_ttl = Some(60);
+    let err = validate_send(&args).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_)) && msg.contains("media-ttl"),
+        "{msg}"
+    );
+
+    let mut url_send = clone_without_text_for_tests(&send_args("plain"));
+    url_send.url = Some("https://example.com/x.jpg".to_string());
+    url_send.kind = Some("photo".to_string());
+    url_send.media_ttl = Some(60);
+    assert!(validate_send(&url_send).is_ok());
+
+    let dir = upload_fixture("media-ttl-file", &["a.pdf"]);
+    let mut file_send = clone_without_text_for_tests(&send_args("plain"));
+    file_send.files = vec![dir.join("a.pdf").to_string_lossy().into_owned()];
+    file_send.media_ttl = Some(60);
+    assert!(validate_send(&file_send).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn validate_send_rejects_reply_and_topic_together() {
+    let mut args = send_args("plain");
+    args.reply = Some(5);
+    args.topic = Some(9);
+    let err = validate_send(&args).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_)) && msg.contains("--reply") && msg.contains("--topic"),
+        "{msg}"
+    );
+    args.reply = None;
+    assert!(validate_send(&args).is_ok());
+    let mut args = send_args("plain");
+    args.reply = Some(5);
+    assert!(validate_send(&args).is_ok());
+}
+
+#[test]
+fn validate_pin_rejects_notify_with_unpin_show_or_all() {
+    let base = PinArgs {
+        chat: crate::chat_target::ChatTarget::new_unchecked("me".to_string()),
+        id: Some(7),
+        unpin: false,
+        notify: false,
+        show: false,
+        all: false,
+    };
+    assert!(validate_pin(&base).is_ok());
+    let mut notify_unpin = base.clone();
+    notify_unpin.unpin = true;
+    notify_unpin.notify = true;
+    let err = validate_pin(&notify_unpin).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_)) && msg.contains("--notify") && msg.contains("--unpin"),
+        "{msg}"
+    );
+    let mut notify_show = base.clone();
+    notify_show.id = None;
+    notify_show.show = true;
+    notify_show.notify = true;
+    let err = validate_pin(&notify_show).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_)) && msg.contains("--notify") && msg.contains("--show"),
+        "{msg}"
+    );
+    let mut notify_all = base.clone();
+    notify_all.id = None;
+    notify_all.all = true;
+    notify_all.notify = true;
+    let err = validate_pin(&notify_all).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_)) && msg.contains("--notify") && msg.contains("--all"),
+        "{msg}"
+    );
+    let mut notify_id = base.clone();
+    notify_id.notify = true;
+    assert!(validate_pin(&notify_id).is_ok());
+}
+
+#[test]
+fn validate_read_rejects_mentions_with_mark_unread() {
+    let base = ReadArgs {
+        chat: crate::chat_target::ChatTarget::new_unchecked("me".to_string()),
+        mark_unread: false,
+        mentions: false,
+    };
+    assert!(validate_read(&base).is_ok());
+    let mut both = base.clone();
+    both.mentions = true;
+    both.mark_unread = true;
+    let err = validate_read(&both).unwrap_err();
+    let msg = err.message();
+    assert!(
+        matches!(err, TeleError::Usage(_))
+            && msg.contains("--mentions")
+            && msg.contains("--mark-unread"),
+        "{msg}"
+    );
+    let mut mentions = base;
+    mentions.mentions = true;
+    assert!(validate_read(&mentions).is_ok());
 }
 
 #[test]

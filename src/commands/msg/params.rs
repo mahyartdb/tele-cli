@@ -597,6 +597,9 @@ pub(crate) struct SendParams {
     pub(crate) todo_others_can_complete: bool,
     #[serde(default)]
     pub(crate) dry_run: bool,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) stdin_ok: bool,
 }
 
 impl From<&SendArgs> for SendParams {
@@ -635,6 +638,7 @@ impl From<&SendArgs> for SendParams {
             todo_others_can_append: a.todo_others_can_append,
             todo_others_can_complete: a.todo_others_can_complete,
             dry_run: false,
+            stdin_ok: true,
         }
     }
 }
