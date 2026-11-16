@@ -848,7 +848,7 @@ pub fn update_config(
         cfg.proxy.clone(),
     );
     if before != after {
-        return Err(TeleError::Other(
+        return Err(TeleError::Config(
             "config update changed a top-level key, which is not persisted; \
              only the accounts table can be written this way"
                 .to_string(),
@@ -2081,6 +2081,11 @@ mod tests {
         assert!(
             err.message().contains("not persisted"),
             "proxy value swap must be rejected like other top-level changes: {err}"
+        );
+        assert_eq!(
+            err.exit_code(),
+            crate::error::EXIT_USAGE,
+            "a rejected config write must not look like an all-accounts failure"
         );
         let back = read_config(&path).unwrap();
         assert_eq!(
