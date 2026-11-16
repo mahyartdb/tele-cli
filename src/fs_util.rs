@@ -1,5 +1,24 @@
 use std::path::Path;
 
+// The clock-derived part is only 16 bits (a nanosecond count truncated to
+// u16), so two calls in the same microsecond would otherwise build the same
+// temp name and remove_dir_all each other's directory. The atomic counter
+// removes that collision within the process.
+fn tmp_dir_name(stem: &std::ffi::OsStr) -> std::ffi::OsString {
+    let rand: u16 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u16)
+        .unwrap_or(0);
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::ffi::OsString::from(format!(
+        ".{}_tmp-{}-{}-{seq}",
+        stem.to_string_lossy(),
+        std::process::id(),
+        rand
+    ))
+}
+
 pub fn create_dir_private(path: &Path) -> std::io::Result<()> {
     if path.exists() {
         if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
@@ -21,16 +40,7 @@ pub fn create_dir_private(path: &Path) -> std::io::Result<()> {
             path.display()
         ))
     })?;
-    let rand: u16 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u16)
-        .unwrap_or(0);
-    let tmp = parent.join(format!(
-        ".{}_tmp-{}-{}",
-        stem.to_string_lossy(),
-        std::process::id(),
-        rand
-    ));
+    let tmp = parent.join(tmp_dir_name(stem));
     if std::fs::symlink_metadata(&tmp).is_ok() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -779,6 +789,26 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tmp_dir_names_are_unique_within_a_process() {
+        let stem = std::ffi::OsStr::new("sessions");
+        let prefix = format!(".sessions_tmp-{}-", std::process::id());
+        let names: Vec<std::ffi::OsString> = (0..1000).map(|_| tmp_dir_name(stem)).collect();
+        for name in &names {
+            let name = name.to_string_lossy();
+            assert!(
+                name.starts_with(&prefix),
+                "temp name {name} must start with {prefix}"
+            );
+        }
+        let distinct: std::collections::HashSet<&std::ffi::OsString> = names.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            names.len(),
+            "every temp name must be distinct so concurrent creators cannot collide"
+        );
     }
 
     #[test]
