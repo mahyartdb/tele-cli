@@ -508,7 +508,8 @@ fn album_flush(account: &str, buf: &mut AlbumBuffer) -> Vec<serde_json::Value> {
 }
 
 /// Emit a buffered row without consulting the count budget. Returns true when
-/// the stream must stop (stdout is gone).
+/// the stream must stop (stdout is gone); a row outside the `--until` window
+/// is skipped and also returns false.
 ///
 /// The `--until` window still applies, with one exception: an `Album` row
 /// carries its first member's date, so an album whose members straddle the
@@ -569,6 +570,37 @@ async fn emit_or_stop(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Raw rows are independent of the parsed event allowlist: `--events Raw`
+/// and `--raw` must report message updates even when their parsed family is
+/// not selected.
+struct RawEmitCtx<'a> {
+    filter: &'a EventFilter,
+    raw_on: bool,
+    update: &'a tl::enums::Update,
+    state: &'a State,
+}
+
+async fn emit_raw_update(
+    writer: &ListenWriter,
+    stopper: &StreamStopper,
+    account: &str,
+    album: &mut AlbumBuffer,
+    ctx: RawEmitCtx<'_>,
+) -> TeleResult<bool> {
+    if !ctx.raw_on || is_empty_update(ctx.update) || !ctx.filter.raw_allows(update_peer(ctx.update))
+    {
+        return Ok(false);
+    }
+    emit_or_stop(
+        writer,
+        stopper,
+        account,
+        album,
+        raw_row(account, ctx.update, ctx.state),
+    )
+    .await
 }
 
 /// Emit the due albums a sweep already removed from the buffer.
@@ -978,6 +1010,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     let chat_action_on = events.iter().any(|e| e == "ChatAction");
                     let user_update_on = events.iter().any(|e| e == "UserUpdate");
                     let callback_query_on = events.iter().any(|e| e == "CallbackQuery");
+                    let raw_on = events.iter().any(|e| e == "Raw");
                     loop {
                         if let Some(d) = deadline {
                             if std::time::Instant::now() >= d {
@@ -1088,6 +1121,22 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                                                 if emit_or_stop(&writer, &stopper, &name, &mut album, gap_row(&name, &signal, update.state())).await? { return Ok(()); }
 
                             }
+                        }
+                        if emit_raw_update(
+                            &writer,
+                            &stopper,
+                            &name,
+                            &mut album,
+                            RawEmitCtx {
+                                filter: &filter,
+                                raw_on,
+                                update: update.raw(),
+                                state: update.state(),
+                            },
+                        )
+                        .await?
+                        {
+                            return Ok(());
                         }
                         match &update {
                             Update::NewMessage(m) => {
@@ -1366,14 +1415,6 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                         continue;
                                     }
                                 }
-                                if !events.iter().any(|e| e == "Raw") {
-                                    continue;
-                                }
-                                if !filter.raw_allows(update_peer(update.raw())) {
-                                    continue;
-                                }
-                                                                if emit_or_stop(&writer, &stopper, &name, &mut album, raw_row(&name, update.raw(), update.state())).await? { return Ok(()); }
-
                             }
                         }
                     }
@@ -1413,7 +1454,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         }
     }
     writer.finish().await;
-    if until.is_some() && stopper.time_up() {
+    if until.is_some() && stopper.time_up() && stopper.report_until_reached() {
         output::log_line("info", "listen --until reached");
     }
     if timeout_secs > 0 {
@@ -1424,11 +1465,17 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     Ok(listen_exit_code(stopper.usage_failure(), ok_count, &failed))
 }
 
+/// A projection failure promotes a successful or partial run to usage, because
+/// the row shapes are unusable as a whole. When every account failed, the
+/// normal precedence still decides: auth and Telegram/IO failures outrank a
+/// usage exit and are more actionable for the caller.
 fn listen_exit_code(usage_failure: bool, ok_count: usize, failed: &[i32]) -> i32 {
-    if usage_failure {
-        return crate::error::EXIT_USAGE;
+    let code = crate::error::aggregate_exit_code(ok_count, failed);
+    if usage_failure && matches!(code, crate::error::EXIT_OK | crate::error::EXIT_PARTIAL) {
+        crate::error::EXIT_USAGE
+    } else {
+        code
     }
-    crate::error::aggregate_exit_code(ok_count, failed)
 }
 
 enum EmitOutcome {
@@ -1626,6 +1673,7 @@ pub(crate) struct StreamStopper {
     until_date: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     stopped: std::sync::atomic::AtomicBool,
     usage_failure: std::sync::atomic::AtomicBool,
+    until_reported: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -1641,6 +1689,7 @@ impl StreamStopper {
             until_date: std::sync::Mutex::new(until_date),
             stopped: std::sync::atomic::AtomicBool::new(false),
             usage_failure: std::sync::atomic::AtomicBool::new(false),
+            until_reported: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -1660,6 +1709,13 @@ impl StreamStopper {
     fn usage_failure(&self) -> bool {
         self.usage_failure
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Claim the one-shot "listen --until reached" stderr notice.
+    fn report_until_reached(&self) -> bool {
+        !self
+            .until_reported
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Sleep until the run is over: `request_stop()` from another account or
@@ -1810,7 +1866,9 @@ async fn emit_row_or_stop(
     // the whole run ends, instead of leaving quiet accounts streaming on.
     if stopper.past_until(&value) {
         stopper.request_stop();
-        output::log_line("info", "listen --until reached");
+        if stopper.report_until_reached() {
+            output::log_line("info", "listen --until reached");
+        }
         return Ok(EmitStep::STOPPED);
     }
     // time_up() only fires for a FUTURE --until (a past timestamp has no
@@ -2561,10 +2619,13 @@ mod tests;
 #[cfg(test)]
 mod stopper_tests {
     use super::{
-        album_ingest, emit_due_albums, emit_row_or_stop, handle_stream_failure, on_emit_failure,
-        AlbumBuffer, CountSlot, EmitFailure, ListenWriter, StreamFailureCtx, StreamStopper,
+        album_ingest, emit_due_albums, emit_raw_update, emit_row_or_stop, handle_stream_failure,
+        on_emit_failure, AlbumBuffer, CountSlot, EmitFailure, EventFilter, ListenWriter,
+        RawEmitCtx, StreamFailureCtx, StreamStopper,
     };
     use crate::error::TeleError;
+    use grammers_client::tl;
+    use grammers_session::updates::State;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -2728,6 +2789,185 @@ mod stopper_tests {
         assert!(stopper.past_until(&after));
     }
 
+    fn raw_new_message_update(id: i32, date: i32) -> tl::enums::Update {
+        tl::enums::Update::NewMessage(tl::types::UpdateNewMessage {
+            message: tl::enums::Message::Message(tl::types::Message {
+                out: false,
+                mentioned: false,
+                media_unread: false,
+                silent: false,
+                post: false,
+                from_scheduled: false,
+                legacy: false,
+                edit_hide: false,
+                pinned: false,
+                noforwards: false,
+                invert_media: false,
+                offline: false,
+                video_processing_pending: false,
+                paid_suggested_post_stars: false,
+                paid_suggested_post_ton: false,
+                id,
+                from_id: None,
+                from_boosts_applied: None,
+                from_rank: None,
+                peer_id: tl::enums::Peer::User(tl::types::PeerUser { user_id: 7 }),
+                saved_peer_id: None,
+                fwd_from: None,
+                via_bot_id: None,
+                via_business_bot_id: None,
+                guestchat_via_from: None,
+                reply_to: None,
+                date,
+                message: "raw hello".to_string(),
+                media: None,
+                reply_markup: None,
+                entities: None,
+                views: None,
+                forwards: None,
+                replies: None,
+                edit_date: None,
+                post_author: None,
+                grouped_id: None,
+                reactions: None,
+                restriction_reason: None,
+                ttl_period: None,
+                quick_reply_shortcut_id: None,
+                effect: None,
+                factcheck: None,
+                report_delivery_until_date: None,
+                paid_message_stars: None,
+                suggested_post: None,
+                schedule_repeat_period: None,
+                summary_from_language: None,
+                rich_message: None,
+            }),
+            pts: 10,
+            pts_count: 1,
+        })
+    }
+
+    fn raw_state(date: i32) -> State {
+        State {
+            date,
+            seq: 1,
+            message_box: None,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn raw_events_cover_message_updates_without_a_parsed_family() {
+        let _lock = quiet_fields();
+        let stopper = StreamStopper::new(None, None, None);
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
+        let mut album = AlbumBuffer::new();
+        let update = raw_new_message_update(42, 1_700_000_000);
+        let state = raw_state(1_700_000_000);
+        let stopped = emit_raw_update(
+            &writer,
+            &stopper,
+            "work",
+            &mut album,
+            RawEmitCtx {
+                filter: &EventFilter::default(),
+                raw_on: true,
+                update: &update,
+                state: &state,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!stopped);
+        writer.finish().await;
+        let lines = sink.lines();
+        assert_eq!(
+            lines.len(),
+            1,
+            "Raw must be emitted with no parsed event family selected"
+        );
+        let row: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(row["event"], "Raw");
+        assert_eq!(row["state"]["date"], 1_700_000_000);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn raw_events_follow_the_raw_allowlist() {
+        let _lock = quiet_fields();
+        let stopper = StreamStopper::new(None, None, None);
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
+        let mut album = AlbumBuffer::new();
+        let update = raw_new_message_update(43, 1_700_000_000);
+        let state = raw_state(1_700_000_000);
+        let open = EventFilter::default();
+        let filtered = EventFilter {
+            patterns: vec![regex::Regex::new("nope").unwrap()],
+            ..EventFilter::default()
+        };
+        for (raw_on, filter) in [(false, &open), (true, &filtered)] {
+            assert!(!emit_raw_update(
+                &writer,
+                &stopper,
+                "work",
+                &mut album,
+                RawEmitCtx {
+                    filter,
+                    raw_on,
+                    update: &update,
+                    state: &state,
+                }
+            )
+            .await
+            .unwrap());
+        }
+        let empty = tl::enums::Update::NewMessage(tl::types::UpdateNewMessage {
+            message: tl::enums::Message::Empty(tl::types::MessageEmpty {
+                id: 44,
+                peer_id: None,
+            }),
+            pts: 11,
+            pts_count: 1,
+        });
+        assert!(!emit_raw_update(
+            &writer,
+            &stopper,
+            "work",
+            &mut album,
+            RawEmitCtx {
+                filter: &open,
+                raw_on: true,
+                update: &empty,
+                state: &state,
+            }
+        )
+        .await
+        .unwrap());
+        let other_chat = EventFilter {
+            chats: vec![super::PeerId::user(8).unwrap()],
+            ..EventFilter::default()
+        };
+        assert!(!emit_raw_update(
+            &writer,
+            &stopper,
+            "work",
+            &mut album,
+            RawEmitCtx {
+                filter: &other_chat,
+                raw_on: true,
+                update: &update,
+                state: &state,
+            }
+        )
+        .await
+        .unwrap());
+        writer.finish().await;
+        assert!(
+            sink.lines().is_empty(),
+            "suppressed raw updates must not reach stdout"
+        );
+    }
+
     #[test]
     fn rows_without_any_date_never_stop_the_stream() {
         // ChatAction/UserUpdate/CallbackQuery rows carry no date at all, so
@@ -2764,6 +3004,30 @@ mod stopper_tests {
             sink.lines().is_empty(),
             "the row that reaches --until must not be written"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_dated_until_stop_reports_once() {
+        let _lock = quiet_fields();
+        let limit = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stopper = StreamStopper::new(None, None, Some(limit));
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
+        let row = serde_json::json!({"event": "NewMessage", "date": "2026-06-01T00:00:00+00:00"});
+        assert!(
+            emit_row_or_stop(&writer, &stopper, "work", row)
+                .await
+                .unwrap()
+                .stop
+        );
+        assert!(
+            !stopper.report_until_reached(),
+            "the row path must claim the one-shot notice, so the end-of-run check stays silent"
+        );
+        writer.finish().await;
+        assert!(sink.lines().is_empty());
     }
 
     #[tokio::test]
@@ -2880,11 +3144,34 @@ mod stopper_tests {
     }
 
     #[test]
-    fn a_usage_failure_outranks_a_successful_account() {
+    fn a_usage_failure_promotes_partial_runs_but_not_all_failed_precedence() {
         assert_eq!(
             super::listen_exit_code(true, 1, &[crate::error::EXIT_USAGE]),
             crate::error::EXIT_USAGE,
             "a --fields projection failure must exit 1 even after another account succeeded"
+        );
+        assert_eq!(
+            super::listen_exit_code(
+                true,
+                0,
+                &[crate::error::EXIT_USAGE, crate::error::EXIT_AUTH]
+            ),
+            crate::error::EXIT_AUTH,
+            "when every account failed, auth must outrank the projection usage failure"
+        );
+        assert_eq!(
+            super::listen_exit_code(
+                true,
+                0,
+                &[crate::error::EXIT_USAGE, crate::error::EXIT_ALL_FAILED]
+            ),
+            crate::error::EXIT_ALL_FAILED,
+            "when every account failed, a Telegram/IO failure must outrank the projection usage failure"
+        );
+        assert_eq!(
+            super::listen_exit_code(true, 0, &[crate::error::EXIT_USAGE]),
+            crate::error::EXIT_USAGE,
+            "a projection failure as the only failure still exits 1"
         );
         assert_eq!(
             super::listen_exit_code(false, 1, &[crate::error::EXIT_USAGE]),
@@ -2902,7 +3189,7 @@ mod stopper_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_for_stop_returns_promptly_after_a_request_from_another_task() {
         let stopper = Arc::new(StreamStopper::new(None, None, None));
         let waiter = tokio::spawn({
@@ -2914,17 +3201,13 @@ mod stopper_tests {
             !waiter.is_finished(),
             "wait_for_stop must park until a stop is requested"
         );
-        let start = std::time::Instant::now();
         stopper.request_stop();
-        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        // Paused time means the 500ms fallback poll cannot fire inside this
+        // one-millisecond window: only the notify can finish the waiter.
+        tokio::time::timeout(std::time::Duration::from_millis(1), waiter)
             .await
-            .expect("request_stop must wake a parked wait_for_stop")
+            .expect("request_stop must wake a parked wait_for_stop, not wait for the poll")
             .expect("waiter task panicked");
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(480),
-            "the notify must wake the wait before the 500ms fallback poll; woke in {:?}",
-            start.elapsed()
-        );
     }
 
     #[tokio::test]
@@ -3045,7 +3328,7 @@ mod stopper_tests {
         .await
         .unwrap();
         assert!(step.stop);
-        tokio::time::timeout(std::time::Duration::from_millis(480), waiter)
+        tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
             .await
             .expect("the last count slot must wake parked accounts without a poll delay")
             .expect("waiter task panicked");
@@ -3162,28 +3445,39 @@ mod stopper_tests {
     async fn a_broken_stdout_releases_the_slot_and_wakes_parked_accounts() {
         // Regression: the emit-error arms returned before the last-slot
         // broadcast, so a broken pipe spent the count budget with no wake-up
-        // and quiet accounts stayed parked for up to an hour.
+        // and quiet accounts waited out the next poll.
         let _lock = quiet_fields();
         let stopper = StreamStopper::new(Some(3), None, None);
         let writer =
             super::spawn_writer(|| BrokenPipeSink, 1, std::time::Duration::from_millis(200));
-        let mut stopped = false;
-        for _ in 0..64 {
-            if emit_row_or_stop(
-                &writer,
-                &stopper,
-                "acct",
-                serde_json::json!({"event": "NewMessage"}),
-            )
-            .await
-            .expect("a broken pipe is not a usage error")
-            .stop
-            {
-                stopped = true;
+        let first = emit_row_or_stop(
+            &writer,
+            &stopper,
+            "acct",
+            serde_json::json!({"event": "NewMessage"}),
+        )
+        .await
+        .expect("the first row is queued before the writer sees the pipe");
+        assert!(!first.stop);
+        for _ in 0..400 {
+            if writer.tx.is_closed() {
                 break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert!(stopped, "the emit failure must stop the stream");
+        assert!(
+            writer.tx.is_closed(),
+            "the writer thread must exit on a broken pipe"
+        );
+        let second = emit_row_or_stop(
+            &writer,
+            &stopper,
+            "acct",
+            serde_json::json!({"event": "NewMessage"}),
+        )
+        .await
+        .expect("a broken pipe is not a usage error");
+        assert!(second.stop, "the emit failure must stop the stream");
         assert!(
             stopper.stop_requested(),
             "a dead stdout must broadcast a stop so parked accounts wake"
@@ -3193,8 +3487,12 @@ mod stopper_tests {
             "a broken pipe must not force the usage exit code"
         );
         assert!(
-            matches!(stopper.reserve(), CountSlot::Reserved { .. }),
+            matches!(stopper.reserve(), CountSlot::Reserved { last: false }),
             "the failed row's slot must be returned, not silently spent"
+        );
+        assert!(
+            matches!(stopper.reserve(), CountSlot::Reserved { last: true }),
+            "one queued row and one returned slot leave two of three slots"
         );
         writer.finish().await;
     }
