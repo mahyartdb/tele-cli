@@ -150,15 +150,10 @@ pub(crate) async fn topic_create_core(
 ) -> TeleResult<serde_json::Value> {
     ChatTarget::parse_flag(&params.chat, "chat")?;
     validate_create_title(&params.title)?;
-    let icon_emoji_id = match params.emoji.as_deref() {
+    let icon_emoji_id = match icon_emoji_source(params.emoji.as_deref())? {
         None => None,
-        Some(raw) => match parse_emoji_document_id(raw) {
-            Some(id) => Some(id),
-            None => {
-                validate_emoji(Some(raw))?;
-                Some(lookup_custom_emoji_id(shares, raw).await?)
-            }
-        },
+        Some(IconEmojiSource::Document(id)) => Some(id),
+        Some(IconEmojiSource::Lookup(raw)) => Some(lookup_custom_emoji_id(shares, &raw).await?),
     };
     shares.rate_limiter.acquire().await;
     let chat =
@@ -179,6 +174,25 @@ pub(crate) async fn topic_create_core(
         .await
         .map_err(tele_invocation)?;
     Ok(create_payload(&params.chat, &params.title, &updates))
+}
+
+#[derive(Debug)]
+enum IconEmojiSource {
+    Document(i64),
+    Lookup(String),
+}
+
+fn icon_emoji_source(emoji: Option<&str>) -> TeleResult<Option<IconEmojiSource>> {
+    match emoji {
+        None => Ok(None),
+        Some(raw) => match parse_emoji_document_id(raw) {
+            Some(id) => Ok(Some(IconEmojiSource::Document(id))),
+            None => {
+                validate_emoji(Some(raw))?;
+                Ok(Some(IconEmojiSource::Lookup(raw.to_string())))
+            }
+        },
+    }
 }
 
 fn create_payload(chat: &str, title: &str, updates: &tl::enums::Updates) -> serde_json::Value {
@@ -1636,8 +1650,25 @@ mod tests {
     }
 
     #[test]
-    fn emoji_absent_means_no_icon() {
+    fn emoji_absent_is_accepted() {
         assert!(validate_emoji(None).is_ok());
+    }
+
+    #[test]
+    fn emoji_source_keeps_numeric_ids_and_looks_up_literals() {
+        assert!(matches!(
+            icon_emoji_source(Some("531234567890123456")).unwrap(),
+            Some(IconEmojiSource::Document(531234567890123456))
+        ));
+        assert!(matches!(
+            icon_emoji_source(Some("\u{1F642}")).unwrap(),
+            Some(IconEmojiSource::Lookup(ref raw)) if raw == "\u{1F642}"
+        ));
+        assert!(icon_emoji_source(None).unwrap().is_none());
+        assert!(matches!(
+            icon_emoji_source(Some("ab")).unwrap_err(),
+            TeleError::Usage(_)
+        ));
     }
 
     #[test]
