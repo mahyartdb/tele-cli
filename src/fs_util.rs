@@ -4,9 +4,15 @@ use std::path::Path;
 // u16), so two calls in the same microsecond would otherwise build the same
 // temp name and remove_dir_all each other's directory. The atomic counter
 // removes that collision within the process.
-fn next_tmp_seq() -> u64 {
+fn tmp_dir_name_at(stem: &std::ffi::OsStr, rand: u16) -> std::ffi::OsString {
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::ffi::OsString::from(format!(
+        ".{}_tmp-{}-{}-{seq}",
+        stem.to_string_lossy(),
+        std::process::id(),
+        rand
+    ))
 }
 
 fn tmp_dir_name(stem: &std::ffi::OsStr) -> std::ffi::OsString {
@@ -14,13 +20,7 @@ fn tmp_dir_name(stem: &std::ffi::OsStr) -> std::ffi::OsString {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u16)
         .unwrap_or(0);
-    std::ffi::OsString::from(format!(
-        ".{}_tmp-{}-{}-{}",
-        stem.to_string_lossy(),
-        std::process::id(),
-        rand,
-        next_tmp_seq()
-    ))
+    tmp_dir_name_at(stem, rand)
 }
 
 pub fn create_dir_private(path: &Path) -> std::io::Result<()> {
@@ -796,12 +796,15 @@ mod tests {
     }
 
     #[test]
-    fn tmp_seq_increments_on_every_call() {
-        let first = next_tmp_seq();
-        let second = next_tmp_seq();
-        assert!(
-            second > first,
-            "the per-process counter must advance on every call: {first} -> {second}"
+    fn tmp_dir_name_disambiguates_the_same_clock_value() {
+        // The clock part is only 16 bits, so two calls can land on the same
+        // value; only the per-process counter keeps the names distinct.
+        let stem = std::ffi::OsStr::new("sessions");
+        let first = tmp_dir_name_at(stem, 7);
+        let second = tmp_dir_name_at(stem, 7);
+        assert_ne!(
+            first, second,
+            "two names built from the same clock value must still differ"
         );
     }
 
