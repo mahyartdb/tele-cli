@@ -2722,17 +2722,15 @@ pub(crate) async fn chat_invite_core(
                 vec![exported_invite_row(&r)]
             } else {
                 let link = plan.link.clone().unwrap_or_default();
-                let plan = invite::resolved_edit_plan(&plan, async {
-                    shares.rate_limiter.acquire().await;
-                    shares
-                        .client
-                        .invoke(&tl::functions::messages::GetExportedChatInvite {
-                            peer: peer.clone(),
-                            link: link.clone(),
-                        })
-                        .await
-                        .map_err(tele_invocation)
-                })
+                let plan = invite::resolved_edit_plan(
+                    &plan,
+                    invite::fetch_current_invite(
+                        &shares.client,
+                        &shares.rate_limiter,
+                        &peer,
+                        &link,
+                    ),
+                )
                 .await?;
                 let r: tl::enums::messages::ExportedChatInvite = shares
                     .client

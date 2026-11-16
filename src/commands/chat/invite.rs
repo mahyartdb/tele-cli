@@ -184,17 +184,10 @@ pub(crate) async fn invite(args: InviteArgs, flags: &GlobalFlags) -> TeleResult<
                         vec![exported_invite_row(&r)]
                     } else {
                         let link = plan.link.clone().unwrap_or_default();
-                        let plan = resolved_edit_plan(&plan, async {
-                            guard.rate_limiter.acquire().await;
-                            guard
-                                .client
-                                .invoke(&tl::functions::messages::GetExportedChatInvite {
-                                    peer: peer.clone(),
-                                    link: link.clone(),
-                                })
-                                .await
-                                .map_err(tele_invocation)
-                        })
+                        let plan = resolved_edit_plan(
+                            &plan,
+                            fetch_current_invite(&guard.client, &guard.rate_limiter, &peer, &link),
+                        )
                         .await?;
                         let r: tl::enums::messages::ExportedChatInvite = guard
                             .client
@@ -415,6 +408,22 @@ pub(crate) fn needs_prefill(plan: &ValidatedInvite) -> bool {
     any_set && !all_set
 }
 
+pub(crate) async fn fetch_current_invite(
+    client: &grammers_client::Client,
+    rate_limiter: &crate::rate_limiter::RateLimiter,
+    peer: &tl::enums::InputPeer,
+    link: &str,
+) -> TeleResult<tl::enums::messages::ExportedChatInvite> {
+    rate_limiter.acquire().await;
+    client
+        .invoke(&tl::functions::messages::GetExportedChatInvite {
+            peer: peer.clone(),
+            link: link.to_string(),
+        })
+        .await
+        .map_err(tele_invocation)
+}
+
 pub(crate) async fn resolved_edit_plan<F>(
     plan: &ValidatedInvite,
     fetch: F,
@@ -426,7 +435,20 @@ where
         return Ok(plan.clone());
     }
     let found = fetch.await?;
-    Ok(invite_edit_merge(&found.invite(), plan))
+    let current = found.invite();
+    if matches!(
+        current,
+        tl::enums::ExportedChatInvite::ChatInvitePublicJoinRequests
+    ) {
+        // The public join-request entry carries no editable options, so the
+        // merge would send every option unset and the server would replace
+        // them. Refuse instead of editing blind.
+        return Err(TeleError::Usage(
+            "--edit LINK resolved to the public join-request link; it has no editable options"
+                .to_string(),
+        ));
+    }
+    Ok(invite_edit_merge(&current, plan))
 }
 
 pub(crate) fn invite_dry_run_payload(chat: &str, plan: &ValidatedInvite) -> serde_json::Value {

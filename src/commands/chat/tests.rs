@@ -1163,7 +1163,7 @@ fn invite_edit_merge_is_per_field() {
 }
 
 #[test]
-fn invite_edit_merge_keeps_plan_revoked_and_public_variant_has_nothing() {
+fn invite_edit_merge_keeps_plan_revoked() {
     let resolved = invite_edit_merge(
         &current_invite(Some(1_800_000_000), None, false, None),
         &ValidatedInvite {
@@ -1176,15 +1176,6 @@ fn invite_edit_merge_keeps_plan_revoked_and_public_variant_has_nothing() {
     assert_eq!(resolved.expire_date, Some(1_800_000_000));
     assert_eq!(resolved.usage_limit, None);
     assert_eq!(resolved.request_needed, Some(false));
-    assert_eq!(resolved.title, None);
-
-    let resolved = invite_edit_merge(
-        &tl::enums::ExportedChatInvite::ChatInvitePublicJoinRequests,
-        &ValidatedInvite::default(),
-    );
-    assert_eq!(resolved.expire_date, None);
-    assert_eq!(resolved.usage_limit, None);
-    assert_eq!(resolved.request_needed, None);
     assert_eq!(resolved.title, None);
 }
 
@@ -1282,6 +1273,51 @@ async fn prefill_fetch_merges_omitted_fields() {
     assert_eq!(resolved.usage_limit, Some(10));
     assert_eq!(resolved.expire_date, Some(123));
     assert_eq!(resolved.request_needed, Some(false));
+}
+
+#[tokio::test]
+async fn prefill_refuses_the_public_join_request_variant() {
+    // The public variant carries no editable options, so merging it would
+    // send every option unset and let the server replace them.
+    let plan = ValidatedInvite {
+        mode: InviteMode::Edit,
+        link: Some("https://t.me/+abc123".to_string()),
+        title: Some("new".to_string()),
+        ..Default::default()
+    };
+    let fetched =
+        tl::enums::messages::ExportedChatInvite::Invite(tl::types::messages::ExportedChatInvite {
+            invite: tl::enums::ExportedChatInvite::ChatInvitePublicJoinRequests,
+            users: Vec::new(),
+        });
+    let err = resolved_edit_plan(&plan, async { Ok(fetched) })
+        .await
+        .expect_err("a public join-request link has no editable options");
+    assert!(
+        err.message().contains("no editable options"),
+        "unexpected error: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn prefill_fetch_errors_surface_as_is() {
+    let plan = ValidatedInvite {
+        mode: InviteMode::Edit,
+        link: Some("https://t.me/+abc123".to_string()),
+        title: Some("new".to_string()),
+        ..Default::default()
+    };
+    let err = resolved_edit_plan(&plan, async {
+        Err(TeleError::Other("getExportedChatInvite failed".to_string()))
+    })
+    .await
+    .expect_err("a failed prefill must not fall back to an unset merge");
+    assert!(
+        err.message().contains("getExportedChatInvite failed"),
+        "unexpected error: {}",
+        err.message()
+    );
 }
 
 #[test]
