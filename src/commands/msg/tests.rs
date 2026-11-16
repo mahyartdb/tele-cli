@@ -6116,35 +6116,35 @@ fn msg_send_serve_planner_applies_stdin_guard() {
 }
 
 #[test]
-fn send_params_default_stdin_ok_to_false() {
+fn send_params_default_stdin_upload_allowed_to_false() {
     let p: SendParams =
         serde_json::from_value(serde_json::json!({"chat": "@x", "text": "hi", "files": ["-"]}))
             .unwrap();
-    assert!(!p.stdin_ok);
+    assert!(!p.stdin_upload_allowed);
 }
 
 #[test]
-fn send_params_wire_cannot_set_stdin_ok() {
+fn send_params_wire_cannot_set_stdin_upload_allowed() {
     let parsed = serde_json::from_value::<SendParams>(serde_json::json!({
-        "chat": "@x", "text": "hi", "files": ["-"], "stdin_ok": true
+        "chat": "@x", "text": "hi", "files": ["-"], "stdin_upload_allowed": true
     }));
     let err = parsed.unwrap_err();
-    assert!(err.to_string().contains("stdin_ok"), "{err}");
+    assert!(err.to_string().contains("stdin_upload_allowed"), "{err}");
 }
 
 #[test]
-fn send_params_schema_omits_stdin_ok() {
+fn send_params_schema_omits_stdin_upload_allowed() {
     let schema = crate::commands::serve::params_schema::<SendParams>();
     assert!(
-        !schema.to_string().contains("stdin_ok"),
-        "schema advertises stdin_ok: {schema}"
+        !schema.to_string().contains("stdin_upload_allowed"),
+        "schema advertises stdin_upload_allowed: {schema}"
     );
 }
 
 #[test]
-fn send_args_to_params_sets_stdin_ok_for_cli() {
+fn send_args_to_params_sets_stdin_upload_allowed_for_cli() {
     let params = SendParams::from(&send_args("plain"));
-    assert!(params.stdin_ok);
+    assert!(params.stdin_upload_allowed);
 }
 
 #[test]

@@ -857,6 +857,7 @@ pub(crate) fn validate_pin(args: &PinArgs) -> TeleResult<()> {
             "--all and --id are mutually exclusive".to_string(),
         ));
     }
+    // clap declares this pair too, so this copy only fires on the serve lane.
     if args.notify && args.unpin {
         return Err(TeleError::Usage(
             "--notify and --unpin are mutually exclusive".to_string(),
@@ -964,6 +965,7 @@ fn get_batch_ids(params: &GetParams) -> TeleResult<Option<Vec<i32>>> {
 
 pub(crate) fn validate_read(args: &ReadArgs) -> TeleResult<()> {
     crate::chat_target::ChatTarget::parse_flag(args.chat.as_str(), "chat")?;
+    // clap declares this pair too, so this copy only fires on the serve lane.
     if args.mentions && args.mark_unread {
         return Err(TeleError::Usage(
             "--mentions and --mark-unread are mutually exclusive".to_string(),

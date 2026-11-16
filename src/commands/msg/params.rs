@@ -597,9 +597,11 @@ pub(crate) struct SendParams {
     pub(crate) todo_others_can_complete: bool,
     #[serde(default)]
     pub(crate) dry_run: bool,
+    // Transport capability, not a wire parameter: stdin carries the protocol
+    // stream over serve/MCP, so only the CLI's From<&SendArgs> sets it.
     #[serde(skip)]
     #[schemars(skip)]
-    pub(crate) stdin_ok: bool,
+    pub(crate) stdin_upload_allowed: bool,
 }
 
 impl From<&SendArgs> for SendParams {
@@ -638,7 +640,7 @@ impl From<&SendArgs> for SendParams {
             todo_others_can_append: a.todo_others_can_append,
             todo_others_can_complete: a.todo_others_can_complete,
             dry_run: false,
-            stdin_ok: true,
+            stdin_upload_allowed: true,
         }
     }
 }

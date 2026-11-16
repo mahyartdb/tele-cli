@@ -76,8 +76,11 @@ fn effective_preview(args: &SendArgs) -> bool {
     args.preview && !args.no_preview
 }
 
-pub(crate) fn validate_stdin_source(files: &[String], stdin_ok: bool) -> TeleResult<()> {
-    if !stdin_ok && files.iter().any(|f| f == "-") {
+pub(crate) fn validate_stdin_source(
+    files: &[String],
+    stdin_upload_allowed: bool,
+) -> TeleResult<()> {
+    if !stdin_upload_allowed && files.iter().any(|f| f == "-") {
         return Err(TeleError::Usage(
             "stdin upload (--file -) is CLI-only: serve/MCP stdin carries the protocol stream"
                 .to_string(),
@@ -87,8 +90,8 @@ pub(crate) fn validate_stdin_source(files: &[String], stdin_ok: bool) -> TeleRes
 }
 
 pub(crate) fn validate_send_serve(args: &SendArgs) -> TeleResult<()> {
-    validate_send(args)?;
-    validate_stdin_source(&args.files, false)
+    validate_stdin_source(&args.files, false)?;
+    validate_send(args)
 }
 
 pub(crate) fn validate_send(args: &SendArgs) -> TeleResult<()> {
@@ -1101,7 +1104,7 @@ pub(crate) async fn send_core(
     params: SendParams,
 ) -> TeleResult<serde_json::Value> {
     validate_send(&SendArgs::from(&params))?;
-    validate_stdin_source(&params.files, params.stdin_ok)?;
+    validate_stdin_source(&params.files, params.stdin_upload_allowed)?;
     for path in &params.files {
         super::validate::validate_upload_path(path)?;
     }
