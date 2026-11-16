@@ -6085,6 +6085,16 @@ fn validate_send_serve_rejects_stdin_while_cli_accepts_it() {
     assert!(matches!(err, TeleError::Usage(_)));
     assert!(err.message().contains("stdin"), "{}", err.message());
 
+    // Without a file name the execute lane would report the missing name;
+    // the stdin guard must win in both lanes so the error names the real
+    // problem (stdin is reserved for the serve/MCP protocol stream).
+    let mut unnamed = send_args("plain");
+    unnamed.text = None;
+    unnamed.files = vec!["-".to_string()];
+    unnamed.file_size = Some(10);
+    let err = validate_send_serve(&unnamed).unwrap_err();
+    assert!(err.message().contains("stdin"), "{}", err.message());
+
     let mut normal = send_args("plain");
     normal.text = None;
     normal.files = vec!["notes.txt".to_string()];

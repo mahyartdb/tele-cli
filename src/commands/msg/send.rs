@@ -1103,8 +1103,8 @@ pub(crate) async fn send_core(
     shares: &crate::client::ServeShares,
     params: SendParams,
 ) -> TeleResult<serde_json::Value> {
-    validate_send(&SendArgs::from(&params))?;
     validate_stdin_source(&params.files, params.stdin_upload_allowed)?;
+    validate_send(&SendArgs::from(&params))?;
     for path in &params.files {
         super::validate::validate_upload_path(path)?;
     }
