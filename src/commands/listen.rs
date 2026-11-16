@@ -511,16 +511,21 @@ fn album_flush(account: &str, buf: &mut AlbumBuffer) -> Vec<serde_json::Value> {
 /// stream must stop (stdout is gone).
 async fn emit_direct(
     writer: &ListenWriter,
+    stopper: &StreamStopper,
     account: &str,
     value: serde_json::Value,
 ) -> TeleResult<bool> {
     match writer.emit(account, value).await {
         Ok(_) => Ok(false),
         Err(e) if matches!(e, TeleError::Usage(_)) => Err(e),
-        Err(e) if emit_stops_stream(&e) => Ok(true),
+        Err(e) if emit_stops_stream(&e) => {
+            stopper.request_stop();
+            Ok(true)
+        }
         Err(e) => {
             // stdout is unusable: continuing would only repeat this failure
-            // once per row.
+            // once per row, and parked accounts must still wake to end the run.
+            stopper.request_stop();
             output::log_line("error", &format!("{account}: emit failed: {}", e.message()));
             Ok(true)
         }
@@ -536,11 +541,12 @@ async fn emit_direct(
 /// as an `Album` row nor as individual `NewMessage` rows.
 async fn flush_albums_on_stop(
     writer: &ListenWriter,
+    stopper: &StreamStopper,
     account: &str,
     album: &mut AlbumBuffer,
 ) -> TeleResult<()> {
     for row in album_flush(account, album) {
-        if emit_direct(writer, account, row).await? {
+        if emit_direct(writer, stopper, account, row).await? {
             return Ok(());
         }
     }
@@ -556,8 +562,35 @@ async fn emit_or_stop(
     value: serde_json::Value,
 ) -> TeleResult<bool> {
     if emit_row_or_stop(writer, stopper, account, value).await? {
-        flush_albums_on_stop(writer, account, album).await?;
+        flush_albums_on_stop(writer, stopper, account, album).await?;
         return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Emit the due albums a sweep already removed from the buffer.
+///
+/// A stop must write the swept rows before the buffer's pending albums: the
+/// sweep removes rows in deadline order, so flushing the buffer first would
+/// emit a later-deadline album before an earlier-due one, and dropping the
+/// leftovers is silent data loss.
+async fn emit_due_albums(
+    writer: &ListenWriter,
+    stopper: &StreamStopper,
+    account: &str,
+    album: &mut AlbumBuffer,
+    swept: Vec<serde_json::Value>,
+) -> TeleResult<bool> {
+    for (index, done) in swept.iter().enumerate() {
+        if emit_row_or_stop(writer, stopper, account, done.clone()).await? {
+            for leftover in swept_after_stop(&swept, index) {
+                if emit_direct(writer, stopper, account, leftover.clone()).await? {
+                    return Ok(true);
+                }
+            }
+            flush_albums_on_stop(writer, stopper, account, album).await?;
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -576,6 +609,13 @@ fn album_flush_chat(
     keys.into_iter()
         .filter_map(|k| buf.remove(&k).map(|p| album_complete(account, &p)))
         .collect()
+}
+
+/// Rows after the one that triggered a stop, from a list the sweep already
+/// removed from its buffer. They were received off the wire, so emitting them
+/// directly is the only way they survive the stop.
+fn swept_after_stop(swept: &[serde_json::Value], stop_index: usize) -> &[serde_json::Value] {
+    swept.get(stop_index + 1..).unwrap_or(&[])
 }
 
 fn album_sweep(
@@ -735,6 +775,13 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     }
     let timeout_secs = args.timeout_secs;
     let (until, until_date) = until_bounds(args.until.as_deref())?;
+    if args.count == Some(0) {
+        // Zero emitted rows is the goal, and no event can ever be emitted:
+        // connect is pure cost, and without a timeout the stream would never
+        // end on its own.
+        output::log_line("info", "listen --count 0: emitting no rows");
+        return Ok(crate::error::EXIT_OK);
+    }
     let stopper = Arc::new(StreamStopper::new(args.count, until, until_date));
     let writer = spawn_listen_writer();
     let direction = if args.out {
@@ -788,6 +835,13 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             break;
                         }
                     }
+                    if stopper.stop_requested() || stopper.time_up() {
+                        // Another account spent the shared count budget or
+                        // the shared wall-clock --until bound expired while
+                        // this one was reconnecting; the pending albums were
+                        // flushed by the inner loop before it broke.
+                        break;
+                    }
                     let mut guard = {
                         let _permit = Arc::clone(&semaphore).acquire_owned().await;
                         match ClientGuard::connect_with_limiter(
@@ -804,7 +858,9 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                         &name,
                                         e,
                                         &mut failures,
+                                        std::time::Duration::ZERO,
                                         deadline,
+                                        Some(&stopper),
                                         MAX_RECONNECT_ATTEMPTS,
                                     )
                                     .await?;
@@ -817,7 +873,9 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                     &name,
                                     TeleError::from(e),
                                     &mut failures,
+                                    std::time::Duration::ZERO,
                                     deadline,
+                                    Some(&stopper),
                                     MAX_RECONNECT_ATTEMPTS,
                                 )
                                 .await?;
@@ -825,6 +883,9 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             }
                         }
                     };
+                    if stopper.stop_requested() || stopper.time_up() {
+                        break;
+                    }
                     if !targets_resolved {
                         filter = resolve_filter(
                             &guard.client,
@@ -850,7 +911,16 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             );
                             return Err(err);
                         }
-                        handle_stream_failure(&name, err, &mut failures, deadline, MAX_RECONNECT_ATTEMPTS).await?;
+                        handle_stream_failure(
+                            &name,
+                            err,
+                            &mut failures,
+                            std::time::Duration::ZERO,
+                            deadline,
+                            Some(&stopper),
+                            MAX_RECONNECT_ATTEMPTS,
+                        )
+                        .await?;
                         continue;
                     }
                     let receiver = std::mem::replace(
@@ -874,7 +944,9 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 &name,
                                 TeleError::Other(e.to_string()),
                                 &mut failures,
+                                std::time::Duration::ZERO,
                                 deadline,
+                                Some(&stopper),
                                 MAX_RECONNECT_ATTEMPTS,
                             )
                             .await?;
@@ -882,6 +954,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         }
                     };
                     failures = on_stream_connected(failures);
+                    let connected_at = std::time::Instant::now();
                     // gaps/observed/album are declared before the reconnect
                     // loop (see below) so gap detection and peer bookkeeping
                     // survive an outage instead of resetting blind.
@@ -901,7 +974,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 // through the stopper would veto them once
                                 // the count budget is spent.
                                 for done in album_flush(&name, &mut album) {
-                                    if emit_direct(&writer, &name, done).await? {
+                                    if emit_direct(&writer, &stopper, &name, done).await? {
                                         return Ok(());
                                     }
                                 }
@@ -913,6 +986,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             StreamError(grammers_client::InvocationError),
                             Idle,
                             AlbumDue,
+                            StopRequested,
                         }
                         let album_timer = async {
                             match min_album_deadline(&album) {
@@ -922,6 +996,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         };
                         let tick = tokio::select! {
                             _ = album_timer => Tick::AlbumDue,
+                            _ = stopper.wait_for_stop() => Tick::StopRequested,
                             res = tokio::time::timeout(
                                 poll_timeout(deadline, std::time::Instant::now()),
                                 stream.next(),
@@ -932,13 +1007,26 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             },
                         };
                         let update = match tick {
-                            Tick::AlbumDue => {
-                                for done in
-                                    album_sweep(&name, &mut album, tokio::time::Instant::now())
-                                {
-                                    if emit_or_stop(&writer, &stopper, &name, &mut album, done).await? {
+                            Tick::StopRequested => {
+                                // The stop decision already spent the count
+                                // budget (or hit the boundary), so these rows
+                                // are written directly: re-entering the
+                                // stopper would veto them (see the deadline
+                                // arm above).
+                                for done in album_flush(&name, &mut album) {
+                                    if emit_direct(&writer, &stopper, &name, done).await? {
                                         return Ok(());
                                     }
+                                }
+                                break;
+                            }
+                            Tick::AlbumDue => {
+                                let swept: Vec<serde_json::Value> =
+                                    album_sweep(&name, &mut album, tokio::time::Instant::now());
+                                if emit_due_albums(&writer, &stopper, &name, &mut album, swept)
+                                    .await?
+                                {
+                                    return Ok(());
                                 }
                                 continue;
                             }
@@ -955,7 +1043,7 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 // album members are written directly so a
                                 // spent count budget cannot drop them.
                                 for done in album_flush(&name, &mut album) {
-                                    if emit_direct(&writer, &name, done).await? {
+                                    if emit_direct(&writer, &stopper, &name, done).await? {
                                         return Ok(());
                                     }
                                 }
@@ -963,7 +1051,9 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                     &name,
                                     crate::error::invocation_error(e),
                                     &mut failures,
+                                    connected_at.elapsed(),
                                     deadline,
+                                    Some(&stopper),
                                     MAX_RECONNECT_ATTEMPTS,
                                 )
                                 .await?;
@@ -1303,6 +1393,9 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         }
     }
     writer.finish().await;
+    if until.is_some() && stopper.time_up() {
+        output::log_line("info", "listen --until reached");
+    }
     if timeout_secs > 0 {
         output::log_line("info", "listen timeout reached");
     }
@@ -1498,11 +1591,12 @@ fn stream_row_line(value: &serde_json::Value) -> TeleResult<String> {
 }
 
 #[derive(Default)]
-struct StreamStopper {
+pub(crate) struct StreamStopper {
     remaining: std::sync::Mutex<Option<u64>>,
     until: std::sync::Mutex<Option<std::time::Instant>>,
     until_date: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     stopped: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 impl StreamStopper {
@@ -1516,12 +1610,34 @@ impl StreamStopper {
             until: std::sync::Mutex::new(until),
             until_date: std::sync::Mutex::new(until_date),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
         }
     }
 
     fn request_stop(&self) {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Sleep until the run is over: `request_stop()` from another account or
+    /// the `--until` wall-clock deadline.
+    ///
+    /// `notified()` snapshots the `notify_waiters` counter when it is created
+    /// (tokio 1.54 `Notify::notified`), so a stop requested before the first
+    /// poll is still observed. The 500ms poll bounds `time_up()`, which has no
+    /// store to notify about.
+    async fn wait_for_stop(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.stop_requested() || self.time_up() {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
+            }
+        }
     }
 
     fn stop_requested(&self) -> bool {
@@ -1632,6 +1748,9 @@ async fn emit_row_or_stop(
         return Ok(true);
     }
     let last = match stopper.reserve() {
+        // A budget spent by another account stops only this account. The
+        // spender's write can still be dropped (a stalled stdout releases the
+        // slot), so an observer must not make the stop permanent.
         CountSlot::Exhausted => return Ok(true),
         CountSlot::Reserved { last } => last,
     };
@@ -1641,19 +1760,47 @@ async fn emit_row_or_stop(
             stopper.release();
             return Ok(false);
         }
-        Err(e) if matches!(e, TeleError::Usage(_)) => return Err(e),
-        Err(e) if emit_stops_stream(&e) => return Ok(true),
         Err(e) => {
-            // stdout is unusable: stop instead of logging once per row.
-            output::log_line("error", &format!("{account}: emit failed: {}", e.message()));
-            return Ok(true);
+            return match on_emit_failure(stopper, account, &e) {
+                EmitFailure::Usage => Err(e),
+                EmitFailure::Stop => Ok(true),
+            };
         }
     }
     if last {
+        // The count budget is shared: without the broadcast the accounts
+        // that never saw an event stay parked on their next poll (up to 1h).
+        stopper.request_stop();
         output::log_line("info", "listen --count reached");
         return Ok(true);
     }
     Ok(false)
+}
+
+enum EmitFailure {
+    Usage,
+    Stop,
+}
+
+fn on_emit_failure(stopper: &StreamStopper, account: &str, err: &TeleError) -> EmitFailure {
+    // The row never reached stdout, so the slot must go back: other accounts
+    // keep streaming and must still emit the full --count.
+    stopper.release();
+    if matches!(err, TeleError::Usage(_)) {
+        // One account's bad projection must not end the run.
+        return EmitFailure::Usage;
+    }
+    // The broadcast is what wakes accounts parked on a quiet stream; without
+    // it they sit on their next poll (up to an hour) on a dead stdout.
+    stopper.request_stop();
+    if !emit_stops_stream(err) {
+        // stdout is unusable: stop instead of logging once per row.
+        output::log_line(
+            "error",
+            &format!("{account}: emit failed: {}", err.message()),
+        );
+    }
+    EmitFailure::Stop
 }
 
 fn emit_stops_stream(err: &TeleError) -> bool {
@@ -1672,13 +1819,18 @@ pub(crate) async fn handle_stream_failure(
     account: &str,
     err: TeleError,
     failures: &mut u32,
+    stream_uptime: std::time::Duration,
     deadline: Option<std::time::Instant>,
+    stopper: Option<&StreamStopper>,
     max_attempts: u32,
 ) -> TeleResult<()> {
     if is_auth_error(&err) {
         return Err(err);
     }
-    *failures = on_failure(*failures);
+    if stopper.is_some_and(|s| s.stop_requested() || s.time_up()) {
+        return Ok(());
+    }
+    *failures = on_failure(streak_before_failure(*failures, stream_uptime));
     if *failures > max_attempts {
         return Err(match err {
             TeleError::Rpc(msg, code, name, seconds) => TeleError::Rpc(
@@ -1718,7 +1870,18 @@ pub(crate) async fn handle_stream_failure(
             &err.message(),
         ),
     );
-    tokio::time::sleep(sleep_for).await;
+    match stopper {
+        Some(stopper) => {
+            // A backoff or FloodWait sleep must not outlive a stop that another
+            // account's last row already triggered; without this the run stays
+            // alive for the whole wait (FloodWait can be an hour).
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => {}
+                _ = stopper.wait_for_stop() => {}
+            }
+        }
+        None => tokio::time::sleep(sleep_for).await,
+    }
     Ok(())
 }
 
@@ -1802,6 +1965,20 @@ fn reconnect_allowed(consecutive_failures: u32) -> bool {
 
 fn on_failure(failures: u32) -> u32 {
     failures + 1
+}
+
+// A connection that stayed up for a minute was healthy; its later death is a
+// new outage, not another consecutive connect failure. Without this, a quiet
+// account accumulates one failure per network blip over days and gives up
+// while it is serving fine.
+const HEALTHY_STREAM_UPTIME: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn streak_before_failure(failures: u32, stream_uptime: std::time::Duration) -> u32 {
+    if stream_uptime >= HEALTHY_STREAM_UPTIME {
+        0
+    } else {
+        failures
+    }
 }
 
 /// An established connection is not proof the stream works: a stream that
@@ -2272,7 +2449,11 @@ mod tests;
 
 #[cfg(test)]
 mod stopper_tests {
-    use super::{CountSlot, ListenWriter, StreamStopper};
+    use super::{
+        album_ingest, emit_due_albums, emit_row_or_stop, handle_stream_failure, on_emit_failure,
+        AlbumBuffer, CountSlot, EmitFailure, ListenWriter, StreamStopper,
+    };
+    use crate::error::TeleError;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -2479,7 +2660,16 @@ mod stopper_tests {
         let deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
         let mut failures = 0u32;
         let start = std::time::Instant::now();
-        let out = super::handle_stream_failure("probe", flood, &mut failures, deadline, 5).await;
+        let out = super::handle_stream_failure(
+            "probe",
+            flood,
+            &mut failures,
+            std::time::Duration::ZERO,
+            deadline,
+            None,
+            5,
+        )
+        .await;
         assert!(
             out.is_err(),
             "must surface FloodWait, not retry while banned"
@@ -2500,7 +2690,16 @@ mod stopper_tests {
         );
         let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
         let mut failures = 0u32;
-        let out = super::handle_stream_failure("probe", flood, &mut failures, deadline, 5).await;
+        let out = super::handle_stream_failure(
+            "probe",
+            flood,
+            &mut failures,
+            std::time::Duration::ZERO,
+            deadline,
+            None,
+            5,
+        )
+        .await;
         assert!(out.is_ok());
         assert_eq!(failures, 1);
     }
@@ -2515,6 +2714,95 @@ mod stopper_tests {
             .unwrap());
         writer.finish().await;
         assert!(sink.lines().is_empty());
+    }
+
+    #[tokio::test]
+    async fn consuming_the_last_count_slot_shares_the_stop() {
+        // Regression: the account that emitted the Nth row returned without
+        // telling the stopper, so every other account parked on its next
+        // poll (up to 1h) instead of ending with the run.
+        let stopper = StreamStopper::new(Some(1), None, None);
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
+        let row = serde_json::json!({"event": "NewMessage"});
+        assert!(super::emit_row_or_stop(&writer, &stopper, "work", row)
+            .await
+            .unwrap());
+        assert!(
+            stopper.stop_requested(),
+            "a spent --count budget must request a stop so parked accounts wake"
+        );
+        writer.finish().await;
+        assert_eq!(sink.lines().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_already_spent_count_budget_stops_the_account_without_making_the_stop_permanent() {
+        // The account that reserved the last slot can lose its write to a
+        // dropped emit, which gives the slot back. An observer that saw
+        // Exhausted must therefore stop itself without broadcasting a stop
+        // that would end the run with the budget unspent.
+        let stopper = StreamStopper::new(Some(0), None, None);
+        let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
+        let row = serde_json::json!({"event": "NewMessage"});
+        assert!(super::emit_row_or_stop(&writer, &stopper, "work", row)
+            .await
+            .unwrap());
+        assert!(
+            !stopper.stop_requested(),
+            "an observer of an exhausted budget must not make the stop permanent"
+        );
+        writer.finish().await;
+        assert!(sink.lines().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_stop_returns_promptly_after_a_request_from_another_task() {
+        let stopper = Arc::new(StreamStopper::new(None, None, None));
+        let waker = {
+            let stopper = Arc::clone(&stopper);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                stopper.request_stop();
+            })
+        };
+        let start = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stopper.wait_for_stop())
+            .await
+            .expect("request_stop must wake a parked wait_for_stop");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(400),
+            "the notify must wake the wait before the 500ms fallback poll; woke in {:?}",
+            start.elapsed()
+        );
+        waker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_stop_returns_when_the_until_deadline_passes() {
+        // No store happens when a wall-clock deadline expires, so only the
+        // bounded poll inside wait_for_stop can observe it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let stopper = StreamStopper::new(None, Some(deadline), None);
+        let start = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stopper.wait_for_stop())
+            .await
+            .expect("an expiring --until deadline must end the wait");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(40),
+            "a future deadline must actually be waited for, not returned from at entry: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_millis(1500),
+            "the 500ms poll bounds the deadline latency, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn no_deadline_and_no_stop_means_time_is_not_up() {
+        let stopper = StreamStopper::new(None, None, None);
+        assert!(!stopper.time_up());
+        assert!(!stopper.stop_requested());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2677,5 +2965,176 @@ mod stopper_tests {
             1,
             "the loss must ride along with the next written row"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_broken_stdout_releases_the_slot_and_wakes_parked_accounts() {
+        // Regression: the emit-error arms returned before the last-slot
+        // broadcast, so a broken pipe spent the count budget with no wake-up
+        // and quiet accounts stayed parked for up to an hour.
+        let _lock = quiet_fields();
+        let stopper = StreamStopper::new(Some(3), None, None);
+        let writer =
+            super::spawn_writer(|| BrokenPipeSink, 1, std::time::Duration::from_millis(200));
+        let mut stopped = false;
+        for _ in 0..64 {
+            if emit_row_or_stop(
+                &writer,
+                &stopper,
+                "acct",
+                serde_json::json!({"event": "NewMessage"}),
+            )
+            .await
+            .expect("a broken pipe is not a usage error")
+            {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "the emit failure must stop the stream");
+        assert!(
+            stopper.stop_requested(),
+            "a dead stdout must broadcast a stop so parked accounts wake"
+        );
+        assert!(
+            matches!(stopper.reserve(), CountSlot::Reserved { .. }),
+            "the failed row's slot must be returned, not silently spent"
+        );
+        writer.finish().await;
+    }
+
+    #[test]
+    fn a_usage_emit_failure_releases_the_reserved_slot_without_stopping_the_run() {
+        // Regression: a row that failed --fields projection had already spent
+        // a slot, so the run could emit fewer than --count rows, and the
+        // failure also stopped every other account.
+        let stopper = StreamStopper::new(Some(1), None, None);
+        let failure = on_emit_failure(
+            &stopper,
+            "acct",
+            &TeleError::Usage("unknown --fields path".to_string()),
+        );
+        assert!(matches!(failure, EmitFailure::Usage));
+        assert!(
+            !stopper.stop_requested(),
+            "one account's projection failure must not end the run"
+        );
+        assert!(
+            matches!(stopper.reserve(), CountSlot::Reserved { .. }),
+            "the row never reached stdout, so its slot must be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_interrupts_the_reconnect_backoff_sleep() {
+        // Regression: a finite run waited out the whole backoff (or FloodWait,
+        // up to an hour) after another account had already ended the stream.
+        let stopper = Arc::new(StreamStopper::new(None, None, None));
+        let requester = Arc::clone(&stopper);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            requester.request_stop();
+        });
+        let mut failures = 0u32;
+        let start = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_stream_failure(
+                "acct",
+                TeleError::Other("boom".into()),
+                &mut failures,
+                std::time::Duration::ZERO,
+                None,
+                Some(&stopper),
+                5,
+            ),
+        )
+        .await
+        .expect("a stop must end the backoff sleep")
+        .expect("a stop is not a failure");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(400),
+            "the backoff sleep was not interrupted: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_healthy_connection_restarts_the_failure_streak() {
+        // Regression: after the connect-time reset was removed, a quiet
+        // account that reconnected healthily five times over days still gave
+        // up because only a consumed update reset the streak.
+        let mut failures = 4u32;
+        handle_stream_failure(
+            "acct",
+            TeleError::Other("boom".into()),
+            &mut failures,
+            std::time::Duration::from_secs(61),
+            Some(std::time::Instant::now()),
+            None,
+            5,
+        )
+        .await
+        .expect("a failure after a healthy connection is not the fifth consecutive one");
+        assert_eq!(
+            failures, 1,
+            "the streak must restart after a connection that stayed up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_lived_connection_still_counts_as_a_consecutive_failure() {
+        let mut failures = 4u32;
+        handle_stream_failure(
+            "acct",
+            TeleError::Other("boom".into()),
+            &mut failures,
+            std::time::Duration::from_secs(1),
+            Some(std::time::Instant::now()),
+            None,
+            5,
+        )
+        .await
+        .expect("the fifth consecutive failure still reconnects");
+        assert_eq!(
+            failures, 5,
+            "a connection that dies immediately must not reset the streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_mid_sweep_writes_due_rows_before_pending_albums() {
+        // The sweep removed the due rows in deadline order; flushing the
+        // buffer's later-deadline albums first inverted the output order.
+        let stopper = StreamStopper::new(Some(1), None, None);
+        let (writer, sink) = test_writer(8, std::time::Duration::from_millis(200));
+        let mut album = AlbumBuffer::new();
+        album_ingest(
+            "work",
+            &mut album,
+            serde_json::json!({"id": 99}),
+            7,
+            70,
+            tokio::time::Instant::now(),
+        );
+        let swept = vec![
+            serde_json::json!({"event": "NewMessage", "n": 1}),
+            serde_json::json!({"event": "NewMessage", "n": 2}),
+        ];
+        let stopped = emit_due_albums(&writer, &stopper, "work", &mut album, swept)
+            .await
+            .unwrap();
+        assert!(stopped);
+        writer.finish().await;
+        let rows: Vec<serde_json::Value> = sink
+            .lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3, "no swept or buffered row may vanish");
+        assert_eq!(rows[0]["n"], 1, "first due row");
+        assert_eq!(rows[1]["n"], 2, "second due row before any pending album");
+        assert_eq!(rows[2]["event"], "Album", "pending album last");
     }
 }

@@ -14,6 +14,7 @@ use crate::commands::listen::{
 use crate::error::{TeleError, TeleResult, EXIT_OK};
 use crate::executor::GlobalFlags;
 use crate::output;
+
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -1656,6 +1657,8 @@ async fn account_task(
                         &name,
                         TeleError::from(e),
                         &mut failures,
+                        std::time::Duration::ZERO,
+                        None,
                         None,
                         SERVE_MAX_RECONNECT_ATTEMPTS,
                     )
@@ -1700,6 +1703,8 @@ async fn account_task(
                 &name,
                 err,
                 &mut failures,
+                std::time::Duration::ZERO,
+                None,
                 None,
                 SERVE_MAX_RECONNECT_ATTEMPTS,
             )
@@ -1739,6 +1744,7 @@ async fn account_task(
                 return;
             }
         };
+        let connected_at = std::time::Instant::now();
         let shares = guard.shares();
         pool.publish(&name, shares);
         if greeted {
@@ -1755,7 +1761,6 @@ async fn account_task(
                 .await;
         }
         greeted = true;
-        failures = 0;
         loop {
             enum Tick {
                 Update(Box<Update>),
@@ -1783,6 +1788,8 @@ async fn account_task(
                         &name,
                         crate::error::invocation_error(e),
                         &mut failures,
+                        connected_at.elapsed(),
+                        None,
                         None,
                         SERVE_MAX_RECONNECT_ATTEMPTS,
                     )
@@ -1795,6 +1802,9 @@ async fn account_task(
                     break;
                 }
                 Tick::Update(update) => {
+                    // A connect is not proof the stream works: a connect-then-drop loop
+                    // must still reach the give-up limit.
+                    failures = 0;
                     if let Err(e) = stream.sync_update_state().await {
                         output::log_line("warn", &format!("serve: sync_update_state failed: {e}"));
                     }
@@ -3790,7 +3800,9 @@ mod tests {
                 "acct",
                 TeleError::Other("boom".into()),
                 &mut failures,
+                std::time::Duration::ZERO,
                 Some(std::time::Instant::now()),
+                None,
                 SERVE_MAX_RECONNECT_ATTEMPTS,
             )
             .await;
@@ -3806,7 +3818,9 @@ mod tests {
             "acct",
             TeleError::Other("boom".into()),
             &mut failures,
+            std::time::Duration::ZERO,
             Some(std::time::Instant::now()),
+            None,
             SERVE_MAX_RECONNECT_ATTEMPTS,
         )
         .await

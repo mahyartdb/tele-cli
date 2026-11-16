@@ -1124,6 +1124,38 @@ async fn album_sweep_respects_per_entry_deadlines() {
     assert!(buf.is_empty());
 }
 
+#[test]
+fn swept_after_stop_keeps_every_row_the_stop_did_not_consume() {
+    // Regression: on stop, rows the sweep had already removed from the
+    // buffer were dropped silently — received off the wire but emitted
+    // neither as an Album row nor as a NewMessage row.
+    let swept = vec![
+        member_row(1, 456, 9001),
+        member_row(2, 456, 9001),
+        member_row(3, 456, 9001),
+    ];
+    let rest = swept_after_stop(&swept, 1);
+    let ids: Vec<i32> = rest
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap() as i32)
+        .collect();
+    assert_eq!(ids, vec![3], "only the stop trigger itself is excluded");
+    assert!(
+        swept_after_stop(&swept, 2).is_empty(),
+        "nothing after the last row"
+    );
+    assert_eq!(swept_after_stop(&swept, 0).len(), 2);
+    assert!(
+        swept_after_stop(&[], 0).is_empty(),
+        "an empty sweep has no remainder"
+    );
+    let out_of_range = swept.len() + 5;
+    assert!(
+        swept_after_stop(&swept, out_of_range).is_empty(),
+        "an out-of-range stop index must not panic"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn album_buffer_cap_evicts_oldest_and_flushes_it() {
     let mut buf = AlbumBuffer::new();

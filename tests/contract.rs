@@ -1083,6 +1083,58 @@ fn listen_dry_run_respects_configured_events() {
 }
 
 #[test]
+fn listen_count_zero_exits_without_connecting_or_emitting() {
+    // The zero-row goal is already met before any connect; the run must not
+    // park on an event that can never be counted (there may be no --timeout).
+    let dir = isolated_appdir("lscount0");
+    write_session(&dir, "ghost");
+    let mut child = tele()
+        .args([
+            "--allow-insecure-app-dir",
+            "listen",
+            "--account",
+            "ghost",
+            "--count",
+            "0",
+            "--json",
+        ])
+        .env("TELE_APP_DIR", &dir)
+        .env_remove("TELE_API_ID")
+        .env_remove("TELE_API_HASH")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn telecli listen --count 0");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait().expect("poll listen --count 0") {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("listen --count 0 must exit instead of waiting for an event; still running after 10s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .expect("collect listen --count 0 output");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "--count 0 must emit no rows, got: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn msg_delete_requires_ids_unless_all() {
     let (code, _out, err) = run_isolated("delnone", &["msg", "delete", "--chat", "me"]);
     assert_eq!(code, 1);
