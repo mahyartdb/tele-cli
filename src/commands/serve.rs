@@ -1657,11 +1657,7 @@ async fn account_task(
                         &name,
                         TeleError::from(e),
                         &mut failures,
-                        StreamFailureCtx {
-                            stream_uptime: std::time::Duration::ZERO,
-                            deadline: None,
-                            stopper: None,
-                        },
+                        StreamFailureCtx::before_connect(None, None),
                         SERVE_MAX_RECONNECT_ATTEMPTS,
                     )
                     .await
@@ -1705,11 +1701,7 @@ async fn account_task(
                 &name,
                 err,
                 &mut failures,
-                StreamFailureCtx {
-                    stream_uptime: std::time::Duration::ZERO,
-                    deadline: None,
-                    stopper: None,
-                },
+                StreamFailureCtx::before_connect(None, None),
                 SERVE_MAX_RECONNECT_ATTEMPTS,
             )
             .await
@@ -1792,11 +1784,7 @@ async fn account_task(
                         &name,
                         crate::error::invocation_error(e),
                         &mut failures,
-                        StreamFailureCtx {
-                            stream_uptime: connected_at.elapsed(),
-                            deadline: None,
-                            stopper: None,
-                        },
+                        StreamFailureCtx::live(connected_at.elapsed(), None, None),
                         SERVE_MAX_RECONNECT_ATTEMPTS,
                     )
                     .await
@@ -3805,11 +3793,7 @@ mod tests {
                 "acct",
                 TeleError::Other("boom".into()),
                 &mut failures,
-                StreamFailureCtx {
-                    stream_uptime: std::time::Duration::ZERO,
-                    deadline: Some(std::time::Instant::now()),
-                    stopper: None,
-                },
+                StreamFailureCtx::before_connect(Some(std::time::Instant::now()), None),
                 SERVE_MAX_RECONNECT_ATTEMPTS,
             )
             .await;
@@ -3825,11 +3809,7 @@ mod tests {
             "acct",
             TeleError::Other("boom".into()),
             &mut failures,
-            StreamFailureCtx {
-                stream_uptime: std::time::Duration::ZERO,
-                deadline: Some(std::time::Instant::now()),
-                stopper: None,
-            },
+            StreamFailureCtx::before_connect(Some(std::time::Instant::now()), None),
             SERVE_MAX_RECONNECT_ATTEMPTS,
         )
         .await
