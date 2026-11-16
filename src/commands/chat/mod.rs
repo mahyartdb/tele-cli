@@ -2721,31 +2721,7 @@ pub(crate) async fn chat_invite_core(
                     .map_err(tele_invocation)?;
                 vec![exported_invite_row(&r)]
             } else {
-                let link = plan.link.clone().unwrap_or_default();
-                let plan = invite::resolved_edit_plan(
-                    &plan,
-                    invite::fetch_current_invite(
-                        &shares.client,
-                        &shares.rate_limiter,
-                        &peer,
-                        &link,
-                    ),
-                )
-                .await?;
-                let r: tl::enums::messages::ExportedChatInvite = shares
-                    .client
-                    .invoke(&tl::functions::messages::EditExportedChatInvite {
-                        revoked: plan.revoked,
-                        peer,
-                        link,
-                        expire_date: plan.expire_date,
-                        usage_limit: plan.usage_limit,
-                        request_needed: plan.request_needed,
-                        title: plan.title.clone(),
-                    })
-                    .await
-                    .map_err(tele_invocation)?;
-                exported_invite_result_rows(&r)
+                invite::edit_invite_link(&shares.client, &shares.rate_limiter, peer, &plan).await?
             };
             Ok(serde_json::json!({"links": rows}))
         }

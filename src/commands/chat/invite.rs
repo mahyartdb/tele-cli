@@ -183,26 +183,7 @@ pub(crate) async fn invite(args: InviteArgs, flags: &GlobalFlags) -> TeleResult<
                             .map_err(tele_invocation)?;
                         vec![exported_invite_row(&r)]
                     } else {
-                        let link = plan.link.clone().unwrap_or_default();
-                        let plan = resolved_edit_plan(
-                            &plan,
-                            fetch_current_invite(&guard.client, &guard.rate_limiter, &peer, &link),
-                        )
-                        .await?;
-                        let r: tl::enums::messages::ExportedChatInvite = guard
-                            .client
-                            .invoke(&tl::functions::messages::EditExportedChatInvite {
-                                revoked: plan.revoked,
-                                peer,
-                                link,
-                                expire_date: plan.expire_date,
-                                usage_limit: plan.usage_limit,
-                                request_needed: plan.request_needed,
-                                title: plan.title.clone(),
-                            })
-                            .await
-                            .map_err(tele_invocation)?;
-                        exported_invite_result_rows(&r)
+                        edit_invite_link(&guard.client, &guard.rate_limiter, peer, &plan).await?
                     };
                     if !output::machine_mode(json, jsonl) {
                         print_invite_link_table(&name, multi, &rows)?;
@@ -380,7 +361,11 @@ pub(crate) fn invite_edit_merge(
 ) -> ValidatedInvite {
     let mut resolved = plan.clone();
     if resolved.expire_date.is_none() {
-        resolved.expire_date = current.expire_date;
+        // An already-expired link cannot be used; sending its stale expiry on
+        // an edit can make the server reject an otherwise valid title change.
+        resolved.expire_date = current
+            .expire_date
+            .filter(|date| i64::from(*date) > chrono::Utc::now().timestamp());
     }
     if resolved.usage_limit.is_none() {
         resolved.usage_limit = current.usage_limit;
@@ -445,6 +430,33 @@ where
                 .to_string(),
         )),
     }
+}
+
+pub(crate) async fn edit_invite_link(
+    client: &grammers_client::Client,
+    rate_limiter: &crate::rate_limiter::RateLimiter,
+    peer: tl::enums::InputPeer,
+    plan: &ValidatedInvite,
+) -> TeleResult<Vec<serde_json::Value>> {
+    let link = plan.link.clone().unwrap_or_default();
+    let resolved = resolved_edit_plan(
+        plan,
+        fetch_current_invite(client, rate_limiter, &peer, &link),
+    )
+    .await?;
+    let r: tl::enums::messages::ExportedChatInvite = client
+        .invoke(&tl::functions::messages::EditExportedChatInvite {
+            revoked: resolved.revoked,
+            peer,
+            link,
+            expire_date: resolved.expire_date,
+            usage_limit: resolved.usage_limit,
+            request_needed: resolved.request_needed,
+            title: resolved.title.clone(),
+        })
+        .await
+        .map_err(tele_invocation)?;
+    Ok(exported_invite_result_rows(&r))
 }
 
 pub(crate) fn invite_dry_run_payload(chat: &str, plan: &ValidatedInvite) -> serde_json::Value {

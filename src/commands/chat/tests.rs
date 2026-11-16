@@ -1142,6 +1142,21 @@ fn invite_edit_merge_prefills_everything_unset_from_current() {
 }
 
 #[test]
+fn invite_edit_merge_does_not_prefill_an_expired_date() {
+    let resolved = invite_edit_merge(
+        &current_export(Some(1), Some(5), true, Some("old".to_string())),
+        &ValidatedInvite {
+            mode: InviteMode::Edit,
+            revoked: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(resolved.expire_date, None);
+    assert_eq!(resolved.usage_limit, Some(5));
+    assert_eq!(resolved.title.as_deref(), Some("old"));
+}
+
+#[test]
 fn invite_edit_merge_plan_wins_over_current() {
     let resolved = invite_edit_merge(
         &current_export(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
@@ -1277,7 +1292,12 @@ async fn prefill_fetch_merges_omitted_fields() {
     };
     let fetched =
         tl::enums::messages::ExportedChatInvite::Invite(tl::types::messages::ExportedChatInvite {
-            invite: current_invite(Some(123), Some(10), false, Some("old".to_string())),
+            invite: current_invite(
+                Some(1_900_000_000),
+                Some(10),
+                false,
+                Some("old".to_string()),
+            ),
             users: Vec::new(),
         });
     let resolved = resolved_edit_plan(&plan, async { Ok(fetched) })
@@ -1285,7 +1305,7 @@ async fn prefill_fetch_merges_omitted_fields() {
         .expect("partial edit prefills omitted fields");
     assert_eq!(resolved.title.as_deref(), Some("new"));
     assert_eq!(resolved.usage_limit, Some(10));
-    assert_eq!(resolved.expire_date, Some(123));
+    assert_eq!(resolved.expire_date, Some(1_900_000_000));
     assert_eq!(resolved.request_needed, Some(false));
 }
 
