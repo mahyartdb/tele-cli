@@ -754,19 +754,24 @@ fn on_failure_increments_consecutive_counter() {
 }
 
 #[test]
-fn on_reconnect_success_resets_counter_to_zero() {
-    assert_eq!(on_reconnect_success(0), 0);
-    assert_eq!(on_reconnect_success(3), 0);
-    assert_eq!(on_reconnect_success(MAX_RECONNECT_ATTEMPTS + 1), 0);
+fn streak_after_update_resets_only_for_a_non_empty_update() {
+    assert_eq!(streak_after_update(0, false), 0);
+    assert_eq!(streak_after_update(3, false), 0);
+    assert_eq!(streak_after_update(MAX_RECONNECT_ATTEMPTS + 1, false), 0);
+    assert_eq!(
+        streak_after_update(3, true),
+        3,
+        "an empty update is a tombstone, not delivery"
+    );
 }
 
 #[test]
-fn failure_then_reconnect_success_cycle_never_gives_up() {
+fn failure_then_non_empty_update_cycle_never_gives_up() {
     let mut failures = 0;
     for _ in 0..10 {
         failures = on_failure(failures);
         assert!(reconnect_allowed(failures));
-        failures = on_reconnect_success(failures);
+        failures = streak_after_update(failures, false);
         assert_eq!(failures, 0);
     }
 }

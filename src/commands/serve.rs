@@ -8,8 +8,8 @@ use std::pin::Pin;
 
 use crate::client::ServeShares;
 use crate::commands::listen::{
-    event_row, getstate_probe_error, handle_stream_failure, is_empty_update, on_reconnect_success,
-    poll_timeout, update_peer, StreamFailureCtx,
+    event_row, getstate_probe_error, handle_stream_failure, is_empty_update, poll_timeout,
+    streak_after_update, update_peer, StreamFailureCtx,
 };
 use crate::error::{TeleError, TeleResult, EXIT_OK};
 use crate::executor::GlobalFlags;
@@ -1811,13 +1811,11 @@ async fn account_task(
                     if let Err(e) = stream.sync_update_state().await {
                         output::log_line("warn", &format!("serve: sync_update_state failed: {e}"));
                     }
-                    if is_empty_update(update.raw()) {
+                    let empty = is_empty_update(update.raw());
+                    failures = streak_after_update(failures, empty);
+                    if empty {
                         continue;
                     }
-                    // A connect is not proof the stream works: only a
-                    // delivered, non-empty update resets the streak, so a
-                    // connect-then-drop loop still reaches the give-up limit.
-                    failures = on_reconnect_success(failures);
                     let Some(kind) = event_kind_allowed(&update, &events) else {
                         continue;
                     };

@@ -1083,7 +1083,7 @@ fn listen_dry_run_respects_configured_events() {
 }
 
 #[test]
-fn listen_count_zero_exits_without_connecting_or_emitting() {
+fn listen_count_zero_exits_without_rows() {
     // The zero-row goal is already met before any connect; the run must not
     // park on an event that can never be counted (there may be no --timeout).
     let dir = isolated_appdir("lscount0");

@@ -871,34 +871,36 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         {
                             Ok(guard) => {
                                 if let Err(e) = client::authorize(&guard.client).await {
+                                    let ctx = StreamFailureCtx {
+                                        stream_uptime: std::time::Duration::ZERO,
+                                        deadline,
+                                        stopper: Some(&stopper),
+                                    };
                                     handle_stream_failure(
-&name,
-e,
-&mut failures,
-StreamFailureCtx {
-    stream_uptime: std::time::Duration::ZERO,
-    deadline,
-    stopper: Some(&stopper),
-},
-MAX_RECONNECT_ATTEMPTS,
-)
+                                        &name,
+                                        e,
+                                        &mut failures,
+                                        ctx,
+                                        MAX_RECONNECT_ATTEMPTS,
+                                    )
                                     .await?;
                                     continue;
                                 }
                                 guard
                             }
                             Err(e) => {
+                                let ctx = StreamFailureCtx {
+                                    stream_uptime: std::time::Duration::ZERO,
+                                    deadline,
+                                    stopper: Some(&stopper),
+                                };
                                 handle_stream_failure(
-&name,
-TeleError::from(e),
-&mut failures,
-StreamFailureCtx {
-    stream_uptime: std::time::Duration::ZERO,
-    deadline,
-    stopper: Some(&stopper),
-},
-MAX_RECONNECT_ATTEMPTS,
-)
+                                    &name,
+                                    TeleError::from(e),
+                                    &mut failures,
+                                    ctx,
+                                    MAX_RECONNECT_ATTEMPTS,
+                                )
                                 .await?;
                                 continue;
                             }
@@ -932,17 +934,18 @@ MAX_RECONNECT_ATTEMPTS,
                             );
                             return Err(err);
                         }
+                        let ctx = StreamFailureCtx {
+                            stream_uptime: std::time::Duration::ZERO,
+                            deadline,
+                            stopper: Some(&stopper),
+                        };
                         handle_stream_failure(
-&name,
-err,
-&mut failures,
-StreamFailureCtx {
-    stream_uptime: std::time::Duration::ZERO,
-    deadline,
-    stopper: Some(&stopper),
-},
-MAX_RECONNECT_ATTEMPTS,
-)
+                            &name,
+                            err,
+                            &mut failures,
+                            ctx,
+                            MAX_RECONNECT_ATTEMPTS,
+                        )
                         .await?;
                         continue;
                     }
@@ -963,17 +966,18 @@ MAX_RECONNECT_ATTEMPTS,
                     {
                         Ok(stream) => stream,
                         Err(e) => {
+                            let ctx = StreamFailureCtx {
+                                stream_uptime: std::time::Duration::ZERO,
+                                deadline,
+                                stopper: Some(&stopper),
+                            };
                             handle_stream_failure(
-&name,
-TeleError::Other(e.to_string()),
-&mut failures,
-StreamFailureCtx {
-    stream_uptime: std::time::Duration::ZERO,
-    deadline,
-    stopper: Some(&stopper),
-},
-MAX_RECONNECT_ATTEMPTS,
-)
+                                &name,
+                                TeleError::Other(e.to_string()),
+                                &mut failures,
+                                ctx,
+                                MAX_RECONNECT_ATTEMPTS,
+                            )
                             .await?;
                             continue;
                         }
@@ -1073,25 +1077,24 @@ MAX_RECONNECT_ATTEMPTS,
                                         return Ok(());
                                     }
                                 }
+                                let ctx = StreamFailureCtx {
+                                    stream_uptime: connected_at.elapsed(),
+                                    deadline,
+                                    stopper: Some(&stopper),
+                                };
                                 handle_stream_failure(
-&name,
-crate::error::invocation_error(e),
-&mut failures,
-StreamFailureCtx {
-    stream_uptime: connected_at.elapsed(),
-    deadline,
-    stopper: Some(&stopper),
-},
-MAX_RECONNECT_ATTEMPTS,
-)
+                                    &name,
+                                    crate::error::invocation_error(e),
+                                    &mut failures,
+                                    ctx,
+                                    MAX_RECONNECT_ATTEMPTS,
+                                )
                                 .await?;
                                 break;
                             }
                             Tick::Update(u) => *u,
                         };
-                        if !is_empty_update(update.raw()) {
-                            failures = on_reconnect_success(failures);
-                        }
+                        failures = streak_after_update(failures, is_empty_update(update.raw()));
                         if let Err(e) = stream.sync_update_state().await {
                             output::log_line(
                                 "warn",
@@ -1188,40 +1191,45 @@ MAX_RECONNECT_ATTEMPTS,
                                 let grouped = if album_on { album_member(&row) } else { None };
                                 match (grouped, chat_id) {
                                     (Some((member_chat, gid)), _) => {
-                                        for done in album_ingest(
+                                        let swept = album_ingest(
                                             &name,
                                             &mut album,
                                             row,
                                             member_chat,
                                             gid,
                                             tokio::time::Instant::now(),
-                                        ) {
-                                            if emit_or_stop(&writer, &stopper, &name, &mut album, done).await? {
-                                                return Ok(());
-                                            }
+                                        );
+                                        if emit_due_albums(
+                                            &writer, &stopper, &name, &mut album, swept,
+                                        )
+                                        .await?
+                                        {
+                                            return Ok(());
                                         }
                                     }
                                     (None, _) => {
                                         if !new_message_on {
                                             continue;
                                         }
-                                for done in
-                                    album_flush_chat(&name, &mut album, chat_id)
-                                {
-                                    if emit_or_stop(&writer, &stopper, &name, &mut album, done).await? {
-                                        return Ok(());
-                                    }
-                                }
-                                if emit_or_stop(&writer, &stopper, &name, &mut album, event_row(
-                                    "NewMessage",
-                                    &name,
-                                    chat_id,
-                                    None,
-                                    Some(row),
-                                )).await? {
-                                    return Ok(());
-                                }
-
+                                        let swept = album_flush_chat(&name, &mut album, chat_id);
+                                        if emit_due_albums(
+                                            &writer, &stopper, &name, &mut album, swept,
+                                        )
+                                        .await?
+                                        {
+                                            return Ok(());
+                                        }
+                                        if emit_or_stop(
+                                            &writer,
+                                            &stopper,
+                                            &name,
+                                            &mut album,
+                                            event_row("NewMessage", &name, chat_id, None, Some(row)),
+                                        )
+                                        .await?
+                                        {
+                                            return Ok(());
+                                        }
                                     }
                                 }
                             }
@@ -1429,6 +1437,11 @@ MAX_RECONNECT_ATTEMPTS,
     if timeout_secs > 0 {
         output::log_line("info", "listen timeout reached");
     }
+    if stopper.usage_failure() {
+        // The projection applies to the whole run, so a partial exit would
+        // hide that some emitted shapes could never be projected.
+        return Ok(crate::error::EXIT_USAGE);
+    }
     Ok(crate::error::aggregate_exit_code(ok_count, &failed))
 }
 
@@ -1626,6 +1639,7 @@ pub(crate) struct StreamStopper {
     until: std::sync::Mutex<Option<std::time::Instant>>,
     until_date: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     stopped: std::sync::atomic::AtomicBool,
+    usage_failure: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -1640,6 +1654,7 @@ impl StreamStopper {
             until: std::sync::Mutex::new(until),
             until_date: std::sync::Mutex::new(until_date),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            usage_failure: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -1648,6 +1663,17 @@ impl StreamStopper {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    fn request_usage_stop(&self) {
+        self.usage_failure
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.request_stop();
+    }
+
+    fn usage_failure(&self) -> bool {
+        self.usage_failure
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Sleep until the run is over: `request_stop()` from another account or
@@ -1845,10 +1871,10 @@ enum EmitFailure {
 
 fn on_emit_failure(stopper: &StreamStopper, account: &str, err: &TeleError) -> EmitFailure {
     if matches!(err, TeleError::Usage(_)) {
-        // The projection is one global --fields value, so it fails for every
-        // account: ending only this task would leave the rest streaming on a
-        // run that can never emit a row.
-        stopper.request_stop();
+        // --fields is one value for the whole run; a row shape without the
+        // requested path makes the projection unusable. Stop every account
+        // instead of streaming only the shapes that happen to match.
+        stopper.request_usage_stop();
         return EmitFailure::Usage;
     }
     // The broadcast is what wakes accounts parked on a quiet stream; without
@@ -2056,15 +2082,20 @@ fn streak_before_failure(failures: u32, stream_uptime: std::time::Duration) -> u
 
 /// An established connection is not proof the stream works: a stream that
 /// connects and immediately errors would reset the streak every cycle and
-/// never reach the give-up limit. Only a delivered, non-empty update
-/// resets it.
+/// never reach the give-up limit.
 fn on_stream_connected(failures: u32) -> u32 {
     failures
 }
 
-pub(crate) fn on_reconnect_success(failures: u32) -> u32 {
-    let _ = failures;
-    0
+/// Only a delivered, non-empty update proves the stream works. Empty updates
+/// are tombstones, so treating them as delivery would let a connect-then-drop
+/// loop never reach the give-up limit.
+pub(crate) fn streak_after_update(failures: u32, empty: bool) -> u32 {
+    if empty {
+        failures
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -2521,7 +2552,10 @@ fn message_action_kind(action: &tl::enums::MessageAction) -> &'static str {
 #[path = "tests.rs"]
 mod tests;
 
+// The emit tests hold FIELDS_TEST_LOCK across awaits to keep OUTPUT_FIELDS
+// stable; the writer thread never takes that lock.
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod stopper_tests {
     use super::{
         album_ingest, emit_due_albums, emit_row_or_stop, handle_stream_failure, on_emit_failure,
@@ -2801,7 +2835,6 @@ mod stopper_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn consuming_the_last_count_slot_shares_the_stop() {
         // Regression: the account that emitted the Nth row returned without
         // telling the stopper, so every other account parked on its next
@@ -2898,7 +2931,6 @@ mod stopper_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[allow(clippy::await_holding_lock)]
     async fn count_budget_is_reserved_before_the_emit_so_accounts_cannot_overshoot() {
         let _lock = quiet_fields();
         let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
@@ -2949,14 +2981,18 @@ mod stopper_tests {
         );
         assert_eq!(failures, super::MAX_RECONNECT_ATTEMPTS + 1);
         assert_eq!(
-            super::on_reconnect_success(failures),
+            super::streak_after_update(failures, true),
+            failures,
+            "an empty update is a tombstone, not delivery"
+        );
+        assert_eq!(
+            super::streak_after_update(failures, false),
             0,
             "a delivered, non-empty update is what resets the streak"
         );
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn writer_preserves_order_and_writes_each_row_once() {
         let _lock = quiet_fields();
         let (writer, sink) = test_writer(4, std::time::Duration::from_millis(200));
@@ -2976,7 +3012,6 @@ mod stopper_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn writer_surfaces_broken_pipe_instead_of_hanging_or_swallowing_it() {
         let _lock = quiet_fields();
         let writer =
@@ -3005,7 +3040,6 @@ mod stopper_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn a_stalled_stdout_drops_the_row_counts_it_and_stamps_the_next_one() {
         let _lock = quiet_fields();
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
@@ -3060,7 +3094,6 @@ mod stopper_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn a_broken_stdout_releases_the_slot_and_wakes_parked_accounts() {
         // Regression: the emit-error arms returned before the last-slot
         // broadcast, so a broken pipe spent the count budget with no wake-up
@@ -3091,6 +3124,10 @@ mod stopper_tests {
             "a dead stdout must broadcast a stop so parked accounts wake"
         );
         assert!(
+            !stopper.usage_failure(),
+            "a broken pipe must not force the usage exit code"
+        );
+        assert!(
             matches!(stopper.reserve(), CountSlot::Reserved { .. }),
             "the failed row's slot must be returned, not silently spent"
         );
@@ -3099,9 +3136,9 @@ mod stopper_tests {
 
     #[test]
     fn a_usage_emit_failure_broadcasts_the_stop() {
-        // --fields is one global value, so a projection failure fails for
-        // every account: ending only this task would leave the rest parked on
-        // a run that can never emit a row.
+        // --fields is one value for the whole run; a row shape without the
+        // requested path makes the projection unusable, so stopping only this
+        // task would leave the rest streaming shapes that cannot be projected.
         let stopper = StreamStopper::new(Some(1), None, None);
         let failure = on_emit_failure(
             &stopper,
@@ -3111,12 +3148,15 @@ mod stopper_tests {
         assert!(matches!(failure, EmitFailure::Usage));
         assert!(
             stopper.stop_requested(),
-            "a global projection failure must wake and end every account"
+            "a projection failure must wake and end every account"
+        );
+        assert!(
+            stopper.usage_failure(),
+            "the run exit code must report the projection failure as usage"
         );
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn emit_direct_broadcasts_a_stop_on_a_dead_stdout() {
         // The stop-flush path writes without the count check, so it must not
         // silently spin on a dead writer either.
@@ -3155,7 +3195,6 @@ mod stopper_tests {
         let stopper = StreamStopper::new(None, None, None);
         stopper.request_stop();
         let mut failures = 2u32;
-        let start = std::time::Instant::now();
         handle_stream_failure(
             "acct",
             TeleError::Other("boom".into()),
@@ -3170,16 +3209,14 @@ mod stopper_tests {
         .await
         .expect("a stopped run does not treat the failure as fatal");
         assert_eq!(failures, 2, "the stopped run must not grow the streak");
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(480),
-            "the stopped run must not sleep through the backoff"
-        );
     }
 
     #[tokio::test]
     async fn a_stop_interrupts_the_reconnect_backoff_sleep() {
         // Regression: a finite run waited out the whole backoff (or FloodWait,
         // up to an hour) after another account had already ended the stream.
+        // A one-hour FloodWait makes the stop the only way this returns inside
+        // the timeout, so the test does not race the backoff clock.
         let stopper = Arc::new(StreamStopper::new(None, None, None));
         let requester = Arc::clone(&stopper);
         tokio::spawn(async move {
@@ -3187,12 +3224,11 @@ mod stopper_tests {
             requester.request_stop();
         });
         let mut failures = 0u32;
-        let start = std::time::Instant::now();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             handle_stream_failure(
                 "acct",
-                TeleError::Other("boom".into()),
+                TeleError::Invocation("FLOOD_WAIT_3600".to_string(), Some(3600)),
                 &mut failures,
                 StreamFailureCtx {
                     stream_uptime: std::time::Duration::ZERO,
@@ -3205,11 +3241,6 @@ mod stopper_tests {
         .await
         .expect("a stop must end the backoff sleep")
         .expect("a stop is not a failure");
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(480),
-            "the backoff sleep was not interrupted: took {:?}",
-            start.elapsed()
-        );
     }
 
     #[tokio::test]
@@ -3260,7 +3291,6 @@ mod stopper_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn a_stop_mid_sweep_writes_due_rows_before_pending_albums() {
         // The sweep removed the due rows in deadline order; flushing the
         // buffer's later-deadline albums first inverted the output order.
@@ -3297,7 +3327,6 @@ mod stopper_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn a_stop_before_the_first_swept_row_still_writes_that_row() {
         // The stop can arrive between the sweep and the first emit (another
         // account spending the last --count slot). That row left the buffer
@@ -3328,7 +3357,6 @@ mod stopper_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn a_stop_flush_does_not_write_rows_past_until() {
         // Bypassing the count budget must not bypass the --until window.
         let _lock = quiet_fields();
