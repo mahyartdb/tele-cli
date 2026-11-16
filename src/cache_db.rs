@@ -44,16 +44,15 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
 END;
 ";
 
-/// Connections opened in this process, keyed by account.
+/// Connections cached per account.
 ///
 /// The serve and MCP lanes serve many cache requests from one long-lived
 /// process. Re-opening the database, re-running the schema DDL and
 /// re-tightening the file permissions on every request cost more than
-/// the queries themselves, so each account keeps one connection for the
-/// process lifetime. Sharing the handle is safe for concurrency, but a read
-/// issued while another task's write transaction is open sees that
-/// transaction's uncommitted rows — rows a rollback then discards — so
-/// `account_gate` serialises readers against writers.
+/// the queries themselves, so each account keeps the last opened connection
+/// for the process lifetime. A concurrent cold start may open more than one
+/// and drop the loser; SQLite connections do not share transaction state, so
+/// the gate below, not the connection count, is what serialises writes.
 static CONNECTIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, libsql::Connection>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -73,10 +72,12 @@ fn account_gate(account: &str) -> std::sync::Arc<tokio::sync::RwLock<()>> {
     gates.entry(account.to_string()).or_default().clone()
 }
 
+#[cfg(test)]
 /// How many times a database was actually opened (not served from the
 /// connection cache). Used by the tests to prove the cache works.
 static DB_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
 /// How many times an operation reached its per-account gate. Used by the
 /// tests to prove a blocked task really contended on the gate.
 static GATE_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -99,6 +100,7 @@ async fn open_db(account: &str) -> TeleResult<libsql::Connection> {
 }
 
 async fn open_db_uncached(account: &str) -> TeleResult<libsql::Connection> {
+    #[cfg(test)]
     DB_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = cache_dir()?;
     // Directory creation and permission hardening are blocking FS calls; run
@@ -190,6 +192,7 @@ pub async fn store_messages(account: &str, msgs: &[CachedMessage]) -> TeleResult
         return Ok(0);
     }
     let gate = account_gate(account);
+    #[cfg(test)]
     GATE_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _write = gate.write().await;
     let conn = open_db(account).await?;
@@ -233,6 +236,7 @@ pub async fn search_cache(
     limit: u32,
 ) -> TeleResult<Vec<CachedMessage>> {
     let gate = account_gate(account);
+    #[cfg(test)]
     GATE_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _read = gate.read().await;
     let conn = open_db(account).await?;
@@ -729,10 +733,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_write_transaction_leaves_the_connection_usable() {
-        // serve/MCP op timeouts drop the store_messages future mid-batch.
-        // The write transaction must roll back as it drops, so the shared
-        // cached connection is usable immediately — no retry loop.
+    async fn a_dropped_write_transaction_rolls_back() {
+        // This pins the libsql contract that makes a cancelled store_messages
+        // future safe: dropping its Transaction rolls back synchronously, so
+        // the shared cached connection is usable immediately - no retry loop.
+        // The batch-atomicity test covers store_messages itself.
         let _guard = crate::config::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
