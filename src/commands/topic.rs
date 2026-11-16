@@ -447,6 +447,7 @@ pub(crate) async fn topic_list_core(
             let tl::enums::messages::ForumTopics::Topics(topics) = results;
             Ok(ForumTopicsPage {
                 topics: topics.topics,
+                messages: topics.messages,
             })
         })
     }
@@ -469,19 +470,31 @@ struct ForumCursor {
 
 struct ForumTopicsPage {
     topics: Vec<tl::enums::ForumTopic>,
+    messages: Vec<tl::enums::Message>,
 }
 
-fn next_cursor(prev: ForumCursor, page: &[tl::enums::ForumTopic]) -> ForumCursor {
-    for topic in page.iter().rev() {
+fn next_cursor(prev: ForumCursor, page: &ForumTopicsPage) -> ForumCursor {
+    for topic in page.topics.iter().rev() {
         if let tl::enums::ForumTopic::Topic(t) = topic {
             return ForumCursor {
-                date: t.date,
+                date: top_message_date(&page.messages, t.top_message).unwrap_or(t.date),
                 message_id: t.top_message,
                 topic_id: t.id,
             };
         }
     }
     prev
+}
+
+fn top_message_date(messages: &[tl::enums::Message], top_message: i32) -> Option<i32> {
+    messages
+        .iter()
+        .find(|m| m.id() == top_message)
+        .and_then(|m| match m {
+            tl::enums::Message::Empty(_) => None,
+            tl::enums::Message::Message(m) => Some(m.date),
+            tl::enums::Message::Service(m) => Some(m.date),
+        })
 }
 
 async fn collect_forum_topics<F, Fut>(
@@ -505,7 +518,7 @@ where
         }
         let page = fetch(cursor, remaining.min(100)).await?;
         let page_len = page.topics.len();
-        let next = next_cursor(cursor, &page.topics);
+        let next = next_cursor(cursor, &page);
         let stalled = page_len > 0 && next == cursor;
         cursor = next;
         topics.extend(page.topics);
@@ -516,12 +529,12 @@ where
     Ok(topics)
 }
 
-fn validate_emoji(emoji: Option<&str>) -> Result<Option<i64>, TeleError> {
+fn validate_emoji(emoji: Option<&str>) -> TeleResult<()> {
     let Some(emoji) = emoji else {
-        return Ok(None);
+        return Ok(());
     };
-    if let Some(id) = parse_emoji_document_id(emoji) {
-        return Ok(Some(id));
+    if parse_emoji_document_id(emoji).is_some() {
+        return Ok(());
     }
     if emoji.is_empty() {
         return Err(TeleError::Usage(
@@ -538,23 +551,13 @@ fn validate_emoji(emoji: Option<&str>) -> Result<Option<i64>, TeleError> {
         )));
     }
 
-    let bytes = emoji.as_bytes();
-    if bytes.len() != 4 {
-        return Err(TeleError::Usage(format!(
-            "--emoji \"{emoji}\" must be exactly 4 UTF-8 bytes or a custom-emoji document id (got {} bytes)",
-            bytes.len(),
-        )));
-    }
-
     let c = emoji.chars().next().unwrap();
     if !is_emoji_codepoint(c) {
         return Err(TeleError::Usage(format!(
             "--emoji \"{emoji}\" is not a recognized emoji; pass a single-codepoint emoji or a custom-emoji document id"
         )));
     }
-    Ok(Some(i64::from_be_bytes([
-        0, 0, 0, 0, bytes[0], bytes[1], bytes[2], bytes[3],
-    ])))
+    Ok(())
 }
 
 fn parse_emoji_document_id(raw: &str) -> Option<i64> {
@@ -1630,21 +1633,13 @@ mod tests {
 
     #[test]
     fn emoji_absent_means_no_icon() {
-        assert_eq!(validate_emoji(None).unwrap(), None);
+        assert!(validate_emoji(None).is_ok());
     }
 
     #[test]
-    fn single_codepoint_emoji_packs_four_bytes() {
-        let grin = validate_emoji(Some("😀")).unwrap().unwrap();
-        assert_eq!(
-            grin,
-            i64::from_be_bytes([0, 0, 0, 0, 0xF0, 0x9F, 0x98, 0x80])
-        );
-        let thumb = validate_emoji(Some("👍")).unwrap().unwrap();
-        assert_eq!(
-            thumb,
-            i64::from_be_bytes([0, 0, 0, 0, 0xF0, 0x9F, 0x91, 0x8D])
-        );
+    fn single_codepoint_emoji_accepted() {
+        assert!(validate_emoji(Some("😀")).is_ok());
+        assert!(validate_emoji(Some("👍")).is_ok());
     }
 
     #[test]
@@ -1675,23 +1670,15 @@ mod tests {
     }
 
     #[test]
-    fn three_byte_emoji_rejected() {
-        for bad in ["☕", "❤"] {
-            let err = validate_emoji(Some(bad)).unwrap_err();
-            assert!(matches!(err, TeleError::Usage(_)), "for {bad}");
-            assert!(
-                err.message().contains("custom-emoji document id"),
-                "for {bad}"
-            );
-        }
+    fn three_byte_and_bmp_emoji_accepted() {
+        assert!(validate_emoji(Some("\u{2602}")).is_ok());
+        assert!(validate_emoji(Some("❤")).is_ok());
+        assert!(validate_emoji(Some("☕")).is_ok());
     }
 
     #[test]
     fn numeric_emoji_is_accepted_as_document_id() {
-        assert_eq!(
-            validate_emoji(Some("531234567890123456")).unwrap(),
-            Some(531234567890123456)
-        );
+        assert!(validate_emoji(Some("531234567890123456")).is_ok());
         assert_eq!(parse_emoji_document_id(" 42 "), Some(42));
         for bad in ["0", "-1", "", "  ", "abc", "12x", "99999999999999999999999"] {
             assert_eq!(parse_emoji_document_id(bad), None, "for {bad}");
@@ -1748,12 +1735,107 @@ mod tests {
         let mut calls = Vec::new();
         let topics = collect_forum_topics(10, |cursor, page_limit| {
             calls.push((cursor, page_limit));
-            async move { Ok(ForumTopicsPage { topics: Vec::new() }) }
+            async move { Ok(empty_page()) }
         })
         .await
         .unwrap();
         assert!(topics.is_empty());
         assert_eq!(calls, vec![(ForumCursor::default(), 10)]);
+    }
+
+    fn empty_page() -> ForumTopicsPage {
+        ForumTopicsPage {
+            topics: Vec::new(),
+            messages: Vec::new(),
+        }
+    }
+
+    fn forum_message(id: i32, date: i32) -> tl::enums::Message {
+        tl::enums::Message::Service(tl::types::MessageService {
+            out: false,
+            mentioned: false,
+            media_unread: false,
+            reactions_are_possible: false,
+            silent: false,
+            post: false,
+            legacy: false,
+            id,
+            from_id: None,
+            peer_id: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 1 }),
+            saved_peer_id: None,
+            reply_to: None,
+            date,
+            action: tl::enums::MessageAction::Empty,
+            reactions: None,
+            ttl_period: None,
+        })
+    }
+
+    fn page(topics: Vec<tl::enums::ForumTopic>) -> ForumTopicsPage {
+        ForumTopicsPage {
+            topics,
+            messages: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_forum_topics_cursor_dates_from_top_message() {
+        let mut calls = Vec::new();
+        let topics = collect_forum_topics(5, |cursor, page_limit| {
+            let page_index = calls.len();
+            calls.push((cursor, page_limit));
+            async move {
+                if page_index == 0 {
+                    Ok(ForumTopicsPage {
+                        topics: vec![fake_topic_at(9, 1_700_000_000, 77)],
+                        messages: vec![forum_message(77, 1_750_000_000)],
+                    })
+                } else {
+                    Ok(empty_page())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(
+            calls[1].0,
+            ForumCursor {
+                date: 1_750_000_000,
+                message_id: 77,
+                topic_id: 9
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_forum_topics_cursor_falls_back_to_topic_date_without_message() {
+        let mut calls = Vec::new();
+        let topics = collect_forum_topics(5, |cursor, page_limit| {
+            let page_index = calls.len();
+            calls.push((cursor, page_limit));
+            async move {
+                if page_index == 0 {
+                    Ok(ForumTopicsPage {
+                        topics: vec![fake_topic_at(9, 1_700_000_000, 77)],
+                        messages: vec![forum_message(76, 1_750_000_000)],
+                    })
+                } else {
+                    Ok(empty_page())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(
+            calls[1].0,
+            ForumCursor {
+                date: 1_700_000_000,
+                message_id: 77,
+                topic_id: 9
+            }
+        );
     }
 
     #[tokio::test]
@@ -1764,11 +1846,9 @@ mod tests {
             calls.push((cursor, page_limit));
             async move {
                 if page_index == 0 {
-                    Ok(ForumTopicsPage {
-                        topics: vec![fake_topic(10), fake_topic(9)],
-                    })
+                    Ok(page(vec![fake_topic(10), fake_topic(9)]))
                 } else {
-                    Ok(ForumTopicsPage { topics: Vec::new() })
+                    Ok(empty_page())
                 }
             }
         })
@@ -1799,13 +1879,9 @@ mod tests {
             calls.push((cursor, page_limit));
             async move {
                 if page_index == 0 {
-                    Ok(ForumTopicsPage {
-                        topics: vec![fake_topic(10), fake_topic(9), fake_topic(8)],
-                    })
+                    Ok(page(vec![fake_topic(10), fake_topic(9), fake_topic(8)]))
                 } else {
-                    Ok(ForumTopicsPage {
-                        topics: vec![fake_topic(7), fake_topic(6)],
-                    })
+                    Ok(page(vec![fake_topic(7), fake_topic(6)]))
                 }
             }
         })
@@ -1833,11 +1909,7 @@ mod tests {
         let mut calls = Vec::new();
         let topics = collect_forum_topics(3, |cursor, page_limit| {
             calls.push((cursor, page_limit));
-            async move {
-                Ok(ForumTopicsPage {
-                    topics: vec![fake_topic(7), fake_topic(6), fake_topic(5)],
-                })
-            }
+            async move { Ok(page(vec![fake_topic(7), fake_topic(6), fake_topic(5)])) }
         })
         .await
         .unwrap();
@@ -1855,9 +1927,7 @@ mod tests {
                 let ids: Vec<i32> = (0..page_limit)
                     .map(|i| 1000 - page_index as i32 * 100 - i as i32)
                     .collect();
-                Ok(ForumTopicsPage {
-                    topics: ids.into_iter().map(fake_topic).collect(),
-                })
+                Ok(page(ids.into_iter().map(fake_topic).collect()))
             }
         })
         .await
@@ -1895,14 +1965,12 @@ mod tests {
             calls.push((cursor, page_limit));
             async move {
                 if page_index == 0 {
-                    Ok(ForumTopicsPage {
-                        topics: vec![
-                            fake_topic(10),
-                            tl::enums::ForumTopic::Deleted(tl::types::ForumTopicDeleted { id: 9 }),
-                        ],
-                    })
+                    Ok(page(vec![
+                        fake_topic(10),
+                        tl::enums::ForumTopic::Deleted(tl::types::ForumTopicDeleted { id: 9 }),
+                    ]))
                 } else {
-                    Ok(ForumTopicsPage { topics: Vec::new() })
+                    Ok(empty_page())
                 }
             }
         })
@@ -1931,11 +1999,9 @@ mod tests {
         let topics = collect_forum_topics(5, |cursor, page_limit| {
             calls.push((cursor, page_limit));
             async move {
-                Ok(ForumTopicsPage {
-                    topics: vec![tl::enums::ForumTopic::Deleted(
-                        tl::types::ForumTopicDeleted { id: 9 },
-                    )],
-                })
+                Ok(page(vec![tl::enums::ForumTopic::Deleted(
+                    tl::types::ForumTopicDeleted { id: 9 },
+                )]))
             }
         })
         .await

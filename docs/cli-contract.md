@@ -372,6 +372,7 @@ This command removes the current profile photo. It reads the photo id from `user
 - `topic edit --emoji` is not offered; emoji icon changes stay deferred (M7).
 - Success rows carry `{"chat", "topic", "ok": true}` plus additive `"title"` and `"closed"` on `edit`, reflecting exactly what was requested. Dry-run rows add `"would": "<action> topic <id> in chat <chat>"`.
 - `topic list` rows gain additive `"closed"` and `"pinned"` booleans per topic; the human table appends matching columns (existing columns keep their order).
+- `topic list` pagination cursors (`offset_date/offset_id/offset_topic` in `messages.getForumTopics`) advance on the date of the topic's top message (`messages.ForumTopics.messages` keyed by `forumTopic.top_message`), which this client assumes is the server's ordering key. The topic creation date is the fallback when the top message is absent from the page (deleted or empty topic); it is older than the normal cursor, so near that boundary the next page may repeat rows, and would skip if the server actually orders by creation date. The cursor wire format is unchanged.
 
 ## `tele listen` streaming
 
