@@ -1948,11 +1948,11 @@ fn flood_wait_secs(err: &TeleError) -> Option<std::time::Duration> {
 
 pub(crate) struct StreamFailureCtx<'a> {
     /// ZERO when no connection was established before the failure.
-    pub stream_uptime: std::time::Duration,
+    stream_uptime: std::time::Duration,
     /// Wall-clock end of the run, when one is set.
-    pub deadline: Option<std::time::Instant>,
+    deadline: Option<std::time::Instant>,
     /// Shared stop source; serve runs without one.
-    pub stopper: Option<&'a StreamStopper>,
+    stopper: Option<&'a StreamStopper>,
 }
 
 impl<'a> StreamFailureCtx<'a> {
