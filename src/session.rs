@@ -145,13 +145,14 @@ fn sweep_session_artifacts(name: &str) -> anyhow::Result<()> {
     }
     let tmp_prefix = format!("{name}.session.tmp-");
     let export_tmp_prefix = export_temp_prefix(&default_export_dest(name));
+    let mut temps = Vec::new();
     if let Ok(entries) = std::fs::read_dir(session_dir()) {
         for entry in entries.flatten() {
             let file_name = entry.file_name().to_string_lossy().to_string();
             if tmp_sweep_matches(&file_name, &tmp_prefix)
                 || tmp_sweep_matches(&file_name, &export_tmp_prefix)
             {
-                targets.push(entry.path());
+                temps.push(entry.path());
             }
         }
     }
@@ -162,6 +163,22 @@ fn sweep_session_artifacts(name: &str) -> anyhow::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         })?;
+    // Temp files are dead pid-specific leftovers. A locked one (AV scanner,
+    // read-only attribute) must not report removal as failed after the real
+    // session is already gone; the account is still removed.
+    for path in temps {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => crate::output::log_line(
+                "warn",
+                &format!(
+                    "could not remove stale session temp {}: {e}",
+                    path.display()
+                ),
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -1980,7 +1997,7 @@ mod tests {
         std::fs::write(&real_tmp_sidecar, b"tmp").unwrap();
         std::fs::write(&real_export_tmp, b"tmp").unwrap();
 
-        sweep_session_artifacts("work").unwrap();
+        remove_session("work").await.unwrap();
 
         assert!(
             lookalike_live.exists(),
@@ -2037,6 +2054,32 @@ mod tests {
             "tmp files of other accounts must not be touched"
         );
         std::fs::remove_file(&foreign_tmp).unwrap();
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remove_session_tolerates_an_unsweepable_tmp() {
+        let _guard = lock_env();
+        let dir = test_dir("remove-stuck-tmp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        seed_test_env(&dir);
+        {
+            let held = open_session("work").await.unwrap();
+            drop(held);
+        }
+        let stuck = session_dir().join("work.session.tmp-333333");
+        std::fs::create_dir(&stuck).unwrap();
+
+        remove_session("work").await.unwrap();
+
+        assert!(!session_path("work").exists());
+        assert!(
+            stuck.exists(),
+            "an unsweepable leftover must not be reported as a failed removal"
+        );
+        std::fs::remove_dir(&stuck).unwrap();
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
