@@ -1087,6 +1087,10 @@ fn invite_args(chat: &str) -> InviteArgs {
     }
 }
 
+fn future_expiry() -> i32 {
+    (chrono::Utc::now().timestamp() + 86_400) as i32
+}
+
 fn current_export(
     expire_date: Option<i32>,
     usage_limit: Option<i32>,
@@ -1127,15 +1131,16 @@ fn current_invite(
 
 #[test]
 fn invite_edit_merge_prefills_everything_unset_from_current() {
+    let expiry = future_expiry();
     let resolved = invite_edit_merge(
-        &current_export(Some(1_800_000_000), Some(5), true, Some("old".to_string())),
+        &current_export(Some(expiry), Some(5), true, Some("old".to_string())),
         &ValidatedInvite {
             mode: InviteMode::Edit,
             revoked: false,
             ..Default::default()
         },
     );
-    assert_eq!(resolved.expire_date, Some(1_800_000_000));
+    assert_eq!(resolved.expire_date, Some(expiry));
     assert_eq!(resolved.usage_limit, Some(5));
     assert_eq!(resolved.request_needed, Some(true));
     assert_eq!(resolved.title.as_deref(), Some("old"));
@@ -1193,8 +1198,9 @@ fn invite_edit_merge_is_per_field() {
 
 #[test]
 fn invite_edit_merge_keeps_plan_revoked() {
+    let expiry = future_expiry();
     let resolved = invite_edit_merge(
-        &current_export(Some(1_800_000_000), None, false, None),
+        &current_export(Some(expiry), None, false, None),
         &ValidatedInvite {
             mode: InviteMode::Edit,
             revoked: true,
@@ -1202,7 +1208,7 @@ fn invite_edit_merge_keeps_plan_revoked() {
         },
     );
     assert!(resolved.revoked);
-    assert_eq!(resolved.expire_date, Some(1_800_000_000));
+    assert_eq!(resolved.expire_date, Some(expiry));
     assert_eq!(resolved.usage_limit, None);
     assert_eq!(resolved.request_needed, Some(false));
     assert_eq!(resolved.title, None);
