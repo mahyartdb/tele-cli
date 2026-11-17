@@ -6159,6 +6159,40 @@ fn msg_pin_serve_planner_rejects_notify_with_unpin() {
 }
 
 #[test]
+fn msg_pin_serve_planner_rejects_show_all_unpin_pairs() {
+    let route = msg_serve_routes()
+        .into_iter()
+        .find(|r| r.op == "msg pin")
+        .expect("msg pin route is registered");
+    for (raw, expected) in [
+        (
+            serde_json::json!({"chat": "me", "show": true, "all": true, "dry_run": true}),
+            "--show and --all",
+        ),
+        (
+            serde_json::json!({"chat": "me", "show": true, "unpin": true, "dry_run": true}),
+            "--show and --unpin",
+        ),
+        (
+            serde_json::json!({"chat": "me", "all": true, "unpin": true, "dry_run": true}),
+            "--all and --unpin",
+        ),
+    ] {
+        let err = (route.planner)("msg pin", raw).unwrap_err();
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+    for raw in [
+        serde_json::json!({"chat": "me", "show": true, "dry_run": true}),
+        serde_json::json!({"chat": "me", "all": true, "dry_run": true}),
+    ] {
+        assert!(
+            (route.planner)("msg pin", raw).is_ok(),
+            "a single read-mode flag must still plan"
+        );
+    }
+}
+
+#[test]
 fn msg_read_serve_planner_rejects_mentions_with_mark_unread() {
     let route = msg_serve_routes()
         .into_iter()

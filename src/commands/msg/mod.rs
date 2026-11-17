@@ -857,6 +857,26 @@ pub(crate) fn validate_pin(args: &PinArgs) -> TeleResult<()> {
             "--all and --id are mutually exclusive".to_string(),
         ));
     }
+    // clap declares these pairs too, so these copies only fire on the
+    // serve/MCP lane, where help text and conflict rules are not applied.
+    for (conflict, message) in [
+        (
+            args.show && args.all,
+            "--show and --all are mutually exclusive",
+        ),
+        (
+            args.show && args.unpin,
+            "--show and --unpin are mutually exclusive",
+        ),
+        (
+            args.all && args.unpin,
+            "--all and --unpin are mutually exclusive",
+        ),
+    ] {
+        if conflict {
+            return Err(TeleError::Usage(message.to_string()));
+        }
+    }
     // clap declares this pair too, so this copy only fires on the serve lane.
     if args.notify && args.unpin {
         return Err(TeleError::Usage(
