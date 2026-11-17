@@ -3797,12 +3797,11 @@ mod tests {
                 SERVE_MAX_RECONNECT_ATTEMPTS,
             )
             .await;
-            failures += attempt;
             assert!(
                 result.is_ok(),
-                "failure {failures} within the 5-attempt cap must reconnect"
+                "failure {} within the 5-attempt cap must reconnect",
+                attempt + 1
             );
-            failures -= attempt;
         }
         assert_eq!(failures, 5);
         let result = handle_stream_failure(
