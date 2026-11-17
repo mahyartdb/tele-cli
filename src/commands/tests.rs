@@ -420,12 +420,24 @@ fn is_empty_update_recognizes_empty_edit_channel_message() {
 
 #[test]
 fn is_empty_update_recognizes_empty_new_message() {
-    let u = tl::enums::Update::NewMessage(tl::types::UpdateNewMessage {
+    let new_msg = tl::enums::Update::NewMessage(tl::types::UpdateNewMessage {
         message: empty_message(),
         pts: 1,
         pts_count: 1,
     });
-    assert!(is_empty_update(&u));
+    let new_channel = tl::enums::Update::NewChannelMessage(tl::types::UpdateNewChannelMessage {
+        message: empty_message(),
+        pts: 1,
+        pts_count: 1,
+    });
+    let edit = tl::enums::Update::EditMessage(tl::types::UpdateEditMessage {
+        message: empty_message(),
+        pts: 1,
+        pts_count: 1,
+    });
+    assert!(is_empty_update(&new_msg));
+    assert!(is_empty_update(&new_channel));
+    assert!(is_empty_update(&edit));
 }
 
 #[test]
@@ -2631,8 +2643,28 @@ fn until_bounds_invalid_value_maps_to_usage() {
 
 #[test]
 fn until_bounds_accepts_timestamp_relative_date_and_rfc3339() {
-    assert!(until_bounds(Some("4102444800")).unwrap().1.is_some());
-    assert!(until_bounds(Some("+90s")).unwrap().1.is_some());
+    let (deadline, date) = until_bounds(Some("4102444800")).unwrap();
+    assert_eq!(
+        date,
+        chrono::DateTime::from_timestamp(4_102_444_800, 0).map(|d| d.with_timezone(&chrono::Utc))
+    );
+    assert!(
+        deadline.is_some(),
+        "a future timestamp must carry a deadline"
+    );
+
+    let before = chrono::Utc::now() + chrono::Duration::seconds(80);
+    let (deadline, date) = until_bounds(Some("+90s")).unwrap();
+    let date = date.expect("relative --until must resolve to a date");
+    assert!(
+        deadline.is_some(),
+        "a relative future bound must carry a deadline"
+    );
+    assert!(
+        date >= before && date <= chrono::Utc::now() + chrono::Duration::seconds(100),
+        "+90s parsed to {date}, not roughly 90 seconds from now"
+    );
+
     assert!(until_bounds(Some("2100-01-01")).unwrap().1.is_some());
     assert!(until_bounds(Some("2100-01-01T00:00:00Z"))
         .unwrap()

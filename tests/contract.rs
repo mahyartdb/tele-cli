@@ -1135,6 +1135,49 @@ fn listen_count_zero_exits_without_rows() {
 }
 
 #[test]
+fn listen_count_zero_prints_dry_run_and_skips_field_validation() {
+    let dir = isolated_appdir("lscount0-order");
+    write_session(&dir, "ghost");
+
+    let (code, out, err) = run_in(
+        &dir,
+        &[
+            "listen",
+            "--account",
+            "ghost",
+            "--count",
+            "0",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {err}");
+    let row = parse_json(&out);
+    assert_eq!(row["dry_run"], true);
+    assert!(row["would"].as_str().unwrap().contains("stream"));
+
+    let (code, out, err) = run_in(
+        &dir,
+        &[
+            "listen",
+            "--account",
+            "ghost",
+            "--count",
+            "0",
+            "--fields",
+            "nope",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "field paths are applied per row, and --count 0 has no rows: {err}"
+    );
+    assert!(out.trim().is_empty(), "unexpected rows: {out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn msg_delete_requires_ids_unless_all() {
     let (code, _out, err) = run_isolated("delnone", &["msg", "delete", "--chat", "me"]);
     assert_eq!(code, 1);
