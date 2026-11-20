@@ -57,7 +57,7 @@ Wasteful: pasting all of `docs/capabilities.md` when you touch one `privacy.*` r
 ```bash
 cargo build                              # debug build
 cargo build --release                    # optimized build
-cargo test                               # ~1910 tests, no network
+cargo test                               # 2175+ tests, no network
 cargo clippy --all-targets -- -D warnings # lint
 cargo fmt --all -- --check               # format check (cargo fmt --all to fix)
 cargo run -- --help                      # CLI help
@@ -262,6 +262,7 @@ Anti-patterns that hurt this repo:
 - Security: `docs/security.md`
 - Observability: `docs/observability.md`
 - Release: `docs/release.md` (13 build targets; npm publishes 1 bundled package via OIDC trusted publishing)
+- CI: [docs/ci.md](docs/ci.md) — workflow gates, local gate commands, pin updates
 - npm packaging: `npm/` — single package bundles all 13 platform binaries; JS launcher (`bin/tele.js`) selects correct binary for platform; `tele` is the primary bin, `telecli` a deprecated alias
 - ADRs: `docs/decisions/` (001 = session kernel; 002 = capability matrix; 003 = CLI JSON contract; 004 = flood and parallel (superseded by 008); 005 = release gate; 006 = Rust/grammers pivot; 007 = product scope v1; 008 = per-account flood weights)
 

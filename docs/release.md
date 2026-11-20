@@ -4,7 +4,7 @@ A release is an annotated tag. You bump versions and push the tag. The `release`
 
 ## Check the gates
 
-1. Confirm `main` is green. The `ci` workflow (`.github/workflows/ci.yml`) gates on `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, an MSRV check on Rust 1.89, and `cargo audit`.
+1. Confirm `main` is green. The `ci` workflow (`.github/workflows/ci.yml`) gates on `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, an MSRV check on Rust 1.89, and `cargo audit`. See [docs/ci.md](ci.md) for the full gate list and the local command for each.
 2. Confirm that `docs/capabilities.md` has no remaining `want` rows. The publication gate lives in [ADR-005](decisions/005-unpublished-until-want-done.md) and is currently met. Waive nothing silently.
 3. Pick the version number. MAJOR breaks the contract, MINOR adds commands or JSON keys, PATCH fixes. The breaking-change definition sits in `docs/cli-contract.md` under "Stability". For why this stack exists, see [ADR-006](decisions/006-rust-grammers.md).
 

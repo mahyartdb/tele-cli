@@ -7,7 +7,9 @@ targets = [
 [advisories]
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (all versions affected); pulled transitively by grammers-client/rmcp and no fixed release exists. Tracked upstream; re-check on every dependency bump." },
+]
 
 [licenses]
 allow = [

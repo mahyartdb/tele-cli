@@ -14,67 +14,105 @@ permissions:
   contents: read
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
       - name: test
         env:
           TELE_SKIP_TL_DRIFT_CHECK: "1"
-        run: cargo test
+        run: cargo test --locked
+      - name: TL drift check (must not skip)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          cargo test --locked --test contract vendored_tl_api_matches_grammers_tl_types
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: check (MSRV)
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
 
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: install cargo-audit
-        run: cargo install cargo-audit --locked || cargo audit --version
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-audit@0.22.2
       - name: audit
         run: cargo audit
 
   supply-chain:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: install cargo-deny
-        run: cargo install cargo-deny --locked || cargo deny --version
-      - name: deny
-        run: cargo deny check
+        with:
+          persist-credentials: false
       - name: secret scan
         run: |
-          set -eu
-          if git ls-files | grep -E '(^|/)\.env$|\.session(-journal|-wal|-shm)?$'; then
+          set -euo pipefail
+          tracked="$(mktemp)"
+          git ls-files > "$tracked"
+          if grep -E '(^|/)\.env$|\.session(-journal|-wal|-shm)?$' "$tracked"; then
             echo "tracked secret files (.env / sessions) must never be committed" >&2
             exit 1
           fi
-          if git ls-files | grep -E 'id_rsa|id_ed25519|\.pem$|\.key$|\.p12$|\.pfx$|\.kdbx$'; then
+          if grep -E 'id_rsa|id_ed25519|\.pem$|\.key$|\.p12$|\.pfx$|\.kdbx$' "$tracked"; then
             echo "tracked private-key material must never be committed" >&2
             exit 1
           fi
@@ -82,3 +120,9 @@ jobs:
             echo "hex-like TELE_API_HASH assignment in tracked files; use YOUR_API_HASH_HERE placeholders" >&2
             exit 1
           fi
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-deny@0.20.2
+      - name: deny
+        run: cargo deny check
