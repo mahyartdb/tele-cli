@@ -1790,24 +1790,13 @@ fn link_serve_dry_run(args: &LinkArgs) -> TeleResult<serde_json::Value> {
 }
 
 fn kick_serve_dry_run(args: &KickArgs) -> TeleResult<serde_json::Value> {
-    let until_secs = parse_ban_duration(args.duration.as_deref())?;
-    let rights_entries = match &args.rights {
-        Some(csv) => parse_banned_rights_csv(csv)?,
-        None => Vec::new(),
-    };
-    let mut data = serde_json::json!({
-        "dry_run": true,
-        "chat": args.chat,
-        "user": args.user,
-        "ban": args.ban,
-        "would": format!("kick user {} from chat {}", args.user, args.chat)
-    });
-    if let Some(secs) = until_secs {
-        data["duration"] = serde_json::json!(secs);
-    }
-    if !rights_entries.is_empty() {
-        data["rights"] = serde_json::json!(rights_entries);
-    }
+    let plan = validate_kick(args)?;
+    let would = format!("kick user {} from chat {}", args.user, args.chat);
+    let mut data = kick_dry_run_payload(&would, &plan);
+    data["dry_run"] = serde_json::json!(true);
+    data["chat"] = serde_json::json!(args.chat);
+    data["user"] = serde_json::json!(args.user);
+    data["ban"] = serde_json::json!(args.ban);
     Ok(data)
 }
 
@@ -2316,14 +2305,9 @@ pub(crate) async fn chat_kick_core(
     shares: &crate::client::ServeShares,
     params: KickServeParams,
 ) -> TeleResult<serde_json::Value> {
+    let plan = validate_kick(&KickArgs::from(&params))?;
     let ban = params.ban;
-    let until_secs = parse_ban_duration(params.duration.as_deref())?;
-    let rights_entries = match &params.rights {
-        Some(csv) => parse_banned_rights_csv(csv)?,
-        None => Vec::new(),
-    };
-    crate::chat_target::ChatTarget::parse_flag(&params.chat, "chat")?;
-    crate::chat_target::ChatTarget::parse_flag(&params.user, "user")?;
+    let until_secs = plan.until_secs;
     shares.rate_limiter.acquire().await;
     let chat =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &params.chat).await?;
@@ -2334,7 +2318,7 @@ pub(crate) async fn chat_kick_core(
     let user_ref = entities::peer_ref(&user_peer)
         .await
         .map_err(tele_invocation)?;
-    if !ban && rights_entries.is_empty() && until_secs.is_none() {
+    if !ban && plan.rights_entries.is_empty() && until_secs.is_none() {
         shares
             .client
             .kick_participant(chat_ref, user_ref)
@@ -2343,13 +2327,14 @@ pub(crate) async fn chat_kick_core(
         return Ok(serde_json::json!({"chat": params.chat, "user": params.user, "kicked": true}));
     }
     reject_duration_on_basic(&chat, until_secs)?;
-    if needs_raw_ban(&rights_entries) {
+    let until_date = kick_until_date(&plan);
+    if needs_raw_ban(&plan.rights_entries) {
         if matches!(&chat, grammers_client::peer::Peer::Group(_)) && !entities::is_channel(&chat) {
             return Err(TeleError::Usage(
                 "granular restrictions (manage_topics, send_photos, send_videos, send_roundvideos, send_audios, send_voices, send_docs, send_plain, edit_rank, send_reactions) require a channel or supergroup; basic groups support view_messages bans only".to_string(),
             ));
         }
-        let rights = build_raw_banned_rights(ban, &rights_entries, until_secs);
+        let rights = build_raw_banned_rights(ban, &plan.rights_entries, until_date);
         shares
             .client
             .invoke(&tl::functions::channels::EditBanned {
@@ -2367,12 +2352,12 @@ pub(crate) async fn chat_kick_core(
             &params.chat,
             &params.user,
             ban,
-            until_secs,
-            &rights_entries,
+            until_date,
+            &plan.rights_entries,
         ));
     }
     let mut call = shares.client.set_banned_rights(chat_ref, user_ref);
-    for (right, allowed) in &rights_entries {
+    for (right, allowed) in &plan.rights_entries {
         call = match right.as_str() {
             "view_messages" => call.view_messages(*allowed),
             "send_messages" => call.send_messages(*allowed),
@@ -2392,19 +2377,19 @@ pub(crate) async fn chat_kick_core(
     // --ban forces view_messages=false only when the --rights CSV
     // does not set view_messages explicitly (an explicit view_messages
     // value must win over the --ban default).
-    if ban_defaults_view_messages(ban, &rights_entries) {
+    if ban_defaults_view_messages(ban, &plan.rights_entries) {
         call = call.view_messages(false);
     }
-    if let Some(secs) = until_secs {
-        call = call.duration(std::time::Duration::from_secs(u64::from(secs)));
+    if let Some(date) = until_date {
+        call = call.until(date);
     }
     call.await.map_err(tele_invocation)?;
     Ok(ban_result(
         &params.chat,
         &params.user,
         ban,
-        until_secs,
-        &rights_entries,
+        until_date,
+        &plan.rights_entries,
     ))
 }
 

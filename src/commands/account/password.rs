@@ -131,6 +131,38 @@ pub(crate) fn extract_new_algo(
     }
 }
 
+pub(crate) fn new_password_settings(
+    new_algo: grammers_client::tl::enums::PasswordKdfAlgo,
+    new_password_hash: Vec<u8>,
+    hint: Option<&str>,
+    email: Option<&str>,
+) -> grammers_client::tl::enums::account::PasswordInputSettings {
+    // `new_algo`, `new_password_hash` and `hint` share flags bit 0, so Telegram
+    // decodes all three bodies or none: omitting one shifts the rest of the
+    // payload. An absent hint is therefore sent as an empty string.
+    grammers_client::tl::enums::account::PasswordInputSettings::Settings(
+        grammers_client::tl::types::account::PasswordInputSettings {
+            new_algo: Some(new_algo),
+            new_password_hash: Some(new_password_hash),
+            hint: Some(hint.unwrap_or_default().to_string()),
+            email: email.map(|s| s.to_string()),
+            new_secure_settings: None,
+        },
+    )
+}
+
+pub(crate) fn remove_password_settings(
+) -> grammers_client::tl::enums::account::PasswordInputSettings {
+    // Removal is passwordKdfAlgoUnknown with an EMPTY hash, not a missing one:
+    // `None` drops the shared-bit-0 bodies and the server rejects the payload.
+    new_password_settings(
+        grammers_client::tl::enums::PasswordKdfAlgo::Unknown,
+        Vec::new(),
+        None,
+        None,
+    )
+}
+
 pub(crate) fn prompt_password_with_echo(prompt: &str) -> TeleResult<Zeroizing<String>> {
     let mut stdin = std::io::stdin().lock();
     let mut stderr = std::io::stderr();
@@ -180,15 +212,7 @@ pub(crate) async fn set_cloud_password(
     let base = extract_new_algo(&pw.new_algo)?;
     let new_password = prompt_new_password_pair()?;
     let (algo, hash) = new_password_algo_and_hash(&new_password, &base, None)?;
-    let new_settings = grammers_client::tl::enums::account::PasswordInputSettings::Settings(
-        grammers_client::tl::types::account::PasswordInputSettings {
-            new_algo: Some(algo),
-            new_password_hash: Some(hash),
-            hint: hint.map(|s| s.to_string()),
-            email: email.map(|s| s.to_string()),
-            new_secure_settings: None,
-        },
-    );
+    let new_settings = new_password_settings(algo, hash, hint, email);
     let empty = grammers_client::tl::enums::InputCheckPasswordSrp::InputCheckPasswordEmpty;
     update_settings_with_email_loop(guard, empty, new_settings).await
 }
@@ -392,15 +416,7 @@ pub(crate) async fn change_cloud_password(
     let new_password = prompt_new_password_pair()?;
     let proof = input_check_password_srp(&params, srp_id, &srp_b, &random_a, &current)?;
     let (algo, hash) = new_password_algo_and_hash(&new_password, &base, None)?;
-    let new_settings = grammers_client::tl::enums::account::PasswordInputSettings::Settings(
-        grammers_client::tl::types::account::PasswordInputSettings {
-            new_algo: Some(algo),
-            new_password_hash: Some(hash),
-            hint: hint.map(|s| s.to_string()),
-            email: email.map(|s| s.to_string()),
-            new_secure_settings: None,
-        },
-    );
+    let new_settings = new_password_settings(algo, hash, hint, email);
     guard.rate_limiter.acquire().await;
     update_settings_with_email_loop(guard, proof, new_settings).await
 }
@@ -486,9 +502,9 @@ pub(crate) fn map_update_password_error(e: grammers_client::InvocationError) -> 
             "NEW_SETTINGS_EMPTY" | "INPUT_FETCH_ERROR" | "INPUT_CONSTRUCTOR_INVALID"
         ) {
             return TeleError::Other(format!(
-                "{e} — Telegram rejected this payload (known grammers TL limitation for \
-UpdatePasswordSettings); disable/change via an official app: Settings → Privacy and Security → \
-Two-Step Verification"
+                "{e} — Telegram rejected the UpdatePasswordSettings payload; if this persists, \
+                 disable or change 2FA via an official app: Settings → Privacy and Security → \
+                 Two-Step Verification"
             ));
         }
     }
@@ -554,15 +570,7 @@ pub(crate) async fn remove_cloud_password(guard: &ClientGuard) -> TeleResult<()>
     guard.rate_limiter.acquire().await;
     let request = tl::functions::account::UpdatePasswordSettings {
         password: proof,
-        new_settings: enums::account::PasswordInputSettings::Settings(
-            tl::types::account::PasswordInputSettings {
-                new_algo: Some(grammers_client::tl::enums::PasswordKdfAlgo::Unknown),
-                new_password_hash: None,
-                hint: None,
-                email: None,
-                new_secure_settings: None,
-            },
-        ),
+        new_settings: remove_password_settings(),
     };
     match guard.client.invoke(&request).await {
         Ok(_) => Ok(()),

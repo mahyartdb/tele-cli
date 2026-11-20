@@ -490,7 +490,30 @@ pub struct McpArgs {
     groups: Option<Vec<String>>,
 }
 
+pub(crate) fn validate_groups(groups: Option<&Vec<String>>) -> TeleResult<()> {
+    let Some(groups) = groups else {
+        return Ok(());
+    };
+    let known: std::collections::HashSet<&str> =
+        serve_op_routes().iter().map(|r| group_of(r.op)).collect();
+    for g in groups {
+        let g = g.trim().to_lowercase();
+        if !g.is_empty() && !known.contains(g.as_str()) {
+            return Err(TeleError::Usage(format!(
+                "unknown --groups entry '{g}': valid groups are {}",
+                {
+                    let mut names: Vec<&str> = known.into_iter().collect();
+                    names.sort_unstable();
+                    names.join(", ")
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(args: &McpArgs, flags: &crate::executor::GlobalFlags) -> TeleResult<i32> {
+    validate_groups(args.groups.as_ref())?;
     let name = args.account.trim();
     if name.is_empty() {
         return Err(TeleError::Usage("--account must not be empty".to_string()));
@@ -542,25 +565,7 @@ pub async fn run(args: &McpArgs, flags: &crate::executor::GlobalFlags) -> TeleRe
 async fn serve_session(guard: &ClientGuard, args: &McpArgs) -> TeleResult<i32> {
     crate::client::authorize(&guard.client).await?;
     let shares = guard.shares();
-    if let Some(groups) = &args.groups {
-        let known: std::collections::HashSet<&str> = crate::commands::serve::serve_op_routes()
-            .iter()
-            .map(|r| group_of(r.op))
-            .collect();
-        for g in groups {
-            let g = g.trim().to_lowercase();
-            if !g.is_empty() && !known.contains(g.as_str()) {
-                return Err(TeleError::Usage(format!(
-                    "unknown --groups entry '{g}': valid groups are {}",
-                    {
-                        let mut names: Vec<&str> = known.into_iter().collect();
-                        names.sort_unstable();
-                        names.join(", ")
-                    }
-                )));
-            }
-        }
-    }
+    validate_groups(args.groups.as_ref())?;
     let server = TeleMcp::new(
         shares,
         args.account.clone(),
@@ -1121,5 +1126,76 @@ mod tests {
         let err = handler.read_resource_core("tele://nope").await.unwrap_err();
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
         assert!(err.message.contains("tele://skill"));
+    }
+
+    #[test]
+    fn validate_groups_accepts_known_group_and_rejects_unknown() {
+        assert_eq!(validate_groups(None), Ok(()));
+        assert_eq!(validate_groups(Some(&vec![])), Ok(()));
+        let known = serve_op_routes()
+            .iter()
+            .map(|r| group_of(r.op))
+            .collect::<HashSet<_>>();
+        let sample: Vec<String> = known.iter().copied().map(str::to_string).collect();
+        assert!(!sample.is_empty(), "serve_op_routes must expose groups");
+        assert_eq!(validate_groups(Some(&sample)), Ok(()));
+        let err = validate_groups(Some(&vec!["bogusgrp".to_string()])).unwrap_err();
+        assert!(matches!(err, TeleError::Usage(_)));
+        assert!(
+            err.message().contains("unknown --groups entry 'bogusgrp'"),
+            "message text is consumed downstream and must not change: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("valid groups are"),
+            "message text is consumed downstream and must not change: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_groups_is_case_insensitive_and_skips_blanks() {
+        let known = serve_op_routes()
+            .iter()
+            .map(|r| group_of(r.op))
+            .collect::<HashSet<_>>();
+        let first = *known.iter().next().expect("serve_op_routes non-empty");
+        let upper = first.to_uppercase();
+        assert_eq!(
+            validate_groups(Some(&vec![upper, "  ".to_string()])),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_dry_run_rejects_unknown_groups_before_connect() {
+        let args = McpArgs {
+            account: "no-such-account-xyz".to_string(),
+            read_only: false,
+            groups: Some(vec!["bogusgrp".to_string()]),
+        };
+        let flags = crate::executor::GlobalFlags {
+            account: vec!["no-such-account-xyz".to_string()],
+            tag: vec![],
+            parallel: None,
+            json: false,
+            jsonl: false,
+            dry_run: true,
+            quiet: true,
+            config_path: None,
+            command: "mcp".to_string(),
+        };
+        let err = run(&args, &flags)
+            .await
+            .expect_err("unknown group must fail");
+        assert!(
+            matches!(err, TeleError::Usage(_)),
+            "expected Usage, got {err:?}"
+        );
+        assert!(
+            err.message().contains("unknown --groups entry 'bogusgrp'"),
+            "groups must be validated before account selection: {}",
+            err.message()
+        );
     }
 }

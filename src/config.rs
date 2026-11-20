@@ -446,6 +446,7 @@ fn parse_api_id(env: &std::collections::HashMap<String, String>) -> anyhow::Resu
         .get("TELE_API_ID")
         .ok_or_else(|| anyhow::anyhow!("{} (see .env.example)", crate::error::API_ID_MISSING))?;
     let api_id = api_id
+        .trim()
         .parse::<i32>()
         .map_err(|_| anyhow::anyhow!("{}", crate::error::API_ID_INTEGER))?;
     if api_id <= 0 {
@@ -1567,6 +1568,20 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         assert_eq!(parse_api_id(&ok).unwrap(), 1234567);
+    }
+
+    #[test]
+    fn api_id_from_process_env_is_trimmed() {
+        let mut env = std::collections::HashMap::new();
+        overlay_process_env(
+            &mut env,
+            [(
+                std::ffi::OsString::from("TELE_API_ID"),
+                std::ffi::OsString::from(" 12345 "),
+            )],
+        );
+        assert_eq!(env.get("TELE_API_ID").map(String::as_str), Some(" 12345 "));
+        assert_eq!(parse_api_id(&env).unwrap(), 12345);
     }
 
     #[cfg(windows)]

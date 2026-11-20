@@ -135,7 +135,7 @@ Rules:
 ## `chat participants`, `chat kick`, and `chat admin`
 
 - `chat participants --chat X` accepts the additive filters `--role admin|banned|kicked|recent` and `--search <q>` on channels and supergroups. They map onto the grammers `iter_participants` filter parameter: `ChannelParticipantsAdmins`, `ChannelParticipantsBanned{q}`, `ChannelParticipantsKicked{q}`, `ChannelParticipantsSearch{q}` for a bare search or `--role recent --search q`, and `ChannelParticipantsRecent` otherwise. An unknown role is a Usage error before connect. `--search` combined with `--role admin` is a Usage error (`ChannelParticipantsAdmins` carries no search parameter, so the query would be silently ignored). On basic groups the filters fail with a clear Usage error instead of being ignored.
-- By default, `chat kick --chat X --user U` performs a plain friendly kick. With `--ban`, `--duration <secs|forever>`, or `--rights CSV`, the command builds `ChatBannedRights` through `set_banned_rights` instead (restrict or ban, with optional duration). `--duration` requires `--ban` or `--rights`. `--rights` takes comma-separated `name:true|false` pairs where `true` means the user keeps the right; names: `view_messages,send_messages,send_media,
+- By default, `chat kick --chat X --user U` performs a plain friendly kick. With `--ban`, `--duration <secs|forever>`, or `--rights CSV`, the command builds `ChatBannedRights` through `set_banned_rights` instead (restrict or ban, with optional duration). Finite durations must fit Telegram's 32-bit `until_date` (the epoch-second horizon ends 2038-01-19; ~11 years from now); larger values are a Usage error — use `forever` for a permanent restriction. `--duration` requires `--ban` or `--rights`. `--rights` takes comma-separated `name:true|false` pairs where `true` means the user keeps the right; names: `view_messages,send_messages,send_media,
   send_stickers,send_gifs,send_games,send_inline,embed_links,send_polls,
   change_info,invite_users,pin_messages,manage_topics,send_photos,send_videos,
   send_roundvideos,send_audios,send_voices,send_docs,send_plain,edit_rank,
@@ -221,6 +221,12 @@ Filters: `--from SENDER` (same target syntax as `--chat`) keeps only that sender
 
 `tele cache search [--query Q] [--chat-id N] [--limit N]` runs an FTS5 query against the account's local message cache with no network call. `--query` defaults to empty (recent cached messages), and `--chat-id N` restricts hits to one numeric chat id. Serve/MCP: `cache search` op (read_only), whose `SearchParams` carries the same `query`/`chat_id`/`limit`.
 
+## `cache stats`
+
+`tele cache stats [--json]` reports local cache counts and byte usage. `oldest_date` and `newest_date` are Unix seconds (the oldest and newest cached message dates), or `null` when the cache is empty. On an empty cache these fields are `null` rather than the previous epoch `0` — consumers must handle the JSON null (deliberate type change at the empty-cache edge, not additive).
+
+## `cache write behavior`
+
 Cache writes (`cache sync`, serve/MCP cache writes) store one batch per transaction on a per-account connection cached by the process. A write batch that fails or is dropped mid-batch (serve/MCP op timeout) rolls its transaction back as it is dropped, so the cached connection is not left inside a transaction. Reads and writes on that connection are ordered per account by an async read-write gate: a write waits for in-flight readers, a read waits for the write batch, and reads may run concurrently with each other. A read that runs during a write batch therefore waits for it to finish or roll back instead of observing uncommitted rows.
 
 ## `contact add`
@@ -269,6 +275,10 @@ Rows gain additive `"username"` (a string, empty when none). The human table app
 - `--format plain|markdown` (default `plain`) applies to `--text` and `--caption` alike; an unknown value is a Usage error.
 - `--no-preview` sets `no_webpage` on the edited message.
 - Dry-run rows echo `file`/`caption`/`format` and `preview` (the inverse of `--no-preview`); `would` is `"edit media of message N"` in file mode.
+
+## `msg get`
+
+`tele msg get --chat X --id N` fetches one message; `--chat X` also accepts deep links carrying a message id: `t.me/<chat>/<id>`, `t.me/c/<internal>/<id>`, and the thread forms `t.me/<chat>/<thread>/<id>` / `t.me/c/<internal>/<thread>/<id>` (the path thread id is validated then discarded; a `?thread=` query is ignored). Only `msg get` consumes a link-carried message id; commands whose `--chat`/`--user` goes through the shared chat-target parser reject it with a Usage error naming the accepted consumers, while `profile` and `raw` peer fields accept a link as a peer and ignore the id. An explicit `--id` conflicts with a link-carried id before connect.
 
 ## `msg get --watch`
 
@@ -376,7 +386,7 @@ This command removes the current profile photo. It reads the photo id from `user
 
 ## `tele listen` streaming
 
-`tele listen` always streams JSON Lines on stdout, one event per line; `--json` is accepted as a no-op for symmetry. Stdout writes are backpressured: `listen` pauses on a slow reader for up to 30s, then drops the row and reports the loss in the `dropped` counter stamped on the next written row. `--fields` projects every emitted streaming row to the named dotted fields (unknown fields fail with a Usage error); without it rows stream whole.
+`tele listen` always streams JSON Lines on stdout, one event per line; `--json` is accepted as a no-op for symmetry. Stdout writes are backpressured: `listen` pauses on a slow reader for up to 30s, then drops the row and reports the loss in the `dropped` counter stamped on the next written row. `--fields` projects every emitted streaming row to the named dotted fields (unknown fields fail with a Usage error); without it rows stream whole. Unlike one-shot fan-out commands, `listen` applies `--parallel` only to connect/reconnect attempts: accounts stream concurrently once connected, so the cap serializes connection bursts (default 1) without ever starving an unbounded stream behind another account's.
 
 Filter applicability per event family: `--from SENDER` applies to NewMessage/MessageEdited/MessageDeleted-adjacent rows that carry a sender, `--chat` applies wherever a chat id is present, and `--in/--out/--pattern` apply only to message rows. When `--in/--out/--pattern` are set, rows that structurally cannot match them (Raw, MessageDeleted, ChatAction, UserUpdate, CallbackQuery) are suppressed rather than bypassing the filter; `--from` and `--chat` still apply to ChatAction/UserUpdate/CallbackQuery rows. This keeps `--pattern ERROR` from drowning in typing-indicator rows while keeping `--from @bob` working on actions. Finite streams: `--timeout-secs S` bounds the whole run, `--count N` exits after N emitted event rows (all accounts combined), and `--until <RFC3339|unix-ts|YYYY-MM-DD>` exits after the first event at/after that timestamp - each prints a stderr info line and exits 0. A future `--until` also ends the run at that wall-clock instant even when no event ever arrives; a past `--until` has no wall-clock bound and only filters event dates. `--count 0` exits 0 with zero rows before connecting, once an account is selected (and before `--fields` is applied; `--dry-run` still reports the would-be selection). A count stop ends every account task, not just the emitting one: the account that spends the last slot broadcasts the stop, which wakes parked accounts (an account that saw no events ends within ~500ms). An account that only observes an already-exhausted budget stops itself without broadcasting, because the spender's stalled write can hand the slot back. A row that never reaches stdout hands its slot back: a stalled-writer drop only skips that row and keeps streaming, while a `--fields` projection failure or a terminal emit error also stops the account, and a terminal stdout failure broadcasts the stop so parked accounts wake. A `--fields` projection failure broadcasts as a Usage error for the whole run, which then exits 1 even when other accounts had already succeeded. `--until` compares against the event's own date: message rows carry an RFC3339 `date`, Raw and Gap rows carry `state.date` (epoch seconds). A past `--until` therefore replays the backlog dated before it and stops at the first event at/after it, instead of expiring before the first row. Rows that carry no date at all (ChatAction, UserUpdate, CallbackQuery, MessageDeleted) can never match a date filter and never stop the run - use `--timeout-secs` to bound those. A date stop ends every account task, not just the one that crossed the boundary. When the stream stops, pending album members are flushed as an `Album` row rather than dropped - including albums swept from the buffer in the same tick as the stop - unless a `--fields` projection failure ended the account, since the album row would fail the same projection. That flush bypasses the count budget, so already-buffered album rows flushed at a stop or on a reconnect can push the final row count past `--count N`; they are dropped only when their own date is at/after a `--until` boundary (which the date stop withholds) or when a stalled stdout rejects the row (recorded in `dropped` on the next written row). An `Album` row carries its first member's date, so an album whose members straddle the boundary is written as one unit rather than split.
 
@@ -459,7 +469,7 @@ Process model:
 - One or more accounts: selection resolves to at least one and at most 32 sessions, otherwise the process exits 1 before anything connects. Each account session is locked exclusively (OS-level per-account lock); other tele processes cannot open the same sessions while serve runs.
 - Exclusive ownership: the standard OS-level per-account session lock applies. While `tele serve` holds the sessions, no other tele process can open them, and the reverse holds too ("session <name> is in use by another process").
 - Frames are single-line JSON objects terminated by `\n`; writers must flush per line.
-- EOF on stdin shuts down cleanly: queued jobs drain, pending responses are flushed to stdout, the client disconnects, and the exit code is 0. Drain is bounded to 10 seconds: ids still queued or in flight when the budget expires answer with a `StreamDown` error envelope, and under sustained stdout backpressure one may be dropped server-side (its correlation id then never appears).
+- EOF on stdin shuts down cleanly: queued jobs drain, pending responses are flushed to stdout, the client disconnects, and the exit code is 0. Shutdown has a single 10-second budget measured from EOF detection, shared by the dispatcher wait, the drain, the post-abort `StreamDown` sweep, and the final stdout flush (each phase gets whatever remains). A main loop already parked in a stdout write when stdin closes can delay EOF detection by up to the 30-second write-stall budget. Ids still queued or in flight when the budget expires answer with a `StreamDown` error envelope; under sustained stdout backpressure one may be dropped server-side (its correlation id then never appears).
 - `--events` allowlist: `NewMessage` and `MessageEdited` (default `NewMessage`). Any other name exits 1 before connect.
 - The default mode is live-only (updates from now on; no replay, no history). `--catch-up` first replays what was missed since the persisted update state.
 - Stream failures reconnect automatically with exponential backoff (1 s to 30 s, up to 5 consecutive attempts); auth failures fail fast (exit 4). Only a delivered, non-empty update resets the failure streak - and so does the end of a connection that stayed up for at least 60 seconds: a connect alone does not reset it, so a connect-then-drop loop still reaches the give-up limit, while a quiet but long-lived stream does not accumulate failures across occasional outages.
@@ -529,8 +539,10 @@ Error taxonomy on the serve wire:
 | `ConfirmRequired` | Destructive op submitted without `"confirm":true` | `would` (the dry-run preview payload) |
 | `NotImplemented` | Unknown op | message lists all supported ops |
 | `VersionMismatch` | hello protocol outside the negotiated range | — |
-| `StreamDown` | Job abandoned because the worker lost its connection (guard dropped); the stream was being rebuilt | — |
-| `QueueFull` | The mutate or read lane queue is full (capacity 64). The caller should retry after existing jobs drain | — |
+| `StreamDown` | Job abandoned because the worker lost its connection (guard dropped), the serve stream ended before the job ran, or EOF arrived with the id queued; the stream may be rebuilt | — |
+| `QueueFull` | The mutate or read lane queue is full (read lane capacity 64 per worker). The caller should retry after existing jobs drain, with a fresh request id (ids are never reusable) | — |
+
+A connection accepts at most 100,000 unique request ids; once exhausted, reconnect to reset the id space (the driver need not persist ids across connections).
 
 Rare kinds from the shared error model may also surface additively: `ConfigError`, `TaskPanicError`, `Error`. In one-shot `--json` mode, a SIGINT produces `Interrupted` with `message: "interrupted by SIGINT"`.
 
@@ -567,7 +579,7 @@ Inline ops handled by the serve loop itself (no route entry):
 ### Two-lane execution and timeouts
 
 - Mutate lane: one worker; jobs run strictly in submission order (queue depth 64).
-- Read lane: two workers; read jobs run concurrently, and their responses may interleave with each other and with mutate responses (queue depth 64).
+- Read lane: two workers; read jobs run concurrently, and their responses may interleave with each other and with mutate responses (64-deep queue per worker, 128 before QueueFull; try_send_to_lane falls back to the idle sibling before rejecting).
 - Per-op timeouts are enforced per job. Expiry yields a `Timeout` error envelope correlated by request `id`:
 
 | Class | Limit | Applies to |
@@ -599,7 +611,7 @@ Any routed op accepts `"dry_run":true` in its params. The request is validated a
 
 ### Backpressure
 
-Intake is bounded end to end: a 64-line stdin queue and 64-job op queues. A slow consumer stalls the pipeline instead of growing memory without bound. Read stdout continuously.
+Intake is bounded end to end: a 64-line stdin queue, a 64-deep dispatcher channel, a 64-deep mutate queue, and two 64-deep read queues (128 read jobs queued before `QueueFull`; an idle sibling is tried before rejecting). A full dispatcher channel answers the request with a retryable `ServeError` ("dispatcher queue full; driver is outpacing the op lanes"); use a fresh request id on retry. A slow consumer stalls the pipeline instead of growing memory without bound. Read stdout continuously.
 
 The account-to-main event hop is bounded too (256 slots) and its wait is capped at 30 seconds: grammers hands the client an *unbounded* update channel, so an account task that parked on the send forever would let that channel grow without limit. When the wait expires the event is dropped, a stderr line counts the drops, and the count rides along with the next event as a `Gap` row (`"reason":"consumer_stalled"`, `"dropped":N`) so the driver sees the gap on the wire instead of a silent hole.
 
@@ -824,7 +836,7 @@ No separate `title` field is emitted; clients fall back to `name`. Annotations a
 ### Safety model
 
 - Dry-run everywhere: every tool accepts `"dry_run": true` and answers offline with the CLI-shaped would payload (`dry_run:true`, a human-readable `would`, and the operation's own argument keys). No network call is made.
-- Confirm gate: destructive tools reject the first call with an `isError:true` result whose text contains the `ConfirmRequired` envelope including the computed `would` preview. Resend the same arguments plus `"confirm": true` to run (`"confirm": false` does not unlock). The destructive set today is 9 tools: `chat_kick`, `chat_leave`, `contact_remove`,
+- Confirm gate: destructive tools reject the first call with an `isError:true` result whose text contains the `ConfirmRequired` envelope including the computed `would` preview. Resend the same arguments plus `"confirm": true` to run (`"confirm": false` does not unlock). The destructive set today is 10 tools: `cache_clear`, `chat_kick`, `chat_leave`, `contact_remove`,
   `dialog_delete`, `msg_delete`, `raw`, `sticker_remove`, `story_delete`,
   and `topic_delete`. All of them carry `destructiveHint: true`.
 - `--read-only`: mutating tools are absent from `tools/list`.
@@ -909,7 +921,7 @@ Same hints notation as the serve table: listed values mark non-defaults, and an 
 
 | tool | summary | hints |
 |---|---|---|
-| `cache_clear` | clear the local message cache | |
+| `cache_clear` | clear the local message cache | destructive |
 | `cache_search` | search the local message cache offline | read_only |
 | `cache_stats` | show local cache statistics | read_only |
 | `cache_sync` | sync recent messages from a chat into the local cache | |
@@ -1159,4 +1171,5 @@ With `--json`/`--jsonl`, stdout carries the standard one-shot envelope instead o
 - New commands and new optional JSON keys are MINOR releases.
 - A changed exit-code meaning, a renamed JSON key, or a removed command is MAJOR.
 - Posture acks are the sanctioned exception: a new required ack flag (`--allow-raw`, `--allow-insecure-app-dir`, `--allow-trace`, phone-on-argv rejection under `--no-input`) may turn a previously-accepted invocation into exit 1 with guidance, without a MAJOR bump. Machine shapes stay additive regardless — only the acceptance gate changes.
+- One sanctioned machine-shape exception: `cache stats` `oldest_date`/`newest_date` are `null` instead of epoch `0` on an empty cache. The keys remain, and the change is recorded in `CHANGELOG.md`; consumers must treat those fields as nullable.
 - Consumers read `CHANGELOG.md`; git log is not the changelog.

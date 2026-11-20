@@ -387,28 +387,60 @@ fn bug_report_footer() {
     let _ = writeln!(std::io::stderr(), "report bugs at {ISSUE_URL}",);
 }
 
-fn clap_error_exit(e: clap::Error) -> std::process::ExitCode {
-    let code = if e.use_stderr() {
-        error::EXIT_USAGE
-    } else {
-        error::EXIT_OK
-    };
-    let _ = e.print();
+fn render_clap_error(e: &clap::Error) -> String {
+    error::scrub(e.render().to_string())
+}
+
+fn clap_render_for(e: &clap::Error) -> Option<String> {
+    if matches!(
+        e.kind(),
+        clap::error::ErrorKind::DisplayHelp
+            | clap::error::ErrorKind::DisplayVersion
+            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        return None;
+    }
+    Some(render_clap_error(e))
+}
+
+fn clap_exit_code(e: &clap::Error) -> u8 {
     if e.use_stderr() {
+        error::EXIT_USAGE as u8
+    } else {
+        error::EXIT_OK as u8
+    }
+}
+
+fn clap_error_exit(e: clap::Error) -> std::process::ExitCode {
+    let rendered = clap_render_for(&e).unwrap_or_else(|| e.render().to_string());
+    let is_help_kind = clap_render_for(&e).is_none();
+    if is_help_kind {
+        if e.use_stderr() {
+            // Bare `tele` prints its help body to stderr and exits 1. It is
+            // help, not a diagnostic, so it must bypass the scrubber.
+            let _ = write!(std::io::stderr(), "{}", e.render());
+            bug_report_footer();
+        } else {
+            // Help and version output are not errors: let clap print them so
+            // wrapping and ANSI styling stay byte-identical to --help.
+            let _ = e.print();
+        }
+    } else {
+        let _ = write!(std::io::stderr(), "{rendered}");
         bug_report_footer();
     }
-    if e.use_stderr() && std::env::args_os().any(|a| a == "--json" || a == "--jsonl") {
-        let hint = argv_command_hint().unwrap_or_default();
+    if std::env::args_os().any(|a| a == "--json" || a == "--jsonl") && e.use_stderr() {
+        let hint = error::scrub(argv_command_hint().unwrap_or_default());
         emit_usage_error(
             UsageCtx {
                 machine: true,
                 dry_run: false,
             },
             &hint,
-            &output::strip_ansi(&e.to_string()),
+            &output::strip_ansi(&rendered),
         );
     }
-    std::process::ExitCode::from(code as u8)
+    std::process::ExitCode::from(clap_exit_code(&e))
 }
 
 const EXIT_CODE_MIN: i32 = 0;
@@ -733,6 +765,122 @@ mod tests {
         assert!(super::no_input_violation(&command, &m).is_some());
         let (command, m) = parsed(&["tele", "msg", "send", "--chat", "me", "--text", "hi"]);
         assert!(super::no_input_violation(&command, &m).is_none());
+    }
+
+    #[test]
+    fn clap_error_render_scrubs_phone_numbers() {
+        let err = super::Cli::command()
+            .try_get_matches_from([
+                "tele",
+                "msg",
+                "send",
+                "--chat",
+                "+15551234567/42",
+                "--text",
+                "hi",
+            ])
+            .expect_err("deep-link chat must fail clap parsing");
+        let rendered = super::render_clap_error(&err);
+        assert!(
+            rendered.contains("invalid value"),
+            "non-error parts must stay intact: {rendered}"
+        );
+        assert!(
+            !rendered.contains("15551234567"),
+            "raw phone must be scrubbed: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "scrubbed output must carry the redaction marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn help_output_is_not_scrubbed() {
+        let err = super::Cli::command()
+            .try_get_matches_from(["tele", "msg", "export", "--help"])
+            .expect_err("--help must return a clap display error");
+        assert!(
+            !err.use_stderr(),
+            "help is not error output and clap_error_exit must exit 0"
+        );
+        assert!(
+            super::clap_render_for(&err).is_none(),
+            "help must bypass the scrubber, not only render clean"
+        );
+        let help = err.render().to_string();
+        assert!(
+            help.contains("max messages to export (1-100000)"),
+            "help must keep the --limit range: {help}"
+        );
+        assert!(
+            !help.contains("[REDACTED]"),
+            "help output must never be scrubbed: {help}"
+        );
+    }
+
+    #[test]
+    fn clap_render_for_scrubs_real_errors() {
+        let err = super::Cli::command()
+            .try_get_matches_from([
+                "tele",
+                "msg",
+                "send",
+                "--chat",
+                "+15551234567/42",
+                "--text",
+                "hi",
+            ])
+            .expect_err("deep-link chat must fail clap parsing");
+        let rendered = super::clap_render_for(&err).expect("real errors must be scrubbed");
+        assert!(
+            rendered.contains("invalid value"),
+            "non-error parts must stay intact: {rendered}"
+        );
+        assert!(
+            !rendered.contains("15551234567"),
+            "raw phone must be scrubbed: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "scrubbed output must carry the redaction marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn version_output_is_not_scrubbed() {
+        let err = super::Cli::command()
+            .try_get_matches_from(["tele", "--version"])
+            .expect_err("--version must return a clap display error");
+        assert!(!err.use_stderr(), "version prints to stdout");
+        assert!(
+            super::clap_render_for(&err).is_none(),
+            "version must bypass the scrubber"
+        );
+        assert_eq!(super::clap_exit_code(&err), 0);
+    }
+
+    #[test]
+    fn missing_subcommand_help_is_not_scrubbed_and_keeps_usage_exit() {
+        let err = super::Cli::command()
+            .try_get_matches_from(["tele"])
+            .expect_err("bare tele must ask for a subcommand");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert!(err.use_stderr(), "bare tele keeps printing help to stderr");
+        assert!(
+            super::clap_render_for(&err).is_none(),
+            "help body must bypass the scrubber"
+        );
+        let help = err.render().to_string();
+        assert!(help.contains("Usage: tele"), "help body expected: {help}");
+        assert!(
+            !help.contains("[REDACTED]"),
+            "help output must never be scrubbed: {help}"
+        );
+        assert_eq!(super::clap_exit_code(&err), 1, "bare tele must keep exit 1");
     }
 
     #[test]

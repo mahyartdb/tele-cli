@@ -93,7 +93,7 @@ Pin-review cadence (run on every MINOR release, and quarterly at minimum):
 
 ## Never
 
-- Logging api_hash, session strings, SMS codes, 2FA passwords, phone numbers, or short service codes (3–6 digits in code/OTP contexts; counts and ids stay untouched, while keyword-adjacent numbers such as a year after "verification" may redact as accepted collateral)
+- Logging api_hash, session strings, SMS codes, 2FA passwords, phone numbers, or short service codes (3–6 digits in code/OTP contexts). Bare 7–15 digit runs are redacted in diagnostics (stderr logs, error envelopes, and usage errors), including chat/message ids inside usage errors — accepted collateral for phone safety, not a claim that ids "stay untouched"; keyword-adjacent numbers such as a year after "verification" may redact too. `--help`/`--version` and the bare-`tele` usage help printed to stderr are not diagnostics surfaces and stay unredacted
 - Committing secrets
 - Sharing one session across clients
 - Running eval or dynamic imports outside the TL functions tree

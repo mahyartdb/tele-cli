@@ -304,6 +304,9 @@ pub fn parse_target(target: &str) -> crate::error::TeleResult<ResolvedTarget> {
             msg_id: None,
         });
     }
+    if is_integer_shaped(t) {
+        return Err(invalid_target_error(target));
+    }
     match split_tme_link(t) {
         TmeLink::NotLink => {}
         TmeLink::Malformed => return Err(invalid_target_error(target)),
@@ -334,23 +337,70 @@ fn invalid_target_error(raw: &str) -> crate::error::TeleError {
     crate::error::TeleError::Usage(format!("invalid target: \"{raw}\""))
 }
 
+/// A digit-only target that failed `parse::<i64>` can only have overflowed;
+/// falling through would send it to username resolution and fail on the network.
+fn is_integer_shaped(t: &str) -> bool {
+    let digits = t.strip_prefix('-').unwrap_or(t);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.as_bytes().get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix.as_bytes()) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn strip_scheme(raw: &str) -> &str {
+    let mut s = raw;
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = strip_prefix_ignore_ascii_case(s, scheme) {
+            s = rest;
+        }
+    }
+    s
+}
+
 enum TmeLink {
     NotLink,
     Malformed,
     Valid(ResolvedTarget),
 }
 
+/// Schemes and hosts are case-insensitive (RFC 3986), so `HTTPS://T.ME/x`
+/// is the same link as `https://t.me/x`; the username segment is not.
+/// `<username>.t.me/...` is the old-host form of `t.me/<username>/...`
+/// (core.telegram.org/api/links).
 fn split_tme_link(raw: &str) -> TmeLink {
-    let mut s = raw;
-    for scheme in ["https://", "http://"] {
-        if let Some(rest) = s.strip_prefix(scheme) {
-            s = rest;
+    let s = strip_scheme(raw);
+    let (host, path) = match s.find(['/', '?', '#']) {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    };
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower == "t.me" || host_lower == "telegram.me" {
+        if !path.starts_with('/') {
+            return TmeLink::NotLink;
         }
+        return tme_from_path(&path[1..]);
     }
-    for host in ["t.me/", "telegram.me/"] {
-        if let Some(rest) = s.strip_prefix(host) {
-            return tme_from_path(rest);
+    for suffix in [".t.me", ".telegram.me"] {
+        if !host_lower.ends_with(suffix) {
+            continue;
         }
+        let username = &host[..host.len() - suffix.len()];
+        if username.is_empty() {
+            return TmeLink::NotLink;
+        }
+        if !path.starts_with('/') {
+            return TmeLink::Valid(ResolvedTarget {
+                peer_ref: link_peer_name(username),
+                msg_id: None,
+            });
+        }
+        return tme_from_path(&format!("{username}{path}"));
     }
     TmeLink::NotLink
 }
@@ -373,6 +423,17 @@ fn tme_from_path(path: &str) -> TmeLink {
             }),
             None => TmeLink::Malformed,
         },
+        ["c", id, thread, msg] => match (
+            internal_channel_ref(id),
+            parse_thread_id(thread),
+            parse_msg_id(msg),
+        ) {
+            (Some(peer_ref), Some(_), Some(msg_id)) => TmeLink::Valid(ResolvedTarget {
+                peer_ref,
+                msg_id: Some(msg_id),
+            }),
+            _ => TmeLink::Malformed,
+        },
         ["c", id, msg] => match (internal_channel_ref(id), parse_msg_id(msg)) {
             (Some(peer_ref), Some(msg_id)) => TmeLink::Valid(ResolvedTarget {
                 peer_ref,
@@ -384,6 +445,13 @@ fn tme_from_path(path: &str) -> TmeLink {
             peer_ref: link_peer_name(one),
             msg_id: None,
         }),
+        [one, thread, msg] => match (parse_thread_id(thread), parse_msg_id(msg)) {
+            (Some(_), Some(msg_id)) => TmeLink::Valid(ResolvedTarget {
+                peer_ref: link_peer_name(one),
+                msg_id: Some(msg_id),
+            }),
+            _ => TmeLink::Malformed,
+        },
         [one, msg] => match parse_msg_id(msg) {
             Some(msg_id) => TmeLink::Valid(ResolvedTarget {
                 peer_ref: link_peer_name(one),
@@ -414,6 +482,18 @@ fn internal_channel_ref(segment: &str) -> Option<String> {
     }
     let bot_api = 1_000_000_000_000i64.checked_add(raw)?;
     Some(format!("-{bot_api}"))
+}
+
+/// Thread ids are validated then discarded: message links resolve by message
+/// id, matching the existing `?thread=<id>` query form.
+fn parse_thread_id(segment: &str) -> Option<i64> {
+    if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match segment.parse::<i64>() {
+        Ok(id) if id > 0 => Some(id),
+        _ => None,
+    }
 }
 
 fn parse_msg_id(segment: &str) -> Option<i32> {
@@ -467,6 +547,9 @@ fn classify_target(raw: &str) -> Target {
     }
     if let Ok(id) = t.parse::<i64>() {
         return Target::Numeric(id);
+    }
+    if is_integer_shaped(t) {
+        return Target::Invalid;
     }
     match split_tme_link(t) {
         TmeLink::NotLink => {}
@@ -601,14 +684,9 @@ fn checked_fallback_ref(id: i64) -> Option<PeerRef> {
 }
 
 pub(crate) fn strip_link_prefixes(raw: &str) -> &str {
-    let mut s = raw;
-    for scheme in ["https://", "http://"] {
-        if let Some(rest) = s.strip_prefix(scheme) {
-            s = rest;
-        }
-    }
+    let mut s = strip_scheme(raw);
     for prefix in ["t.me/", "telegram.me/"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
+        if let Some(rest) = strip_prefix_ignore_ascii_case(s, prefix) {
             s = rest;
         }
     }
@@ -1499,6 +1577,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_uppercase_scheme_and_host_link_is_link() {
+        assert_eq!(
+            classify_target("HTTPS://T.ME/durov"),
+            Target::Link("durov".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_subdomain_form_link_is_link() {
+        assert_eq!(
+            classify_target("durov.t.me/42"),
+            Target::Link("durov".to_string())
+        );
+    }
+
+    #[test]
     fn classify_tme_link_is_link() {
         assert_eq!(
             classify_target("t.me/durov"),
@@ -1570,6 +1664,25 @@ mod tests {
     }
 
     #[test]
+    fn classify_overflow_digits_is_invalid() {
+        assert_eq!(
+            classify_target("99999999999999999999"),
+            Target::Invalid,
+            "overflow-digit target must fail offline instead of resolving as a username"
+        );
+        assert_eq!(classify_target("-99999999999999999999"), Target::Invalid);
+        assert_eq!(classify_target("-123"), Target::Numeric(-123));
+        assert_eq!(
+            classify_target("9223372036854775807"),
+            Target::Numeric(i64::MAX)
+        );
+        assert_eq!(
+            classify_target("123abc"),
+            Target::Username("123abc".to_string())
+        );
+    }
+
+    #[test]
     fn classify_at_username_is_username() {
         assert_eq!(
             classify_target("@durov"),
@@ -1620,6 +1733,18 @@ mod tests {
     }
 
     #[test]
+    fn classify_tme_thread_links_have_thread_discarded() {
+        assert_eq!(
+            classify_target("t.me/durov/2/42"),
+            Target::Link("durov".to_string())
+        );
+        assert_eq!(
+            classify_target("t.me/c/1234567890/2/42"),
+            Target::Numeric(-1001234567890)
+        );
+    }
+
+    #[test]
     fn classify_tme_deep_link_bad_msg_id_is_invalid() {
         assert_eq!(classify_target("t.me/durov/abc"), Target::Invalid);
     }
@@ -1636,7 +1761,10 @@ mod tests {
 
     #[test]
     fn classify_tme_deep_link_extra_segment_is_invalid() {
-        assert_eq!(classify_target("t.me/durov/42/43"), Target::Invalid);
+        assert_eq!(classify_target("t.me/durov/2/3/4"), Target::Invalid);
+        assert_eq!(classify_target("t.me/c/1/2/3/4"), Target::Invalid);
+        assert_eq!(classify_target("t.me/durov/abc/42"), Target::Invalid);
+        assert_eq!(classify_target("t.me/c/123/2/abc"), Target::Invalid);
     }
 
     #[test]
@@ -1698,6 +1826,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_target_uppercase_scheme_and_host_link() {
+        let rt = parse_target("HTTPS://T.ME/durov").unwrap();
+        assert_eq!(rt.peer_ref, "durov");
+        assert_eq!(rt.msg_id, None);
+    }
+
+    #[test]
+    fn parse_target_mixed_case_telegram_me_host_link() {
+        let rt = parse_target("Telegram.Me/durov").unwrap();
+        assert_eq!(rt.peer_ref, "durov");
+        assert_eq!(rt.msg_id, None);
+    }
+
+    #[test]
+    fn parse_target_subdomain_form_extracts_msg_id() {
+        let rt = parse_target("durov.t.me/42").unwrap();
+        assert_eq!(rt.peer_ref, "durov");
+        assert_eq!(rt.msg_id, Some(42));
+    }
+
+    #[test]
+    fn parse_target_subdomain_form_preserves_username_case() {
+        let rt = parse_target("DUROV.T.ME").unwrap();
+        assert_eq!(rt.peer_ref, "DUROV");
+        assert_eq!(rt.msg_id, None);
+    }
+
+    #[test]
+    fn parse_target_subdomain_form_with_msg_preserves_username_case() {
+        let rt = parse_target("DUROV.T.ME/42").unwrap();
+        assert_eq!(rt.peer_ref, "DUROV");
+        assert_eq!(rt.msg_id, Some(42));
+    }
+
+    #[test]
     fn parse_target_strips_trailing_slashes() {
         let rt = parse_target("t.me/durov/42///").unwrap();
         assert_eq!(rt.peer_ref, "durov");
@@ -1756,6 +1919,37 @@ mod tests {
         let rt = parse_target("t.me/c/1/1").unwrap();
         assert_eq!(rt.peer_ref, "-1000000000001");
         assert_eq!(rt.msg_id, Some(1));
+    }
+
+    #[test]
+    fn parse_target_username_thread_link_extracts_msg_id() {
+        let rt = parse_target("https://t.me/durov/2/42").unwrap();
+        assert_eq!(rt.peer_ref, "durov");
+        assert_eq!(rt.msg_id, Some(42));
+    }
+
+    #[test]
+    fn parse_target_c_form_thread_link_extracts_msg_id() {
+        let rt = parse_target("https://t.me/c/1234567890/2/42").unwrap();
+        assert_eq!(rt.peer_ref, "-1001234567890");
+        assert_eq!(rt.msg_id, Some(42));
+    }
+
+    #[test]
+    fn parse_target_thread_links_strip_single_and_comment_query() {
+        let public = parse_target("t.me/durov/2/42?single&comment=99").unwrap();
+        assert_eq!(public.peer_ref, "durov");
+        assert_eq!(public.msg_id, Some(42));
+        let private = parse_target("t.me/c/1234567890/2/42?single&comment=99").unwrap();
+        assert_eq!(private.peer_ref, "-1001234567890");
+        assert_eq!(private.msg_id, Some(42));
+    }
+
+    #[test]
+    fn parse_target_thread_query_form_still_resolves_msg_id() {
+        let rt = parse_target("t.me/durov/42?thread=2").unwrap();
+        assert_eq!(rt.peer_ref, "durov");
+        assert_eq!(rt.msg_id, Some(42));
     }
 
     #[test]
@@ -1822,6 +2016,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_target_rejects_digit_strings_that_overflow_i64() {
+        for raw in ["99999999999999999999", "-99999999999999999999"] {
+            let err = parse_target(raw).unwrap_err();
+            assert!(
+                matches!(err, crate::error::TeleError::Usage(_)),
+                "{raw} must fail offline as Usage: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_target_i64_max_stays_numeric() {
+        let rt = parse_target("9223372036854775807").unwrap();
+        assert_eq!(rt.peer_ref, "9223372036854775807");
+        assert_eq!(rt.msg_id, None);
+    }
+
+    #[test]
     fn parse_target_rejects_empty_phone_digits() {
         assert!(parse_target("+abc").is_err());
         assert!(parse_target("+").is_err());
@@ -1883,8 +2095,52 @@ mod tests {
 
     #[test]
     fn parse_target_rejects_extra_segments() {
-        assert!(parse_target("t.me/durov/42/43").is_err());
-        assert!(parse_target("t.me/c/1/2/3").is_err());
+        assert!(parse_target("t.me/durov/2/3/4").is_err());
+        assert!(parse_target("t.me/c/1/2/3/4").is_err());
+    }
+
+    #[test]
+    fn parse_target_rejects_bad_thread_ids() {
+        for raw in [
+            "t.me/durov/abc/42",
+            "t.me/durov/0/42",
+            "t.me/durov/-1/42",
+            "t.me/durov/9223372036854775808/42",
+            "t.me/c/123/abc/42",
+            "t.me/c/123/0/42",
+            "t.me/c/123/-1/42",
+            "t.me/c/123/9223372036854775808/42",
+        ] {
+            assert!(parse_target(raw).is_err(), "must reject {raw}");
+        }
+    }
+
+    #[test]
+    fn parse_target_rejects_bad_msg_ids_in_thread_links() {
+        for raw in [
+            "t.me/durov/2/abc",
+            "t.me/durov/2/0",
+            "t.me/durov/2/-1",
+            "t.me/durov/2/2147483648",
+            "t.me/c/123/2/abc",
+            "t.me/c/123/2/0",
+            "t.me/c/123/2/-1",
+            "t.me/c/123/2/2147483648",
+        ] {
+            assert!(parse_target(raw).is_err(), "must reject {raw}");
+        }
+    }
+
+    #[test]
+    fn thread_links_stay_out_of_chat_targets() {
+        for raw in ["t.me/durov/2/3", "t.me/c/123/2/3"] {
+            let err = crate::chat_target::ChatTarget::parse_flag(raw, "chat").unwrap_err();
+            assert!(
+                err.message()
+                    .contains("deep-link message ids are only accepted by: tele msg get"),
+                "{raw}: {err}"
+            );
+        }
     }
 
     #[test]

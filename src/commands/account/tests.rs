@@ -960,6 +960,87 @@ fn other_update_password_errors_pass_through_taxonomy() {
     assert!(matches!(err, TeleError::Rpc(_, 420, _, Some(9))), "{err}");
 }
 
+#[test]
+fn update_settings_errors_do_not_blame_grammers_tl() {
+    let e = grammers_client::InvocationError::Rpc(grammers_client::sender::RpcError {
+        code: 400,
+        name: "NEW_SETTINGS_EMPTY".to_string(),
+        value: None,
+        caused_by: None,
+    });
+    let err = password::map_update_password_error(e);
+    assert!(matches!(err, TeleError::Other(_)), "{err}");
+    let message = err.message();
+    assert!(message.contains("UpdatePasswordSettings"), "{err}");
+    assert!(message.contains("Two-Step Verification"), "{err}");
+    assert!(
+        !message.to_lowercase().contains("grammers"),
+        "payload rejection must not be reported as a library defect: {err}"
+    );
+}
+
+fn round_trip_password_settings(
+    settings: grammers_client::tl::enums::account::PasswordInputSettings,
+) -> grammers_client::tl::types::account::PasswordInputSettings {
+    use grammers_client::tl::{Deserializable, Serializable};
+    let bytes = settings.to_bytes();
+    match grammers_client::tl::enums::account::PasswordInputSettings::from_bytes(&bytes) {
+        Ok(grammers_client::tl::enums::account::PasswordInputSettings::Settings(inner)) => inner,
+        Err(e) => panic!("Telegram's decoder rejects the serialized payload ({e}): {bytes:02x?}"),
+    }
+}
+
+#[test]
+fn remove_password_settings_round_trip_carries_empty_hash_and_hint() {
+    let inner = round_trip_password_settings(remove_password_settings());
+    assert_eq!(
+        inner.new_algo,
+        Some(grammers_client::tl::enums::PasswordKdfAlgo::Unknown)
+    );
+    assert_eq!(inner.new_password_hash, Some(Vec::new()));
+    assert_eq!(inner.hint, Some(String::new()));
+    assert_eq!(inner.email, None);
+    assert_eq!(inner.new_secure_settings, None);
+}
+
+#[test]
+fn new_password_settings_round_trip_without_hint_sends_empty_hint() {
+    let hash = vec![0x11u8; 256];
+    let inner = round_trip_password_settings(new_password_settings(
+        grammers_client::tl::enums::PasswordKdfAlgo::Unknown,
+        hash.clone(),
+        None,
+        None,
+    ));
+    assert_eq!(inner.new_password_hash, Some(hash));
+    assert_eq!(inner.hint, Some(String::new()));
+    assert_eq!(inner.email, None);
+}
+
+#[test]
+fn new_password_settings_round_trip_without_hint_keeps_email_out_of_hint() {
+    let inner = round_trip_password_settings(new_password_settings(
+        grammers_client::tl::enums::PasswordKdfAlgo::Unknown,
+        vec![0x11u8; 256],
+        None,
+        Some("me@example.com"),
+    ));
+    assert_eq!(inner.hint, Some(String::new()));
+    assert_eq!(inner.email, Some("me@example.com".to_string()));
+}
+
+#[test]
+fn new_password_settings_round_trip_with_hint_and_email_preserves_both() {
+    let inner = round_trip_password_settings(new_password_settings(
+        grammers_client::tl::enums::PasswordKdfAlgo::Unknown,
+        vec![0x11u8; 256],
+        Some("pet name"),
+        Some("me@example.com"),
+    ));
+    assert_eq!(inner.hint, Some("pet name".to_string()));
+    assert_eq!(inner.email, Some("me@example.com".to_string()));
+}
+
 fn export_args(name: &str, out: Option<&str>) -> ExportSessionArgs {
     ExportSessionArgs {
         name: name.to_string(),

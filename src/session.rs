@@ -718,7 +718,13 @@ async fn install_copied_session(
     for suffix in ["-journal", "-wal", "-shm"] {
         let _ = std::fs::remove_file(sidecar_path(name, suffix));
     }
-    std::fs::rename(&tmp_path, &path)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        cleanup_partial_import(name);
+        return Err(anyhow::anyhow!(
+            "cannot replace the session file {}: {e}; the previous session's journal files were removed during import and the import failed; run `tele account status --account {name}` to verify the old session before use",
+            path.display()
+        ));
+    }
     restrict_session_files(name)?;
     Ok(ImportedSession {
         account: name.to_string(),
@@ -1084,7 +1090,19 @@ pub async fn write_native_from_telethon(
             data.schema_version
         )));
     }
-    std::fs::rename(&tmp_path, &path)?;
+    // Remove any previous database's sidecars BEFORE the rename lands: a
+    // stale hot -journal/-wal from a crashed prior run would be replayed onto
+    // the imported session and corrupt it. The account lock is held here.
+    for suffix in SESSION_SIDECAR_SUFFIXES {
+        let _ = std::fs::remove_file(sidecar_path(name, suffix));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        cleanup_partial_import(name);
+        return Err(anyhow::anyhow!(
+            "cannot replace the session file {}: {e}; the previous session's journal files were removed during import and the import failed; run `tele account status --account {name}` to verify the old session before use",
+            path.display()
+        ));
+    }
     restrict_session_files(name)?;
     Ok(path)
 }
@@ -2423,6 +2441,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn telethon_native_rename_failure_cleans_tmp_and_names_removed_sidecars() {
+        let _app = TestAppDir::new("telethon-rename-failure");
+        std::fs::create_dir_all(session_path("fromtg")).unwrap();
+        let marker = session_path("fromtg").join("keep");
+        std::fs::write(&marker, b"pre-existing-destination").unwrap();
+        let journal = sidecar_path("fromtg", "-journal");
+        std::fs::write(&journal, b"hot").unwrap();
+
+        let err = write_native_from_telethon("fromtg", &fixture_telethon(2), true)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("journal files were removed"),
+            "rename failure must name the removed sidecars: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("tele account status --account fromtg"),
+            "rename failure must point at status verification with the --account flag: {err}"
+        );
+        assert!(
+            !tmp_session_path("fromtg").exists(),
+            "failed native install must not strand the tmp session"
+        );
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"pre-existing-destination",
+            "failed native install must not remove the pre-existing destination"
+        );
+        assert!(
+            !journal.exists(),
+            "the import removed the old journal before the failed rename"
+        );
+        assert!(
+            session_path("fromtg").exists(),
+            "failed install must not remove the pre-existing destination"
+        );
+    }
+
+    #[tokio::test]
     async fn write_native_from_telethon_rejects_hostname_and_bad_port() {
         let _guard = lock_env();
         let dir = test_dir("telethon-badaddr");
@@ -2702,6 +2761,51 @@ mod tests {
         remove_session("victim").await.unwrap();
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn import_rename_failure_cleans_tmp_and_names_removed_journal() {
+        let app = TestAppDir::new("import-rename-failure");
+        let inbox = app.dir.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let source = inbox.join("src.session");
+        sqlite_scaffold(&source).await;
+        std::fs::create_dir_all(session_path("victim")).unwrap();
+        let marker = session_path("victim").join("keep");
+        std::fs::write(&marker, b"pre-existing-destination").unwrap();
+        let journal = sidecar_path("victim", "-journal");
+        std::fs::write(&journal, b"hot").unwrap();
+
+        let err = install_copied_session("victim", &source, true)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("journal files were removed"),
+            "rename failure must name the removed journal sidecars: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("tele account status --account victim"),
+            "rename failure must point at status verification with the --account flag: {err}"
+        );
+        assert!(
+            !tmp_session_path("victim").exists(),
+            "failed install must not strand the tmp session"
+        );
+        assert!(
+            !journal.exists(),
+            "the import removed the old journal before the failed rename"
+        );
+        assert!(
+            session_path("victim").exists(),
+            "failed install must not remove the pre-existing destination"
+        );
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"pre-existing-destination",
+            "failed install must not alter the pre-existing destination's contents"
+        );
     }
 
     #[tokio::test]

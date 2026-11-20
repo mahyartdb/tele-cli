@@ -859,6 +859,24 @@ fn clap_parse_error_emits_json_envelope() {
 }
 
 #[test]
+fn clap_json_envelope_scrubs_phone_in_command_field() {
+    let (code, out, err) = run_isolated("phonecmd", &["--json", "+15551234567"]);
+    assert_eq!(code, 1, "stderr: {err}");
+    let v = parse_json(&out);
+    assert_eq!(v["error"]["type"], serde_json::json!("UsageError"));
+    let command = v["command"].as_str().unwrap_or_default();
+    assert!(!command.contains("15551234567"), "raw phone leaked: {out}");
+    assert!(
+        command.contains("[REDACTED]"),
+        "command not scrubbed: {out}"
+    );
+    assert!(
+        !out.contains("+15551234567"),
+        "raw phone anywhere in envelope: {out}"
+    );
+}
+
+#[test]
 fn missing_required_arg_emits_json_envelope() {
     let (code, out, err) = run_isolated("badarg", &["--json", "msg", "send"]);
     assert_eq!(code, 1, "stderr: {err}");

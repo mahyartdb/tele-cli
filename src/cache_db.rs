@@ -364,9 +364,16 @@ pub async fn cache_stats(account: &str) -> TeleResult<serde_json::Value> {
                 _ => 0,
             }
         };
-        (get(0), get(1), get(2), get(3))
+        let get_date = |i: i32| -> Option<i64> {
+            match row.get::<libsql::Value>(i) {
+                Ok(libsql::Value::Integer(v)) => Some(v),
+                Ok(libsql::Value::Real(v)) => Some(v as i64),
+                _ => None,
+            }
+        };
+        (get(0), get(1), get_date(2), get_date(3))
     } else {
-        (0, 0, 0, 0)
+        (0, 0, None, None)
     };
     let path = cache_path(account)?;
     let bytes =
@@ -508,10 +515,32 @@ mod tests {
         let stats = cache_stats(&account).await.unwrap();
         assert_eq!(stats["messages"], 2);
         assert_eq!(stats["chats"], 1);
+        assert_eq!(
+            stats["oldest_date"],
+            serde_json::json!(1700000000),
+            "oldest_date must carry the stored minimum"
+        );
+        assert_eq!(
+            stats["newest_date"],
+            serde_json::json!(1700000001),
+            "newest_date must carry the stored maximum"
+        );
         let cleared = clear_cache(&account).await.unwrap();
         assert_eq!(cleared["deleted"], 2);
         let empty = search_cache(&account, "", None, 10).await.unwrap();
         assert!(empty.is_empty());
+        let stats_after_clear = cache_stats(&account).await.unwrap();
+        assert_eq!(stats_after_clear["messages"], 0);
+        assert_eq!(
+            stats_after_clear.get("oldest_date"),
+            Some(&serde_json::Value::Null),
+            "empty cache must not report epoch 0 as oldest_date"
+        );
+        assert_eq!(
+            stats_after_clear.get("newest_date"),
+            Some(&serde_json::Value::Null),
+            "empty cache must not report epoch 0 as newest_date"
+        );
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -939,6 +968,16 @@ mod tests {
         clear_cache(&account).await.unwrap();
         let after = cache_stats(&account).await.unwrap();
         assert_eq!(after["messages"], 0);
+        assert_eq!(
+            after.get("oldest_date"),
+            Some(&serde_json::Value::Null),
+            "empty cache must not report epoch 0 as oldest_date"
+        );
+        assert_eq!(
+            after.get("newest_date"),
+            Some(&serde_json::Value::Null),
+            "empty cache must not report epoch 0 as newest_date"
+        );
         let bytes_after = after["bytes"].as_u64().unwrap();
         assert!(
             bytes_after < bytes_before,

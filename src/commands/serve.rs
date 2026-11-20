@@ -392,14 +392,15 @@ async fn try_send_with_retry(
     false
 }
 
-async fn send_reply(responses: &ServeResponseSender, id: u64, reply: serde_json::Value) {
+async fn send_reply(responses: &ServeResponseSender, id: u64, reply: serde_json::Value) -> bool {
     if try_send_with_retry(responses, reply, RESPONSE_RETRY_BUDGET).await {
-        return;
+        return true;
     }
     output::log_line(
         "warn",
         &format!("serve: dropped reply for request {id}: response channel stayed saturated"),
     );
+    false
 }
 
 const INLINE_OPS: &[(&str, &str, bool, bool, bool)] = &[
@@ -720,39 +721,242 @@ fn identity_json(me: &grammers_client::peer::User) -> serde_json::Value {
     })
 }
 
-type JsonlAck = tokio::sync::oneshot::Sender<TeleResult<()>>;
+enum EmitOutcome {
+    /// The row was handed to the writer thread; it will be written in order.
+    Queued,
+    /// The stdout consumer stayed stalled past the budget and the row was
+    /// dropped. The drop is counted and surfaced in the shutdown log.
+    Dropped,
+}
 
 struct JsonlWriter {
-    tx: tokio::sync::mpsc::Sender<(String, JsonlAck)>,
+    tx: Option<tokio::sync::mpsc::Sender<String>>,
+    dropped: std::sync::Arc<std::sync::Mutex<u32>>,
+    error: std::sync::Arc<std::sync::Mutex<Option<TeleError>>>,
+    handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+    stall_budget: std::time::Duration,
 }
 
 impl JsonlWriter {
-    async fn emit(&self, value: &serde_json::Value) -> TeleResult<()> {
-        let line = serde_json::to_string(value)?;
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send((line, ack_tx))
-            .await
-            .map_err(|_| TeleError::BrokenPipe)?;
-        ack_rx.await.map_err(|_| TeleError::BrokenPipe)?
+    /// Hand one row to the writer thread, waiting at most `stall_budget`.
+    ///
+    /// The handoff is bounded because the writer thread parks inside a
+    /// blocking `writeln!` on a consumer that stopped reading: awaiting a
+    /// per-line ack forever would hang the main loop, drain, and EOF
+    /// shutdown alike. A row that cannot be handed over in time is dropped
+    /// and counted (its correlation id then never appears on stdout).
+    async fn emit(&self, value: &serde_json::Value) -> TeleResult<EmitOutcome> {
+        let line = serde_json::to_string(value).map_err(TeleError::from)?;
+        let Some(tx) = self.tx.as_ref() else {
+            // Unreachable under the owner protocol: tx is only taken by
+            // finish()/Drop, which hold exclusive &mut self. Kept defensive;
+            // the wording names the invariant instead of claiming a panic
+            // happened.
+            return Err(TeleError::TaskPanic(
+                "serve emit called after the writer was finished".to_string(),
+            ));
+        };
+        match tokio::time::timeout(self.stall_budget, tx.send(line)).await {
+            Ok(Ok(())) => Ok(EmitOutcome::Queued),
+            Ok(Err(_)) => Err(self.writer_error()),
+            Err(_) => {
+                let dropped = self.add_dropped(1);
+                output::log_line(
+                    "warn",
+                    &format!(
+                        "serve: dropped a row: stdout stayed stalled for {}s ({dropped} dropped in total)",
+                        self.stall_budget.as_secs()
+                    ),
+                );
+                Ok(EmitOutcome::Dropped)
+            }
+        }
+    }
+
+    /// Close the writer and wait until every queued row is flushed, never
+    /// past `deadline`.
+    ///
+    /// The writer channel has exactly one sender (this value), so closing it
+    /// is what ends the writer thread. The op workers' response senders are
+    /// unrelated to the writer flush, but they must already be gone so no
+    /// response can still arrive behind it.
+    async fn finish(mut self, deadline: tokio::time::Instant) -> Option<TeleError> {
+        self.tx.take();
+        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(handle) = handle {
+            // The writer thread can be inside a write to a consumer that
+            // stopped reading, so the join is bounded: a reader that never
+            // drains must not keep the process alive after the stream ends.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let spawned = std::thread::Builder::new()
+                .name("serve-writer-join".to_string())
+                .spawn(move || {
+                    let _ = handle.join();
+                    let _ = done_tx.send(());
+                });
+            match spawned {
+                Ok(_) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    match tokio::time::timeout(remaining, done_rx).await {
+                        Ok(_) => {}
+                        Err(_) => output::log_line(
+                            "warn",
+                            "serve: stdout did not drain before the shutdown deadline",
+                        ),
+                    }
+                }
+                Err(e) => output::log_line(
+                    "warn",
+                    &format!("serve: could not join the jsonl writer: {e}"),
+                ),
+            }
+        }
+        self.take_diagnostics()
+    }
+
+    fn take_diagnostics(&self) -> Option<TeleError> {
+        log_writer_diagnostics(&self.dropped, &self.error)
+    }
+
+    #[cfg(test)]
+    fn take_dropped(&self) -> u32 {
+        let mut guard = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    }
+
+    fn add_dropped(&self, delta: u32) -> u32 {
+        let mut guard = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = guard.saturating_add(delta);
+        *guard
+    }
+
+    fn writer_error(&self) -> TeleError {
+        let guard = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(e) if e.is_broken_pipe() => TeleError::BrokenPipe,
+            Some(e) => TeleError::Other(e.message()),
+            None => TeleError::TaskPanic("serve writer thread stopped".to_string()),
+        }
+    }
+}
+
+fn log_writer_diagnostics(
+    dropped: &std::sync::Arc<std::sync::Mutex<u32>>,
+    error: &std::sync::Arc<std::sync::Mutex<Option<TeleError>>>,
+) -> Option<TeleError> {
+    let stranded = {
+        let mut guard = dropped.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    if stranded > 0 {
+        output::log_line(
+            "warn",
+            &format!("serve: {stranded} row(s) were dropped before the stream ended"),
+        );
+    }
+    let err = error.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(err) = &err {
+        if !err.is_broken_pipe() {
+            output::log_line(
+                "error",
+                &format!("serve: stdout writer failed: {}", err.message()),
+            );
+        }
+    }
+    err.filter(|e| !e.is_broken_pipe())
+}
+
+impl Drop for JsonlWriter {
+    fn drop(&mut self) {
+        // Reached when no async finish() can run (Ctrl+C drops the serve
+        // future, and several error paths return early). Closing the sender
+        // is what ends the writer thread; the join runs on a helper thread
+        // so a stalled stdout cannot block process teardown.
+        self.tx.take();
+        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // Publish the drop count synchronously: if teardown ends the process
+        // before the detached join finishes, the loss must still be visible.
+        let stranded = {
+            let mut guard = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        if stranded > 0 {
+            output::log_line(
+                "warn",
+                &format!("serve: {stranded} row(s) were dropped before the stream ended"),
+            );
+        }
+        let dropped = std::sync::Arc::clone(&self.dropped);
+        let error = std::sync::Arc::clone(&self.error);
+        if let Some(handle) = handle {
+            let spawned = std::thread::Builder::new()
+                .name("serve-writer-join".to_string())
+                .spawn(move || {
+                    let _ = handle.join();
+                    // finish() reports these on the EOF path; a teardown
+                    // that skips finish() must not lose the drop count or
+                    // a non-broken-pipe writer failure. stderr only, and
+                    // the slots are taken so a later finish() cannot
+                    // double-log.
+                    log_writer_diagnostics(&dropped, &error);
+                });
+            if let Err(e) = spawned {
+                output::log_line(
+                    "warn",
+                    &format!("serve: could not join the jsonl writer: {e}"),
+                );
+            }
+        } else {
+            // finish() already joined the thread and must have logged the
+            // diagnostics; nothing left to report here.
+            log_writer_diagnostics(&dropped, &error);
+        }
+    }
+}
+
+/// One writer thread owns stdout for the whole serve run, so rows keep the
+/// order they were submitted in and the queue bound is the only buffer
+/// between the op lanes and stdout.
+fn spawn_writer<F, W>(open: F, capacity: usize, stall_budget: std::time::Duration) -> JsonlWriter
+where
+    F: FnOnce() -> W + Send + 'static,
+    W: Write,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(capacity);
+    let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let writer_error = std::sync::Arc::clone(&error);
+    let handle = std::thread::Builder::new()
+        .name("serve-jsonl-writer".to_string())
+        .spawn(move || {
+            let mut out = open();
+            while let Some(line) = rx.blocking_recv() {
+                let written = writeln!(out, "{line}")
+                    .and_then(|()| out.flush())
+                    .map_err(TeleError::from);
+                if let Err(e) = written {
+                    *writer_error
+                        .lock()
+                        .unwrap_or_else(|inner| inner.into_inner()) = Some(e);
+                    break;
+                }
+            }
+        })
+        .expect("spawn serve jsonl writer thread");
+    JsonlWriter {
+        tx: Some(tx),
+        dropped: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        error,
+        handle: std::sync::Arc::new(std::sync::Mutex::new(Some(handle))),
+        stall_budget,
     }
 }
 
 fn spawn_jsonl_writer() -> JsonlWriter {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, JsonlAck)>(SERVE_OUTPUT_CAPACITY);
-    let _handle = std::thread::Builder::new()
-        .name("serve-jsonl-writer".to_string())
-        .spawn(move || {
-            let mut out = std::io::stdout().lock();
-            while let Some((line, ack)) = rx.blocking_recv() {
-                let result = writeln!(out, "{line}")
-                    .and_then(|()| out.flush())
-                    .map_err(TeleError::from);
-                let _ = ack.send(result);
-            }
-        })
-        .expect("spawn serve jsonl writer thread");
-    JsonlWriter { tx }
+    spawn_writer(
+        || std::io::stdout().lock(),
+        SERVE_OUTPUT_CAPACITY,
+        SERVE_WRITE_STALL_BUDGET,
+    )
 }
 
 #[macro_export]
@@ -1007,7 +1211,25 @@ fn try_send_to_lane(
                 % reads.len().max(1);
             match reads[idx].try_send(job) {
                 Ok(()) => LaneSend::Queued,
-                Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => LaneSend::QueueFull(job),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    if reads.len() > 1 {
+                        let sibling = (idx + 1) % reads.len();
+                        match reads[sibling].try_send(returned) {
+                            Ok(()) => LaneSend::Queued,
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                                LaneSend::QueueFull(job)
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
+                                // The primary was merely full; a dead sibling
+                                // does not make the job undeliverable, so keep
+                                // the retryable QueueFull signal.
+                                LaneSend::QueueFull(job)
+                            }
+                        }
+                    } else {
+                        LaneSend::QueueFull(returned)
+                    }
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => LaneSend::Closed,
             }
         }
@@ -1029,13 +1251,14 @@ async fn dispatch_action(
     reads: &[tokio::sync::mpsc::Sender<Job>],
     read_counter: &std::sync::atomic::AtomicUsize,
     responses: &tokio::sync::mpsc::Sender<serde_json::Value>,
+    pending: &DispatcherPending,
     id: u64,
     op: &str,
     params: serde_json::Value,
 ) -> TeleResult<()> {
     if op == "ping" {
         let response = response_ok(id, serde_json::json!({ "pong": true }));
-        send_reply(responses, id, response).await;
+        send_answered_reply(pending, responses, id, response).await;
         return Ok(());
     }
     if op == "stream.resync" {
@@ -1044,13 +1267,13 @@ async fn dispatch_action(
             Ok(a) => a,
             Err(error) => {
                 let response = response_err(Some(id), error);
-                send_reply(responses, id, response).await;
+                send_answered_reply(pending, responses, id, response).await;
                 return Ok(());
             }
         };
         if let Err(error) = validate_no_params(op, &params) {
             let response = response_err(Some(id), error);
-            send_reply(responses, id, response).await;
+            send_answered_reply(pending, responses, id, response).await;
             return Ok(());
         }
         for name in &selected {
@@ -1065,22 +1288,22 @@ async fn dispatch_action(
             }
         }
         let response = response_ok(id, serde_json::json!({ "resync": "started" }));
-        send_reply(responses, id, response).await;
+        send_answered_reply(pending, responses, id, response).await;
         return Ok(());
     }
     if op == "ops.list" {
         if let Err(error) = validate_no_params(op, &params) {
             let response = response_err(Some(id), error);
-            send_reply(responses, id, response).await;
+            send_answered_reply(pending, responses, id, response).await;
             return Ok(());
         }
         let response = response_ok(id, ops_list_data());
-        send_reply(responses, id, response).await;
+        send_answered_reply(pending, responses, id, response).await;
         return Ok(());
     }
     let Some(route) = find_route(op) else {
         let response = response_err(Some(id), not_implemented(op));
-        send_reply(responses, id, response).await;
+        send_answered_reply(pending, responses, id, response).await;
         return Ok(());
     };
     let mut raw = params;
@@ -1088,24 +1311,24 @@ async fn dispatch_action(
         Ok(a) => a,
         Err(error) => {
             let response = response_err(Some(id), error);
-            send_reply(responses, id, response).await;
+            send_answered_reply(pending, responses, id, response).await;
             return Ok(());
         }
     };
     if let Err(error) = apply_confirm_gate(op, route.destructive, route.planner, &mut raw) {
         let response = response_err(Some(id), error);
-        send_reply(responses, id, response).await;
+        send_answered_reply(pending, responses, id, response).await;
         return Ok(());
     }
     match (route.planner)(op, raw) {
         Err(error) => {
             let response = response_err(Some(id), error);
-            send_reply(responses, id, response).await;
+            send_answered_reply(pending, responses, id, response).await;
             Ok(())
         }
         Ok(Plan::DryRun(data)) => {
             let response = response_ok(id, data);
-            send_reply(responses, id, response).await;
+            send_answered_reply(pending, responses, id, response).await;
             Ok(())
         }
         Ok(Plan::Execute(raw)) => {
@@ -1113,7 +1336,7 @@ async fn dispatch_action(
                 Ok(shares) => shares,
                 Err(error) => {
                     let response = response_err(Some(id), error);
-                    send_reply(responses, id, response).await;
+                    send_answered_reply(pending, responses, id, response).await;
                     return Ok(());
                 }
             };
@@ -1129,9 +1352,12 @@ async fn dispatch_action(
                     completed: false,
                 },
             };
+            // From here the guard (or the QueueFull envelope) owns the
+            // answer, and the transition is synchronous, so an abort cannot
+            // land between the hand-off and the Answered mark.
             let send_result = try_send_to_lane(job, route.lane, mutations, reads, read_counter);
             match send_result {
-                LaneSend::Queued => {}
+                LaneSend::Queued => mark_answered(pending, id),
                 LaneSend::QueueFull(mut job) => {
                     let id = job.guard.id;
                     let op = job.guard.op;
@@ -1139,7 +1365,9 @@ async fn dispatch_action(
                     job.guard.completed = true;
                     drop(job);
                     let envelope = queue_full_envelope(id, op, lane);
-                    if !try_send_with_retry(responses, envelope, RESPONSE_RETRY_BUDGET).await {
+                    if try_send_with_retry(responses, envelope, RESPONSE_RETRY_BUDGET).await {
+                        mark_answered(pending, id);
+                    } else {
                         output::log_line(
                             "warn",
                             &format!(
@@ -1149,6 +1377,10 @@ async fn dispatch_action(
                     }
                 }
                 LaneSend::Closed => {
+                    // The dropped job's guard answered StreamDown on the way
+                    // out, so the id has an owner even though the lane is
+                    // gone.
+                    mark_answered(pending, id);
                     output::log_line("warn", "serve: op queue closed before dispatch");
                 }
             }
@@ -1156,48 +1388,263 @@ async fn dispatch_action(
         }
     }
 }
-const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Held back from the dispatcher wait and from drain phase 1 so the
+/// abandoned-id sweep and the aborted guards' StreamDown flush always have a
+/// live budget; it must cover the guard's own 2s response retry budget.
+const SWEEP_RESERVE: std::time::Duration = std::time::Duration::from_millis(2_500);
+/// Nothing polls the response channel while the dispatcher is being awaited,
+/// so waiting out the whole budget starves inline replies blocked in
+/// try_send_with_retry and leaves the drain no time to flush replies the
+/// workers already computed. The sweep owns whatever the dispatcher did not
+/// finish, so a wait past this cap buys nothing.
+const DISPATCH_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(1);
+/// The stdout writer thread parks inside a blocking writeln! when the
+/// consumer stops reading; an emit that cannot hand its row over within
+/// this budget drops the row and counts it instead of parking the caller
+/// (and with it the whole serve loop) forever.
+const SERVE_WRITE_STALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const SERVE_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hand one row to the writer inside a bounded window. A stall past the
+/// window drops the row, counts it, and keeps draining: the deadline is the
+/// caller's remaining budget, not a reason to abandon responses already in
+/// hand.
+async fn emit_bounded(
+    writer: &JsonlWriter,
+    value: &serde_json::Value,
+    window: Duration,
+) -> TeleResult<()> {
+    match tokio::time::timeout(window, writer.emit(value)).await {
+        Ok(outcome) => outcome.map(|_| ()),
+        Err(_) => {
+            let dropped = writer.add_dropped(1);
+            output::log_line(
+                "warn",
+                &format!(
+                    "serve: dropped a row at the drain deadline: stdout stayed stalled ({dropped} dropped in total)"
+                ),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn abort_workers(workers: &mut Vec<tokio::task::JoinHandle<()>>) {
+    for worker in workers.drain(..) {
+        worker.abort();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingState {
+    Queued,
+    Claimed,
+    Answered,
+}
+
+struct PendingEntry {
+    op: String,
+    state: PendingState,
+}
+
+/// Ids handed to the dispatcher. A queued id has no Job, so no
+/// JobCompletionGuard speaks for it if the stream ends first; a claimed id has
+/// no guard either while dispatch_action is awaiting a reply or a lane slot.
+/// The EOF sweep answers everything that never reached Answered.
+type DispatcherPending = std::sync::Arc<std::sync::Mutex<HashMap<u64, PendingEntry>>>;
+
+fn pending_lock(
+    pending: &DispatcherPending,
+) -> std::sync::MutexGuard<'_, HashMap<u64, PendingEntry>> {
+    pending.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn mark_claimed(pending: &DispatcherPending, id: u64) {
+    if let Some(entry) = pending_lock(pending).get_mut(&id) {
+        entry.state = PendingState::Claimed;
+    }
+}
+
+fn mark_answered(pending: &DispatcherPending, id: u64) {
+    if let Some(entry) = pending_lock(pending).get_mut(&id) {
+        entry.state = PendingState::Answered;
+    }
+}
+
+fn remove_answered(pending: &DispatcherPending, id: u64) {
+    let mut map = pending_lock(pending);
+    if map
+        .get(&id)
+        .is_some_and(|entry| entry.state == PendingState::Answered)
+    {
+        map.remove(&id);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DispatchEnqueue {
+    Queued,
+    Full,
+    Closed,
+}
+
+/// Register and hand one action to the dispatcher. Registration happens
+/// BEFORE the hand-off: the dispatcher can claim and answer the id before the
+/// main loop regains control, and a late insert would leave a stale entry the
+/// EOF sweep answers a second time.
+fn enqueue_dispatch(
+    pending: &DispatcherPending,
+    dispatch_tx: &tokio::sync::mpsc::Sender<(u64, String, serde_json::Value)>,
+    id: u64,
+    op: &str,
+    params: serde_json::Value,
+) -> DispatchEnqueue {
+    pending_lock(pending).insert(
+        id,
+        PendingEntry {
+            op: op.to_string(),
+            state: PendingState::Queued,
+        },
+    );
+    match dispatch_tx.try_send((id, op.to_string(), params)) {
+        Ok(()) => DispatchEnqueue::Queued,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            pending_lock(pending).remove(&id);
+            DispatchEnqueue::Full
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            pending_lock(pending).remove(&id);
+            DispatchEnqueue::Closed
+        }
+    }
+}
+
+async fn send_answered_reply(
+    pending: &DispatcherPending,
+    responses: &ServeResponseSender,
+    id: u64,
+    reply: serde_json::Value,
+) {
+    if send_reply(responses, id, reply).await {
+        mark_answered(pending, id);
+    }
+}
+
+/// Answer ids the dispatcher queued or claimed but never answered. Runs on
+/// the EOF path after the dispatcher is stopped and awaited, so no inline
+/// reply can still be in flight; a row the stalled stdout cannot take is
+/// dropped and counted like any other emit.
+async fn emit_abandoned_dispatch(
+    writer: &JsonlWriter,
+    pending: &DispatcherPending,
+    deadline: tokio::time::Instant,
+) {
+    let mut abandoned: Vec<(u64, String)> = {
+        let mut map = pending_lock(pending);
+        std::mem::take(&mut *map)
+            .into_iter()
+            .filter(|(_, entry)| entry.state != PendingState::Answered)
+            .map(|(id, entry)| (id, entry.op))
+            .collect()
+    };
+    abandoned.sort_by_key(|(id, _)| *id);
+    for (id, op) in abandoned {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // A writer failure at this point surfaces through finish()/Drop
+        // diagnostics; the sweep itself must keep answering remaining ids.
+        let _ = emit_bounded(writer, &undelivered_envelope(id, &op), remaining).await;
+    }
+}
+
+/// Stop the dispatcher and answer every id it queued or claimed but never
+/// answered. The wait keeps `SWEEP_RESERVE` back from the deadline and is
+/// capped at `DISPATCH_WAIT_CAP`; after abort the task is awaited so no
+/// inline reply is still in flight when the registry is taken.
+async fn shutdown_dispatcher(
+    dispatcher: &mut tokio::task::JoinHandle<()>,
+    writer: &JsonlWriter,
+    pending: &DispatcherPending,
+    deadline: tokio::time::Instant,
+) {
+    let wait = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .saturating_sub(SWEEP_RESERVE)
+        .min(DISPATCH_WAIT_CAP);
+    if tokio::time::timeout(wait, &mut *dispatcher).await.is_err() {
+        dispatcher.abort();
+        let _ = (&mut *dispatcher).await;
+    }
+    emit_abandoned_dispatch(writer, pending, deadline).await;
+}
 
 async fn drain_and_flush(
     workers: &mut Vec<tokio::task::JoinHandle<()>>,
     writer: &JsonlWriter,
     response_rx: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
 ) -> TeleResult<()> {
-    let deadline = tokio::time::sleep(DRAIN_BUDGET);
-    tokio::pin!(deadline);
-    let mut aborted = false;
+    let deadline = tokio::time::Instant::now() + SERVE_FLUSH_BUDGET;
+    drain_and_flush_until(workers, writer, response_rx, deadline).await
+}
+
+async fn drain_and_flush_until(
+    workers: &mut Vec<tokio::task::JoinHandle<()>>,
+    writer: &JsonlWriter,
+    response_rx: &mut tokio::sync::mpsc::Receiver<serde_json::Value>,
+    flush_deadline: tokio::time::Instant,
+) -> TeleResult<()> {
+    let now = tokio::time::Instant::now();
+    let abort_at = now
+        + flush_deadline
+            .saturating_duration_since(now)
+            .saturating_sub(SWEEP_RESERVE);
+    // Phase 1: flush completed responses up to the abort point.
     loop {
-        tokio::select! {
+        let now = tokio::time::Instant::now();
+        if now >= abort_at {
+            break;
+        }
+        let deadline = tokio::time::sleep_until(abort_at);
+        tokio::pin!(deadline);
+        // The select only waits for a response or the abort point. The emit
+        // runs after it with a window measured from the current clock, so a
+        // response that arrives late cannot inherit the window from loop
+        // entry and push the emit past the flush deadline.
+        let received = tokio::select! {
             biased;
-            maybe = response_rx.recv() => match maybe {
-                Some(value) => match writer.emit(&value).await {
-                    Ok(()) => {}
-                    Err(e) if e.is_broken_pipe() => {
-                        for worker in workers.drain(..) {
-                            worker.abort();
-                        }
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        for worker in workers.drain(..) {
-                            worker.abort();
-                        }
-                        return Err(e);
-                    }
-                },
-                None => {
-                    workers.clear();
-                    return Ok(());
-                }
-            },
-            _ = &mut deadline, if !aborted && !workers.is_empty() => {
-                for worker in workers.drain(..) {
-                    worker.abort();
-                }
-                aborted = true;
-            }
+            maybe = response_rx.recv() => maybe,
+            _ = &mut deadline => break,
+        };
+        let Some(value) = received else {
+            break;
+        };
+        let window = abort_at.saturating_duration_since(tokio::time::Instant::now());
+        if let Err(e) = emit_bounded(writer, &value, window).await {
+            abort_workers(workers);
+            return Err(e);
         }
     }
+    abort_workers(workers);
+    // Phase 2: sweep the StreamDown envelopes the aborted jobs' guards
+    // enqueue on drop, until the flush deadline or the channel closes.
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= flush_deadline {
+            break;
+        }
+        let remaining = flush_deadline.saturating_duration_since(now);
+        match tokio::time::timeout(remaining, response_rx.recv()).await {
+            Ok(Some(value)) => {
+                let window = flush_deadline.saturating_duration_since(tokio::time::Instant::now());
+                emit_bounded(writer, &value, window).await?;
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 fn event_kind_allowed(update: &Update, kinds: &[String]) -> Option<&'static str> {
@@ -1321,6 +1768,9 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     }
     let (dispatch_tx, mut dispatch_rx) =
         tokio::sync::mpsc::channel::<(u64, String, serde_json::Value)>(SERVE_INTAKE_CAPACITY);
+    let dispatcher_pending: DispatcherPending =
+        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let disp_pending = std::sync::Arc::clone(&dispatcher_pending);
     let disp_response_tx = response_tx.clone();
     let disp_pool = std::sync::Arc::clone(&pool);
     let disp_mutations = mutations.clone();
@@ -1329,6 +1779,10 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     let disp_read_counter_clone = std::sync::Arc::clone(&disp_read_counter);
     let mut dispatcher = tokio::spawn(async move {
         while let Some((id, op, params)) = dispatch_rx.recv().await {
+            // Dequeue only claims the id: an abort can land inside
+            // dispatch_action before any reply or Job guard exists, and the
+            // EOF sweep must still answer that id.
+            mark_claimed(&disp_pending, id);
             let served = disp_pool.served();
             let _ = dispatch_action(
                 &disp_pool,
@@ -1337,11 +1791,13 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                 &disp_read_senders,
                 &disp_read_counter_clone,
                 &disp_response_tx,
+                &disp_pending,
                 id,
                 &op,
                 params,
             )
             .await;
+            remove_answered(&disp_pending, id);
         }
     });
     let main_response_tx = response_tx.clone();
@@ -1399,13 +1855,17 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                 drop(mutations);
                 drop(read_senders);
                 drop(main_response_tx);
-                let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
-                // timeout() on a borrowed handle leaves the task running; a
-                // dispatcher stuck past the budget (e.g. blocked on a
-                // saturated lane) would otherwise keep response_rx clones
-                // alive and hang drain_and_flush / EOF shutdown forever.
-                dispatcher.abort();
-                drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
+                // One absolute deadline covers the dispatcher wait, the
+                // abandoned-id sweep, the drain, and the writer join, so the
+                // documented 10s EOF bound holds under backpressure.
+                let eof_deadline = tokio::time::Instant::now() + SERVE_FLUSH_BUDGET;
+                shutdown_dispatcher(&mut dispatcher, &writer, &dispatcher_pending, eof_deadline)
+                    .await;
+                drain_and_flush_until(&mut workers, &writer, &mut response_rx, eof_deadline)
+                    .await?;
+                if let Some(err) = writer.finish(eof_deadline).await {
+                    return Err(err);
+                }
                 return Ok(EXIT_OK);
             }
             Tick::Line(line) => match parse_incoming(&line) {
@@ -1441,8 +1901,8 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         }
                         continue;
                     }
-                    match dispatch_tx.try_send((id, op, params)) {
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    match enqueue_dispatch(&dispatcher_pending, &dispatch_tx, id, &op, params) {
+                        DispatchEnqueue::Full => {
                             let reply = response_err(
                                 Some(id),
                                 err_json(
@@ -1461,10 +1921,10 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 );
                             }
                         }
-                        Err(_) => {
+                        DispatchEnqueue::Closed => {
                             output::log_line("warn", "serve: dispatch queue closed");
                         }
-                        Ok(()) => {}
+                        DispatchEnqueue::Queued => {}
                     }
                 }
             },
@@ -1478,13 +1938,13 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                 }
             }
             Tick::Response(value) => match writer.emit(&value).await {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(e) if e.is_broken_pipe() => {
                     drop(dispatch_tx);
                     drop(mutations);
                     drop(read_senders);
                     drop(main_response_tx);
-                    let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                    let _ = tokio::time::timeout(SERVE_FLUSH_BUDGET, &mut dispatcher).await;
                     dispatcher.abort();
                     drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                     return Ok(EXIT_OK);
@@ -1494,7 +1954,7 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     drop(mutations);
                     drop(read_senders);
                     drop(main_response_tx);
-                    let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                    let _ = tokio::time::timeout(SERVE_FLUSH_BUDGET, &mut dispatcher).await;
                     dispatcher.abort();
                     drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                     return Err(e);
@@ -1526,13 +1986,13 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     ))
                     .await
                 {
-                    Ok(()) => greeted = true,
+                    Ok(_) => greeted = true,
                     Err(e) if e.is_broken_pipe() => {
                         drop(dispatch_tx);
                         drop(mutations);
                         drop(read_senders);
                         drop(main_response_tx);
-                        let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                        let _ = tokio::time::timeout(SERVE_FLUSH_BUDGET, &mut dispatcher).await;
                         dispatcher.abort();
                         drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                         return Ok(EXIT_OK);
@@ -1548,13 +2008,13 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                 let mut row = event_row("Reconnected", &name, None, None, None);
                 apply_seq(&mut row, &mut seq);
                 match writer.emit(&row).await {
-                    Ok(()) => {}
+                    Ok(_) => {}
                     Err(e) if e.is_broken_pipe() => {
                         drop(dispatch_tx);
                         drop(mutations);
                         drop(read_senders);
                         drop(main_response_tx);
-                        let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                        let _ = tokio::time::timeout(SERVE_FLUSH_BUDGET, &mut dispatcher).await;
                         dispatcher.abort();
                         drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                         return Ok(EXIT_OK);
@@ -1582,7 +2042,7 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                 let mut emitted = false;
                 for _ in 0..2 {
                     match writer.emit(&ev).await {
-                        Ok(()) => {
+                        Ok(_) => {
                             emitted = true;
                             break;
                         }
@@ -1591,7 +2051,7 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                             drop(mutations);
                             drop(read_senders);
                             drop(main_response_tx);
-                            let _ = tokio::time::timeout(DRAIN_BUDGET, &mut dispatcher).await;
+                            let _ = tokio::time::timeout(SERVE_FLUSH_BUDGET, &mut dispatcher).await;
                             dispatcher.abort();
                             drain_and_flush(&mut workers, &writer, &mut response_rx).await?;
                             return Ok(EXIT_OK);
@@ -3869,6 +4329,576 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_lane_falls_back_to_sibling_before_reporting_queue_full() {
+        let (read_a, mut rx_a) = tokio::sync::mpsc::channel::<Job>(READ_QUEUE_CAPACITY);
+        let (read_b, mut rx_b) = tokio::sync::mpsc::channel::<Job>(READ_QUEUE_CAPACITY);
+        let reads = vec![read_a, read_b];
+        let mutations = tokio::sync::mpsc::channel::<Job>(4).0;
+        let read_counter = std::sync::atomic::AtomicUsize::new(0);
+        let queued = |id: u64| {
+            try_send_to_lane(
+                scripted_job(id, 0, None),
+                Lane::Read,
+                &mutations,
+                &reads,
+                &read_counter,
+            )
+        };
+        assert!(matches!(queued(0), LaneSend::Queued));
+        assert!(matches!(queued(1), LaneSend::Queued));
+        assert!(
+            rx_a.try_recv().is_ok() && rx_b.try_recv().is_ok(),
+            "round robin must spread the first two jobs across both workers"
+        );
+        // Fill worker 0 to capacity directly; the counter now points at
+        // worker 0, so the next dispatch deterministically hits a full lane.
+        for i in 2..READ_QUEUE_CAPACITY {
+            reads[0]
+                .try_send(scripted_job(i as u64, 0, None))
+                .expect("fill worker 0");
+        }
+        for i in 0..READ_QUEUE_CAPACITY {
+            assert!(
+                matches!(queued(1_000 + i as u64), LaneSend::Queued),
+                "job {i} must fall back to the idle sibling before QueueFull"
+            );
+        }
+        // Fill both workers to capacity directly; only then may QueueFull appear.
+        while reads[0].try_send(scripted_job(8_000, 0, None)).is_ok() {}
+        while reads[1].try_send(scripted_job(8_001, 0, None)).is_ok() {}
+        assert!(matches!(queued(9_999), LaneSend::QueueFull(_)));
+        let mut drained = 0;
+        while rx_a.try_recv().is_ok() {
+            drained += 1;
+        }
+        while rx_b.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(
+            drained,
+            2 * READ_QUEUE_CAPACITY,
+            "fallback must not drop jobs"
+        );
+    }
+
+    struct BlockedSink {
+        gate: std::sync::Arc<std::sync::Mutex<()>>,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl Write for BlockedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _guard = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            self.written
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let _guard = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn blocked_sink() -> (
+        std::sync::Arc<std::sync::Mutex<()>>,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        BlockedSink,
+    ) {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = BlockedSink {
+            gate: std::sync::Arc::clone(&gate),
+            written: std::sync::Arc::clone(&written),
+        };
+        (gate, written, sink)
+    }
+
+    const STALL_TEST_BUDGET: Duration = Duration::from_millis(300);
+
+    /// Fill the writer's handoff channel until the stalled stdout forces a
+    /// drop; returns the index of the first dropped row.
+    async fn fill_until_first_drop(writer: &JsonlWriter) -> u32 {
+        for i in 0..64u32 {
+            if matches!(
+                writer
+                    .emit(&serde_json::json!({"n": i}))
+                    .await
+                    .expect("pre-stall emits must not error"),
+                EmitOutcome::Dropped
+            ) {
+                return i;
+            }
+        }
+        panic!("emit never dropped against a permanently stalled stdout");
+    }
+
+    #[tokio::test]
+    async fn emit_returns_within_budget_and_counts_drop_when_writer_writeln_blocks() {
+        let (gate, _written, sink) = blocked_sink();
+        let _held = gate.lock().unwrap();
+        let writer = spawn_writer(move || sink, 4, STALL_TEST_BUDGET);
+        let first_drop = fill_until_first_drop(&writer).await;
+        let started = std::time::Instant::now();
+        let outcome = writer
+            .emit(&serde_json::json!({"stalled": true}))
+            .await
+            .expect("a stalled stdout drops the row instead of erroring");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, EmitOutcome::Dropped),
+            "stalled emit must be a drop"
+        );
+        assert!(
+            elapsed >= STALL_TEST_BUDGET.saturating_sub(Duration::from_millis(100)),
+            "emit must actually wait out the budget before dropping, took {elapsed:?}"
+        );
+        assert!(
+            elapsed <= STALL_TEST_BUDGET + Duration::from_millis(500),
+            "emit must return within the write stall budget, took {elapsed:?}"
+        );
+        assert_eq!(
+            writer.take_dropped(),
+            2,
+            "the drop after fill-until-drop {first_drop} must be counted"
+        );
+        drop(_held);
+        let _ = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn emit_after_a_stall_still_writes_its_own_line() {
+        let (gate, written, sink) = blocked_sink();
+        let _held = gate.lock().unwrap();
+        let writer = spawn_writer(move || sink, 4, STALL_TEST_BUDGET);
+        fill_until_first_drop(&writer).await;
+        writer
+            .emit(&serde_json::json!({"stalled": true}))
+            .await
+            .expect("stalled row drops");
+        drop(_held);
+        writer
+            .emit(&serde_json::json!({"recovered": true}))
+            .await
+            .expect("a later emit after recovery still queues");
+        let _ = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await;
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("recovered"),
+            "recovered row must reach stdout: {out}"
+        );
+        assert!(
+            !out.contains("stalled"),
+            "the dropped row must never reach stdout: {out}"
+        );
+        assert!(
+            out.lines().count() >= 2,
+            "queued rows keep flowing after a drop: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lane_reports_queue_full_when_primary_full_and_sibling_closed() {
+        let (primary, _primary_rx) = tokio::sync::mpsc::channel::<Job>(READ_QUEUE_CAPACITY);
+        let (sibling, sibling_rx) = tokio::sync::mpsc::channel::<Job>(READ_QUEUE_CAPACITY);
+        drop(sibling_rx);
+        let reads = vec![primary, sibling];
+        let mutations = tokio::sync::mpsc::channel::<Job>(4).0;
+        let read_counter = std::sync::atomic::AtomicUsize::new(0);
+        while reads[0].try_send(scripted_job(1, 0, None)).is_ok() {}
+        match try_send_to_lane(
+            scripted_job(44, 0, None),
+            Lane::Read,
+            &mutations,
+            &reads,
+            &read_counter,
+        ) {
+            LaneSend::QueueFull(job) => {
+                assert_eq!(job.id, 44, "the returned job must be the rejected one");
+            }
+            _ => panic!(
+                "a full primary with a closed sibling must answer QueueFull (retryable), not Closed"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_aborted_inflight_job_sweeps_its_stream_down_envelope_to_the_writer() {
+        let (_gate, written, sink) = blocked_sink();
+        let writer = spawn_writer(move || sink, SERVE_OUTPUT_CAPACITY, STALL_TEST_BUDGET);
+        let (mutation_tx, mutation_rx) = tokio::sync::mpsc::channel::<Job>(4);
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(RESPONSE_CAPACITY);
+        let worker = tokio::spawn(job_worker(mutation_rx, response_tx.clone()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let job = Job {
+            id: 31,
+            op: "msg send",
+            timeout: None,
+            future: Box::pin(async move {
+                let _ = started_tx.send(());
+                std::future::pending::<Result<serde_json::Value, serde_json::Value>>().await
+            }),
+            guard: JobCompletionGuard {
+                id: 31,
+                op: "msg send",
+                responses: response_tx.clone(),
+                completed: false,
+            },
+        };
+        mutation_tx.send(job).await.unwrap();
+        drop(mutation_tx);
+        started_rx
+            .await
+            .expect("worker must start the pending job before the drain aborts it");
+        drop(response_tx);
+        let mut workers = vec![worker];
+        drain_and_flush_until(
+            &mut workers,
+            &writer,
+            &mut response_rx,
+            tokio::time::Instant::now() + Duration::from_millis(600),
+        )
+        .await
+        .expect("drain must finish inside its budget");
+        assert!(workers.is_empty(), "drain must abort every worker");
+        let _ = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await;
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let envelopes: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("writer emits json lines"))
+            .collect();
+        assert!(
+            envelopes
+                .iter()
+                .any(|v| v["id"] == 31 && v["ok"] == false && v["error"]["type"] == "StreamDown"),
+            "aborted in-flight job must answer StreamDown, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_bounds_a_stalled_writer_without_hanging() {
+        let (gate, _written, sink) = blocked_sink();
+        let _held = gate.lock().unwrap();
+        let writer = spawn_writer(move || sink, 4, STALL_TEST_BUDGET);
+        fill_until_first_drop(&writer).await;
+        assert!(
+            writer.take_dropped() >= 1,
+            "the pre-drain fill must leave drops behind"
+        );
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(RESPONSE_CAPACITY);
+        response_tx
+            .send(serde_json::json!({"type": "response", "id": 5, "ok": true}))
+            .await
+            .unwrap();
+        let mut workers = Vec::new();
+        let budget = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_and_flush_until(
+                &mut workers,
+                &writer,
+                &mut response_rx,
+                tokio::time::Instant::now() + budget,
+            ),
+        )
+        .await
+        .expect("drain must not hang on a stalled writer");
+        assert!(result.is_ok());
+        assert!(
+            started.elapsed() < budget + Duration::from_secs(1),
+            "drain overran its budget: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            writer.take_dropped() >= 1,
+            "a response dropped at the drain deadline must be counted"
+        );
+        drop(_held);
+        let _ = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await;
+    }
+
+    struct DiskFullSink;
+
+    impl std::io::Write for DiskFullSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_reports_a_writer_failure_so_eof_cannot_exit_zero() {
+        let writer = spawn_writer(|| DiskFullSink, 4, STALL_TEST_BUDGET);
+        writer
+            .emit(&serde_json::json!({"type": "response", "id": 1}))
+            .await
+            .expect("the row queues before the writer thread fails");
+        let err = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await
+            .expect("a final-flush write failure must be reported");
+        assert!(!err.is_broken_pipe(), "err: {err:?}");
+        assert!(
+            err.message().contains("disk full"),
+            "error must carry the writer failure: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_writer_tears_down_a_stalled_sink_without_blocking() {
+        let (gate, _written, sink) = blocked_sink();
+        let _held = gate.lock().unwrap();
+        let writer = spawn_writer(move || sink, 4, STALL_TEST_BUDGET);
+        fill_until_first_drop(&writer).await;
+        let started = std::time::Instant::now();
+        drop(writer);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "drop must not join a stalled writer inline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_reports_writer_diagnostics_so_teardown_without_finish_is_not_silent() {
+        let writer = spawn_writer(|| DiskFullSink, 4, STALL_TEST_BUDGET);
+        let error_slot = std::sync::Arc::clone(&writer.error);
+        let dropped_slot = std::sync::Arc::clone(&writer.dropped);
+        writer
+            .emit(&serde_json::json!({"type": "response", "id": 1}))
+            .await
+            .expect("the row queues before the writer thread fails");
+        writer.add_dropped(1);
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let error_taken = error_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none();
+                let dropped_taken = *dropped_slot.lock().unwrap_or_else(|e| e.into_inner()) == 0;
+                if error_taken && dropped_taken {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop must join the writer and report its diagnostics");
+    }
+
+    #[tokio::test]
+    async fn eof_sweeps_the_queued_and_the_orphaned_claimed_id_after_a_real_dispatcher_wait() {
+        let (_gate, written, sink) = blocked_sink();
+        let writer = spawn_writer(move || sink, SERVE_OUTPUT_CAPACITY, STALL_TEST_BUDGET);
+        let (dispatch_tx, mut dispatch_rx) =
+            tokio::sync::mpsc::channel::<(u64, String, serde_json::Value)>(8);
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let spawn_pending = std::sync::Arc::clone(&pending);
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let busy_tx = std::sync::Mutex::new(Some(busy_tx));
+        let mut dispatcher = tokio::spawn(async move {
+            while let Some((id, _op, _params)) = dispatch_rx.recv().await {
+                mark_claimed(&spawn_pending, id);
+                if id == 1 {
+                    if let Some(tx) = busy_tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        let _ = tx.send(());
+                    }
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        pending_lock(&pending).insert(
+            1,
+            PendingEntry {
+                op: "ping".to_string(),
+                state: PendingState::Queued,
+            },
+        );
+        dispatch_tx
+            .send((1, "ping".to_string(), serde_json::json!({})))
+            .await
+            .unwrap();
+        busy_rx
+            .await
+            .expect("dispatcher must claim the first request");
+        pending_lock(&pending).insert(
+            2,
+            PendingEntry {
+                op: "msg send".to_string(),
+                state: PendingState::Queued,
+            },
+        );
+        dispatch_tx
+            .send((
+                2,
+                "msg send".to_string(),
+                serde_json::json!({"chat": "@x", "text": "hi"}),
+            ))
+            .await
+            .unwrap();
+        drop(dispatch_tx);
+
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + SWEEP_RESERVE + Duration::from_millis(150);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            shutdown_dispatcher(&mut dispatcher, &writer, &pending, deadline),
+        )
+        .await
+        .expect("the EOF sweep must not hang on a blocked dispatcher");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(140),
+            "the dispatcher wait must actually run before the sweep, took {elapsed:?}"
+        );
+        let _ = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await;
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let envelopes: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("writer emits json lines"))
+            .collect();
+        for id in [1_u64, 2] {
+            assert_eq!(
+                envelopes
+                    .iter()
+                    .filter(|v| v["id"] == id && v["error"]["type"] == "StreamDown")
+                    .count(),
+                1,
+                "request {id} must answer StreamDown exactly once at EOF, got: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enqueue_dispatch_registers_before_handoff_and_clears_rejected_ids() {
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (dispatch_tx, mut dispatch_rx) =
+            tokio::sync::mpsc::channel::<(u64, String, serde_json::Value)>(1);
+        assert_eq!(
+            enqueue_dispatch(&pending, &dispatch_tx, 1, "ping", serde_json::json!({})),
+            DispatchEnqueue::Queued
+        );
+        assert_eq!(
+            pending_lock(&pending).get(&1).map(|entry| entry.state),
+            Some(PendingState::Queued),
+            "a handed-off id must be registered before the dispatcher can claim it"
+        );
+        assert_eq!(
+            enqueue_dispatch(&pending, &dispatch_tx, 2, "ping", serde_json::json!({})),
+            DispatchEnqueue::Full
+        );
+        assert!(
+            !pending_lock(&pending).contains_key(&2),
+            "a rejected id must not be left for the EOF sweep"
+        );
+        let _ = dispatch_rx.recv().await;
+        let (closed_tx, closed_rx) =
+            tokio::sync::mpsc::channel::<(u64, String, serde_json::Value)>(1);
+        drop(closed_rx);
+        assert_eq!(
+            enqueue_dispatch(&pending, &closed_tx, 3, "ping", serde_json::json!({})),
+            DispatchEnqueue::Closed
+        );
+        assert!(
+            !pending_lock(&pending).contains_key(&3),
+            "a closed dispatch queue must not leave the id behind"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn phase_two_recomputes_the_emit_window_after_a_late_response() {
+        let (gate, _written, sink) = blocked_sink();
+        let _held = gate.lock().unwrap();
+        let writer = spawn_writer(move || sink, 4, STALL_TEST_BUDGET);
+        fill_until_first_drop(&writer).await;
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(RESPONSE_CAPACITY);
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            response_tx
+                .send(serde_json::json!({"type": "response", "id": 7, "ok": true}))
+                .await
+                .expect("receiver stays open until the drain ends");
+            std::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let mut workers = Vec::new();
+        drain_and_flush_until(&mut workers, &writer, &mut response_rx, deadline)
+            .await
+            .expect("a stalled writer is a drop, not a drain error");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= Duration::from_millis(260),
+            "a response arriving with 50ms left must get a 50ms window, not the 200ms measured at loop entry: {elapsed:?}"
+        );
+        sender.abort();
+        drop(_held);
+        tokio::time::resume();
+        let _ = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn eof_deadline_bounds_dispatcher_wait_drain_and_finish_together() {
+        let (gate, _written, sink) = blocked_sink();
+        let _held = gate.lock().unwrap();
+        let writer = spawn_writer(move || sink, 4, STALL_TEST_BUDGET);
+        fill_until_first_drop(&writer).await;
+        let (_dispatch_tx, mut dispatch_rx) =
+            tokio::sync::mpsc::channel::<(u64, String, serde_json::Value)>(8);
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut dispatcher =
+            tokio::spawn(async move { while dispatch_rx.recv().await.is_some() {} });
+        pending_lock(&pending).insert(
+            1,
+            PendingEntry {
+                op: "ping".to_string(),
+                state: PendingState::Queued,
+            },
+        );
+        let (_response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(RESPONSE_CAPACITY);
+        let mut workers = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            shutdown_dispatcher(&mut dispatcher, &writer, &pending, deadline).await;
+            drain_and_flush_until(&mut workers, &writer, &mut response_rx, deadline)
+                .await
+                .expect("drain tolerates a stalled writer");
+            let _ = writer.finish(deadline).await;
+        })
+        .await
+        .expect("dispatcher wait, drain and finish must share one deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the EOF path must finish on its 700ms deadline, took {:?}",
+            started.elapsed()
+        );
+        drop(_held);
+    }
+
+    #[tokio::test]
     async fn dispatch_ping_reply_survives_saturated_response_channel() {
         let pool = ServePool {
             shares: std::sync::RwLock::new(HashMap::new()),
@@ -3877,6 +4907,7 @@ mod tests {
         let mutations = tokio::sync::mpsc::channel::<Job>(4).0;
         let reads: Vec<tokio::sync::mpsc::Sender<Job>> = Vec::new();
         let read_counter = std::sync::atomic::AtomicUsize::new(0);
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (response_tx, mut response_rx) =
             tokio::sync::mpsc::channel::<serde_json::Value>(RESPONSE_CAPACITY);
         for i in 0..RESPONSE_CAPACITY {
@@ -3898,6 +4929,7 @@ mod tests {
             &reads,
             &read_counter,
             &response_tx,
+            &pending,
             9,
             "ping",
             serde_json::json!({}),
@@ -3912,5 +4944,264 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(25));
         assert_eq!(reply["id"], 9);
         assert_eq!(reply["data"]["pong"], true);
+    }
+
+    #[tokio::test]
+    async fn eof_caps_the_dispatcher_wait_so_computed_worker_replies_still_reach_stdout() {
+        let (_gate, written, sink) = blocked_sink();
+        let writer = spawn_writer(move || sink, SERVE_OUTPUT_CAPACITY, STALL_TEST_BUDGET);
+        let (dispatch_tx, mut dispatch_rx) =
+            tokio::sync::mpsc::channel::<(u64, String, serde_json::Value)>(8);
+        let mut dispatcher =
+            tokio::spawn(async move { while dispatch_rx.recv().await.is_some() {} });
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        pending_lock(&pending).insert(
+            30,
+            PendingEntry {
+                op: "msg send".to_string(),
+                state: PendingState::Queued,
+            },
+        );
+
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(RESPONSE_CAPACITY);
+        for i in 0..RESPONSE_CAPACITY {
+            response_tx
+                .send(serde_json::json!({"type": "response", "id": 1000 + i, "ok": true}))
+                .await
+                .unwrap();
+        }
+        let (mutation_tx, mutation_rx) = tokio::sync::mpsc::channel::<Job>(4);
+        let worker = tokio::spawn(job_worker(mutation_rx, response_tx.clone()));
+        let (computed_tx, computed_rx) = tokio::sync::oneshot::channel();
+        mutation_tx
+            .send(Job {
+                id: 900,
+                op: "msg send",
+                timeout: None,
+                future: Box::pin(async move {
+                    let _ = computed_tx.send(());
+                    Ok(serde_json::json!({"sent": true}))
+                }),
+                guard: JobCompletionGuard {
+                    id: 900,
+                    op: "msg send",
+                    responses: response_tx.clone(),
+                    completed: false,
+                },
+            })
+            .await
+            .unwrap();
+        drop(mutation_tx);
+        drop(response_tx);
+        computed_rx
+            .await
+            .expect("the worker must compute its reply before EOF");
+
+        let expected_wait_cap = DISPATCH_WAIT_CAP;
+        let deadline = tokio::time::Instant::now() + SERVE_FLUSH_BUDGET;
+        let started = std::time::Instant::now();
+        shutdown_dispatcher(&mut dispatcher, &writer, &pending, deadline).await;
+        let wait = started.elapsed();
+        assert!(
+            wait < expected_wait_cap + Duration::from_millis(700),
+            "the dispatcher wait must be capped at {expected_wait_cap:?}, took {wait:?}"
+        );
+        let mut workers = vec![worker];
+        drain_and_flush_until(&mut workers, &writer, &mut response_rx, deadline)
+            .await
+            .expect("drain tolerates a healthy writer");
+        assert!(
+            started.elapsed() < SERVE_FLUSH_BUDGET,
+            "EOF must exit inside the shared deadline, took {:?}",
+            started.elapsed()
+        );
+        drop(dispatch_tx);
+        let _ = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await;
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let envelopes: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("writer emits json lines"))
+            .collect();
+        assert_eq!(
+            envelopes
+                .iter()
+                .filter(|v| v["id"] == 30 && v["error"]["type"] == "StreamDown")
+                .count(),
+            1,
+            "the unclaimed id must be swept exactly once, got: {out}"
+        );
+        assert!(
+            envelopes
+                .iter()
+                .any(|v| v["id"] == 900 && v["ok"] == true),
+            "a reply computed by a worker blocked on the full response channel must reach stdout, got: {out}"
+        );
+        let filler_ok = envelopes
+            .iter()
+            .filter(|v| v["ok"] == true)
+            .filter_map(|v| v["id"].as_u64())
+            .filter(|id| (1000..1000 + RESPONSE_CAPACITY as u64).contains(id))
+            .count();
+        assert_eq!(
+            filler_ok, RESPONSE_CAPACITY,
+            "every already-computed reply must be flushed, got: {out}"
+        );
+    }
+
+    async fn offline_shares(tag: &str) -> ServeShares {
+        let dir = std::env::temp_dir().join(format!(
+            "telecli-serve-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = std::sync::Arc::new(
+            grammers_client::session::storages::SqliteSession::open(dir.join("s.session"))
+                .await
+                .unwrap(),
+        );
+        let pool = grammers_client::SenderPool::with_configuration(
+            std::sync::Arc::clone(&session),
+            1,
+            grammers_client::sender::ConnectionParams::default(),
+        );
+        let client = grammers_client::Client::with_configuration(
+            pool.handle,
+            grammers_client::client::ClientConfiguration::default(),
+        );
+        ServeShares {
+            client,
+            session,
+            rate_limiter: crate::rate_limiter::RateLimiter::unlimited(),
+            _session_lock: None,
+            account: "test-acct".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_action_marks_a_routed_job_answered_at_the_lane_handoff() {
+        let pool = ServePool {
+            shares: std::sync::RwLock::new(HashMap::new()),
+            resync: HashMap::new(),
+        };
+        pool.publish("acct", offline_shares("handoff").await);
+        let (mutations, mut mutation_rx) = tokio::sync::mpsc::channel::<Job>(4);
+        let reads: Vec<tokio::sync::mpsc::Sender<Job>> = Vec::new();
+        let read_counter = std::sync::atomic::AtomicUsize::new(0);
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(RESPONSE_CAPACITY);
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        pending_lock(&pending).insert(
+            7,
+            PendingEntry {
+                op: "msg send".to_string(),
+                state: PendingState::Queued,
+            },
+        );
+        dispatch_action(
+            &pool,
+            &["acct".to_string()],
+            &mutations,
+            &reads,
+            &read_counter,
+            &response_tx,
+            &pending,
+            7,
+            "msg send",
+            serde_json::json!({"chat": "@x", "text": "hi"}),
+        )
+        .await
+        .expect("a routed op must queue into its lane");
+        assert_eq!(
+            pending_lock(&pending).get(&7).map(|entry| entry.state),
+            Some(PendingState::Answered),
+            "a queued job's guard owns its answer, so the hand-off must mark the id Answered"
+        );
+        let mut job = mutation_rx
+            .recv()
+            .await
+            .expect("the routed job must be queued in the mutate lane");
+        assert_eq!(job.id, 7);
+        job.guard.completed = true;
+        drop(job);
+        assert!(
+            response_rx.try_recv().is_err(),
+            "the lane hand-off must not answer inline"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_sweep_skips_an_answered_dispatch_and_answers_an_unclaimed_id_once() {
+        let (_gate, written, sink) = blocked_sink();
+        let writer = spawn_writer(move || sink, SERVE_OUTPUT_CAPACITY, STALL_TEST_BUDGET);
+        let pool = ServePool {
+            shares: std::sync::RwLock::new(HashMap::new()),
+            resync: HashMap::new(),
+        };
+        pool.publish("acct", offline_shares("sweep").await);
+        let (mutations, _mutation_rx) = tokio::sync::mpsc::channel::<Job>(4);
+        let reads: Vec<tokio::sync::mpsc::Sender<Job>> = Vec::new();
+        let read_counter = std::sync::atomic::AtomicUsize::new(0);
+        let (response_tx, _response_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(RESPONSE_CAPACITY);
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        pending_lock(&pending).insert(
+            8,
+            PendingEntry {
+                op: "msg send".to_string(),
+                state: PendingState::Queued,
+            },
+        );
+        dispatch_action(
+            &pool,
+            &["acct".to_string()],
+            &mutations,
+            &reads,
+            &read_counter,
+            &response_tx,
+            &pending,
+            8,
+            "msg send",
+            serde_json::json!({"chat": "@x", "text": "hi"}),
+        )
+        .await
+        .expect("a routed op must queue into its lane");
+        pending_lock(&pending).insert(
+            9,
+            PendingEntry {
+                op: "dialog list".to_string(),
+                state: PendingState::Queued,
+            },
+        );
+        let (dispatch_tx, mut dispatch_rx) =
+            tokio::sync::mpsc::channel::<(u64, String, serde_json::Value)>(4);
+        let mut dispatcher =
+            tokio::spawn(async move { while dispatch_rx.recv().await.is_some() {} });
+        let deadline = tokio::time::Instant::now() + SWEEP_RESERVE;
+        shutdown_dispatcher(&mut dispatcher, &writer, &pending, deadline).await;
+        drop(dispatch_tx);
+        let _ = writer
+            .finish(tokio::time::Instant::now() + SERVE_FLUSH_BUDGET)
+            .await;
+        let out = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let envelopes: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("writer emits json lines"))
+            .collect();
+        assert!(
+            !envelopes.iter().any(|v| v["id"] == 8),
+            "an id answered by the lane hand-off must not be swept into a second answer, got: {out}"
+        );
+        assert_eq!(
+            envelopes
+                .iter()
+                .filter(|v| v["id"] == 9 && v["error"]["type"] == "StreamDown")
+                .count(),
+            1,
+            "the unclaimed id must still be answered exactly once, got: {out}"
+        );
     }
 }

@@ -244,7 +244,7 @@ pub(crate) fn needs_raw_ban(rights_entries: &[(String, bool)]) -> bool {
 pub(crate) fn build_raw_banned_rights(
     ban: bool,
     rights_entries: &[(String, bool)],
-    until_secs: Option<u32>,
+    until_date: Option<i32>,
 ) -> tl::types::ChatBannedRights {
     let mut denied = std::collections::HashSet::new();
     if ban_defaults_view_messages(ban, rights_entries) {
@@ -258,13 +258,6 @@ pub(crate) fn build_raw_banned_rights(
         }
     }
     let has = |name: &str| denied.contains(name);
-    let until_date = until_secs.map(|secs| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64 + i64::from(secs))
-            .unwrap_or_default()
-            .min(i64::from(i32::MAX)) as i32
-    });
     tl::types::ChatBannedRights {
         view_messages: has("view_messages"),
         send_messages: has("send_messages"),
@@ -292,6 +285,25 @@ pub(crate) fn build_raw_banned_rights(
     }
 }
 
+/// grammers' `.duration()` re-reads the clock and adds unchecked i32, so an
+/// exactly-cap duration accepted at parse time can overflow a second later.
+/// Compute the clamped absolute date once instead and use `.until()`.
+pub(crate) fn ban_until_date(secs: u32) -> i32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    (now as i64 + i64::from(secs)).min(i64::from(i32::MAX)) as i32
+}
+
+pub(crate) fn ban_duration_cap() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    (i64::from(i32::MAX) - now as i64).max(0)
+}
+
 pub(crate) fn parse_ban_duration(duration: Option<&str>) -> TeleResult<Option<u32>> {
     match duration {
         None | Some("forever") => Ok(None),
@@ -306,12 +318,44 @@ pub(crate) fn parse_ban_duration(duration: Option<&str>) -> TeleResult<Option<u3
                     "--duration must be greater than 0 or 'forever'".to_string(),
                 ));
             }
-            u32::try_from(secs)
-                .ok()
-                .map(Some)
-                .ok_or_else(|| TeleError::Usage("--duration is too large".to_string()))
+            // The cap rejection names no digits on purpose: TeleError::message()
+            // scrubs 7-15 digit runs, so a "{secs}/{cap}" message reaches the
+            // user as "[REDACTED] ... [REDACTED]".
+            const CAP_MESSAGE: &str = "--duration exceeds the 32-bit until_date limit (2038/01/19); use a shorter duration or 'forever'";
+            if secs > u32::MAX as u64 {
+                return Err(TeleError::Usage(CAP_MESSAGE.to_string()));
+            }
+            let secs = secs as u32;
+            let cap = ban_duration_cap();
+            if i64::from(secs) > cap {
+                return Err(TeleError::Usage(CAP_MESSAGE.to_string()));
+            }
+            Ok(Some(secs))
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KickPlan {
+    pub(crate) until_secs: Option<u32>,
+    pub(crate) rights_entries: Vec<(String, bool)>,
+}
+
+// Anchor the absolute date at the RPC, not at validation: connect plus two
+// peer resolutions can outlast a short ban, and a stale date bans for less.
+pub(crate) fn kick_until_date(plan: &KickPlan) -> Option<i32> {
+    plan.until_secs.map(ban_until_date)
+}
+
+pub(crate) fn kick_dry_run_payload(would: &str, plan: &KickPlan) -> serde_json::Value {
+    let mut data = serde_json::json!({ "would": would });
+    if let Some(secs) = plan.until_secs {
+        data["duration"] = serde_json::json!(secs);
+    }
+    if !plan.rights_entries.is_empty() {
+        data["rights"] = serde_json::json!(plan.rights_entries);
+    }
+    data
 }
 
 pub(crate) fn parse_banned_rights_csv(csv: &str) -> TeleResult<Vec<(String, bool)>> {
@@ -368,7 +412,7 @@ pub(crate) fn reject_duration_on_basic(
     Ok(())
 }
 
-pub(crate) fn validate_kick(args: &KickArgs) -> TeleResult<()> {
+pub(crate) fn validate_kick(args: &KickArgs) -> TeleResult<KickPlan> {
     crate::chat_target::ChatTarget::parse_flag(&args.chat, "chat")?;
     crate::chat_target::ChatTarget::parse_flag(&args.user, "user")?;
     let has_duration = args.duration.is_some();
@@ -377,46 +421,39 @@ pub(crate) fn validate_kick(args: &KickArgs) -> TeleResult<()> {
             "--duration requires --ban or --rights".to_string(),
         ));
     }
-    parse_ban_duration(args.duration.as_deref())?;
-    if let Some(rights) = &args.rights {
-        parse_banned_rights_csv(rights)?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn kick(args: KickArgs, flags: &GlobalFlags) -> TeleResult<i32> {
-    validate_kick(&args)?;
-    crate::executor::require_explicit_selection("chat kick", flags)?;
-    let config_path = flags.config_path.clone();
-    let dry_run = flags.dry_run;
-    let ban = args.ban;
     let until_secs = parse_ban_duration(args.duration.as_deref())?;
     let rights_entries = match &args.rights {
         Some(csv) => parse_banned_rights_csv(csv)?,
         None => Vec::new(),
     };
+    Ok(KickPlan {
+        until_secs,
+        rights_entries,
+    })
+}
+
+pub(crate) async fn kick(args: KickArgs, flags: &GlobalFlags) -> TeleResult<i32> {
+    let plan = validate_kick(&args)?;
+    crate::executor::require_explicit_selection("chat kick", flags)?;
+    let config_path = flags.config_path.clone();
+    let dry_run = flags.dry_run;
+    let ban = args.ban;
     let envelope = run_fanout(flags, move |name| {
         let config_path = config_path.clone();
         let target = args.chat.clone();
         let user = args.user.clone();
-        let rights_entries = rights_entries.clone();
+        let plan = plan.clone();
         Box::pin(async move {
             if dry_run {
-                let mut data = serde_json::json!({
-                    "dry_run": true,
-                    "chat": target,
-                    "user": user,
-                    "ban": ban,
-                    "would": format!("kick user {user} from chat {target}")
-                });
-                if let Some(secs) = until_secs {
-                    data["duration"] = serde_json::json!(secs);
-                }
-                if !rights_entries.is_empty() {
-                    data["rights"] = serde_json::json!(rights_entries);
-                }
+                let would = format!("kick user {user} from chat {target}");
+                let mut data = kick_dry_run_payload(&would, &plan);
+                data["dry_run"] = serde_json::json!(true);
+                data["chat"] = serde_json::json!(target);
+                data["user"] = serde_json::json!(user);
+                data["ban"] = serde_json::json!(ban);
                 return Ok(data);
             }
+            let until_secs = plan.until_secs;
             let guard =
                 ClientGuard::connect(&name, creds_api_id()?, config_path.as_deref()).await?;
             client::authorize(&guard.client).await?;
@@ -430,7 +467,7 @@ pub(crate) async fn kick(args: KickArgs, flags: &GlobalFlags) -> TeleResult<i32>
             let user_ref = entities::peer_ref(&user_peer)
                 .await
                 .map_err(tele_invocation)?;
-            if !ban && rights_entries.is_empty() && until_secs.is_none() {
+            if !ban && plan.rights_entries.is_empty() && until_secs.is_none() {
                 guard
                     .client
                     .kick_participant(chat_ref, user_ref)
@@ -439,7 +476,8 @@ pub(crate) async fn kick(args: KickArgs, flags: &GlobalFlags) -> TeleResult<i32>
                 return Ok(serde_json::json!({"chat": target, "user": user, "kicked": true}));
             }
             reject_duration_on_basic(&chat, until_secs)?;
-            if needs_raw_ban(&rights_entries) {
+            let until_date = kick_until_date(&plan);
+            if needs_raw_ban(&plan.rights_entries) {
                 if matches!(&chat, grammers_client::peer::Peer::Group(_))
                     && !entities::is_channel(&chat)
                 {
@@ -447,7 +485,7 @@ pub(crate) async fn kick(args: KickArgs, flags: &GlobalFlags) -> TeleResult<i32>
                         "granular restrictions (manage_topics, send_photos, send_videos, send_roundvideos, send_audios, send_voices, send_docs, send_plain, edit_rank, send_reactions) require a channel or supergroup; basic groups support view_messages bans only".to_string(),
                     ));
                 }
-                let rights = build_raw_banned_rights(ban, &rights_entries, until_secs);
+                let rights = build_raw_banned_rights(ban, &plan.rights_entries, until_date);
                 guard
                     .client
                     .invoke(&tl::functions::channels::EditBanned {
@@ -461,10 +499,16 @@ pub(crate) async fn kick(args: KickArgs, flags: &GlobalFlags) -> TeleResult<i32>
                     })
                     .await
                     .map_err(tele_invocation)?;
-                return Ok(ban_result(&target, &user, ban, until_secs, &rights_entries));
+                return Ok(ban_result(
+                    &target,
+                    &user,
+                    ban,
+                    until_date,
+                    &plan.rights_entries,
+                ));
             }
             let mut call = guard.client.set_banned_rights(chat_ref, user_ref);
-            for (right, allowed) in &rights_entries {
+            for (right, allowed) in &plan.rights_entries {
                 call = match right.as_str() {
                     "view_messages" => call.view_messages(*allowed),
                     "send_messages" => call.send_messages(*allowed),
@@ -484,14 +528,20 @@ pub(crate) async fn kick(args: KickArgs, flags: &GlobalFlags) -> TeleResult<i32>
             // --ban forces view_messages=false only when the --rights CSV
             // does not set view_messages explicitly (an explicit view_messages
             // value must win over the --ban default).
-            if ban_defaults_view_messages(ban, &rights_entries) {
+            if ban_defaults_view_messages(ban, &plan.rights_entries) {
                 call = call.view_messages(false);
             }
-            if let Some(secs) = until_secs {
-                call = call.duration(std::time::Duration::from_secs(u64::from(secs)));
+            if let Some(date) = until_date {
+                call = call.until(date);
             }
             call.await.map_err(tele_invocation)?;
-            Ok(ban_result(&target, &user, ban, until_secs, &rights_entries))
+            Ok(ban_result(
+                &target,
+                &user,
+                ban,
+                until_date,
+                &plan.rights_entries,
+            ))
         })
     })
     .await?;
@@ -502,7 +552,7 @@ pub(crate) fn ban_result(
     chat: &str,
     user: &str,
     ban: bool,
-    until_secs: Option<u32>,
+    until_date: Option<i32>,
     rights_entries: &[(String, bool)],
 ) -> serde_json::Value {
     let mut data = serde_json::json!({
@@ -510,12 +560,8 @@ pub(crate) fn ban_result(
         "user": user,
         "kicked": true,
         "banned": ban});
-    if let Some(secs) = until_secs {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or_default();
-        data["until"] = serde_json::json!(i64::from(secs) + now as i64);
+    if let Some(date) = until_date {
+        data["until"] = serde_json::json!(date);
     }
     if !rights_entries.is_empty() {
         let denied: Vec<&str> = rights_entries

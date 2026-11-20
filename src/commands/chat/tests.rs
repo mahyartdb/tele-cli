@@ -2135,6 +2135,92 @@ fn ban_duration_rejects_garbage_zero_negative_overflow() {
 }
 
 #[test]
+fn ban_duration_rejects_values_past_the_i32_until_date() {
+    let expected =
+        "--duration exceeds the 32-bit until_date limit (2038/01/19); use a shorter duration or 'forever'";
+    for bad in ["1000000000", "3000000000", "99999999999"] {
+        let err = parse_ban_duration(Some(bad)).unwrap_err();
+        assert_eq!(
+            err.message(),
+            expected,
+            "duration {bad} must be rejected with the stable until_date message; interpolated digits get scrubbed"
+        );
+    }
+}
+
+#[test]
+fn ban_duration_one_year_self_adjusts_to_cap() {
+    let secs: u64 = 86_400 * 365;
+    if secs > u64::try_from(ban_duration_cap()).unwrap_or(u64::MAX) {
+        // Past the cap horizon (~2037) a one-year ban no longer fits the
+        // 32-bit until_date; the cap only shrinks, so rejection is sticky.
+        assert!(matches!(
+            parse_ban_duration(Some(&secs.to_string())),
+            Err(TeleError::Usage(_))
+        ));
+    } else {
+        assert_eq!(
+            parse_ban_duration(Some(&secs.to_string())).unwrap(),
+            Some(u32::try_from(secs).unwrap())
+        );
+    }
+}
+
+#[test]
+fn ban_duration_accepts_exactly_cap() {
+    let cap = ban_duration_cap();
+    if cap == 0 {
+        // Past the until_date horizon the cap pins to 0 and "0" is rejected
+        // by the greater-than-0 rule, not the cap rule.
+        return;
+    }
+    // Exactly-cap races the clock: a second boundary crossed between the two
+    // internal reads legitimately rejects it; rejection without the clock
+    // advancing is the off-by-one bug this test exists for.
+    match parse_ban_duration(Some(&cap.to_string())) {
+        Ok(v) => assert_eq!(v, Some(u32::try_from(cap).unwrap())),
+        Err(_) => assert!(
+            ban_duration_cap() < cap,
+            "exactly-cap duration rejected without the clock advancing"
+        ),
+    }
+}
+
+#[test]
+fn ban_duration_rejects_cap_plus_one() {
+    let cap = ban_duration_cap();
+    if cap == 0 {
+        return;
+    }
+    let over = cap + 1;
+    assert!(
+        matches!(
+            parse_ban_duration(Some(&over.to_string())),
+            Err(TeleError::Usage(_))
+        ),
+        "cap+1 ({over}) must be rejected; the cap only decreases with time"
+    );
+}
+
+#[test]
+fn ban_duration_rejects_cap_minus_one_second_short_of_horizon() {
+    let cap = ban_duration_cap();
+    if cap <= 1 {
+        return;
+    }
+    assert_eq!(
+        parse_ban_duration(Some(&(cap - 1).to_string())).unwrap(),
+        Some(u32::try_from(cap - 1).unwrap()),
+        "cap-1 must be accepted: the cap only decreases with time, so acceptance here cannot flip later"
+    );
+}
+
+#[test]
+fn ban_until_date_caps_at_i32_max() {
+    assert_eq!(ban_until_date(u32::MAX), i32::MAX);
+}
+
+#[test]
 fn banned_rights_csv_maps_names_and_values() {
     let entries = parse_banned_rights_csv("send_stickers:false, invite_users:true").unwrap();
     assert_eq!(
@@ -2239,6 +2325,12 @@ fn raw_banned_rights_honor_ban_default_unless_overridden() {
     let rights = build_raw_banned_rights(false, &plain, None);
     assert!(!rights.view_messages);
     assert!(rights.send_voices);
+
+    let rights = build_raw_banned_rights(true, &[], Some(12345));
+    assert_eq!(
+        rights.until_date, 12345,
+        "a timed ban must carry the caller's absolute date, not 0 (forever)"
+    );
 }
 
 #[test]
@@ -2250,9 +2342,12 @@ fn ban_result_shapes_kicked_banned_and_restricted() {
     assert!(v.get("restricted").is_none());
 
     let entries = parse_banned_rights_csv("send_photos:false,send_messages:true").unwrap();
-    let v = ban_result("@c", "@u", true, Some(60), &entries);
+    let v = ban_result("@c", "@u", true, Some(12345), &entries);
     assert_eq!(v["restricted"], serde_json::json!(["send_photos"]));
-    assert!(v["until"].as_i64().unwrap() > 0);
+    assert_eq!(v["until"], serde_json::json!(12345));
+
+    let v = ban_result("@c", "@u", true, Some(i32::MAX), &[]);
+    assert_eq!(v["until"], serde_json::json!(i32::MAX));
 }
 
 #[test]
@@ -2271,6 +2366,98 @@ fn kick_rejects_empty_user() {
         );
     }
     assert!(validate_kick(&base("@u")).is_ok());
+}
+
+#[test]
+fn kick_plan_carries_parsed_duration_and_rights() {
+    let base = |duration: Option<&str>, ban: bool, rights: Option<&str>| KickArgs {
+        chat: "@c".to_string(),
+        user: "@u".to_string(),
+        ban,
+        duration: duration.map(str::to_string),
+        rights: rights.map(str::to_string),
+    };
+    let plan = validate_kick(&base(None, false, None)).unwrap();
+    assert_eq!(plan.until_secs, None);
+    assert_eq!(kick_until_date(&plan), None);
+    assert!(plan.rights_entries.is_empty());
+
+    let plan = validate_kick(&base(Some("300"), true, None)).unwrap();
+    assert_eq!(plan.until_secs, Some(300));
+    assert!(plan.rights_entries.is_empty());
+
+    let plan = validate_kick(&base(Some("forever"), true, None)).unwrap();
+    assert_eq!(plan.until_secs, None);
+    assert_eq!(kick_until_date(&plan), None);
+
+    let plan = validate_kick(&base(None, false, Some("send_stickers:false"))).unwrap();
+    assert_eq!(plan.until_secs, None);
+    assert_eq!(
+        plan.rights_entries,
+        vec![("send_stickers".to_string(), false)]
+    );
+
+    assert!(matches!(
+        validate_kick(&base(Some("0"), true, None)),
+        Err(TeleError::Usage(_))
+    ));
+    assert!(matches!(
+        validate_kick(&base(Some("99999999999"), true, None)),
+        Err(TeleError::Usage(_))
+    ));
+    assert!(matches!(
+        validate_kick(&base(Some("abc"), true, None)),
+        Err(TeleError::Usage(_))
+    ));
+}
+
+#[test]
+fn kick_until_date_is_anchored_at_the_send_call() {
+    let plan = validate_kick(&KickArgs {
+        chat: "@c".to_string(),
+        user: "@u".to_string(),
+        ban: true,
+        duration: Some("300".to_string()),
+        rights: None,
+    })
+    .unwrap();
+    let before = ban_until_date(300);
+    let until = kick_until_date(&plan).expect("timed plan must yield an absolute until_date");
+    let after = ban_until_date(300);
+    assert!(
+        (before..=after).contains(&until),
+        "until_date {until} must be computed when the RPC is about to run (bounds {before}..={after}), not carried as a plan snapshot"
+    );
+}
+
+#[test]
+fn kick_dry_run_payload_echoes_plan_values() {
+    let plan = validate_kick(&KickArgs {
+        chat: "@c".to_string(),
+        user: "@u".to_string(),
+        ban: true,
+        duration: Some("300".to_string()),
+        rights: Some("send_stickers:false".to_string()),
+    })
+    .unwrap();
+    let data = kick_dry_run_payload("kick user @u from chat @c", &plan);
+    assert_eq!(data["duration"], serde_json::json!(300));
+    assert_eq!(
+        data["rights"],
+        serde_json::json!([["send_stickers", false]])
+    );
+
+    let plan = validate_kick(&KickArgs {
+        chat: "@c".to_string(),
+        user: "@u".to_string(),
+        ban: false,
+        duration: None,
+        rights: None,
+    })
+    .unwrap();
+    let data = kick_dry_run_payload("kick user @u from chat @c", &plan);
+    assert!(data.get("duration").is_none());
+    assert!(data.get("rights").is_none());
 }
 
 #[test]
