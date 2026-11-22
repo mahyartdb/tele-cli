@@ -60,7 +60,7 @@ So the schema is always actually verified on push and PR, not merely skipped. Lo
 
 ## Caching
 
-`Swatinem/rust-cache` is used by `clippy`, `test` and `msrv`, pinned to a commit SHA. It caches:
+`Swatinem/rust-cache` is used by `clippy`, `test` and `msrv`, pinned to a commit SHA. All three set `save-if: ${{ github.ref == 'refs/heads/main' }}`: pushes to `main` write the cache, PR runs only restore it. On a busy repository a PR branch that changes `Cargo.lock` can otherwise evict the good `main` entry by filling the 10 GB repository quota with a short-lived cache. A PR normally gets the warm `main` entry restored; if it misses, it builds cold but does not poison the cache for everyone else. It caches:
 
 - `~/.cargo/registry` — index, crate archives, and the extracted sources under `registry/src`,
 - `~/.cargo/git`,
@@ -109,7 +109,7 @@ Every `uses:` in `.github/workflows/ci.yml` carries a full 40-character commit S
 
 `dtolnay/rust-toolchain` is branch-per-toolchain: the pinned SHA is an earlier snapshot of the `stable` branch (the branch has moved on since; a pin does not track it), and that snapshot's default input is `toolchain: stable`. The `msrv` job overrides it with `toolchain: "1.89"`, which the action maps to the `1.89` rustup toolchain. Pinning the SHA pins the action's code, not the Rust release — `stable` still means "current stable at run time", which is intended.
 
-`taiki-e/install-action` is a composite action (no Node runtime) and is left at v2.90.6: a newer patch exists, but the install step is a second either way, and moving it means re-checking that `cargo-audit@0.22.2` and `cargo-deny@0.20.2` are still in its manifests. Bump it only with that check.
+`taiki-e/install-action` in `ci.yml` is a composite action (no Node runtime) and is left at v2.90.6: a newer patch exists, but the install step is a second either way, and moving it means re-checking that `cargo-audit@0.22.2` and `cargo-deny@0.20.2` are still in its manifests. `release.yml` uses v2.90.8 for its `cross` install. Two pinning styles exist: a `@<tool_name>` branch ref (for example `@cross`) carries a default `tool:` input, while a version-tag ref such as `@v2.90.8` requires an explicit `with: tool: cross`. Bumping from the former to the latter without adding that input makes the step warn and exit 0 without installing anything.
 
 Two tool versions are pinned independently of the action SHA: `cargo-audit@0.22.2` and `cargo-deny@0.20.2`. Both exist in install-action v2.90.6's manifests with per-platform SHA-256 checksums, so they install as verified downloads. `cargo-deny` 0.20.2 was also run against this repository: all four checks (advisories, bans, licenses, sources) ran to completion, with one documented advisory waiver, see below. Advisories are evaluated against the current `Cargo.lock` on every run, so a newly published advisory reddens the job until the dependency is bumped or the advisory is waived in `deny.toml`.
 
@@ -134,7 +134,7 @@ echo "$sha"
 Then:
 
 1. Replace the SHA in the `uses:` line and update the `# vX.Y.Z` comment to match.
-2. If the action is `taiki-e/install-action`, bump the `cargo-audit@` / `cargo-deny@` versions deliberately and confirm the new versions are in the action's `manifests/*.json`. A version missing from the manifest falls back to cargo-binstall with a warning, which loses the checksum-verified prebuilt path; a version that does not exist fails the install step.
+2. If the action is `taiki-e/install-action`, confirm the `tool:` input is still set. A `@<tool_name>` branch pin carries a default, but a version-tag pin does not and the step silently installs nothing without an explicit `with: tool:`. Bump the `cargo-audit@` / `cargo-deny@` versions deliberately and confirm the new versions are in the action's `manifests/*.json`. A version missing from the manifest falls back to cargo-binstall with a warning, which loses the checksum-verified prebuilt path; a version that does not exist fails the install step.
 3. Validate the YAML (see below) and let the PR run the full matrix before merging.
 
 ## Run the gates locally
