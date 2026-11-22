@@ -10,7 +10,7 @@ tele [GLOBAL] GROUP COMMAND [ARGS]
 Globals (root callback, inherited):
   --account NAME     repeatable; NAME or all
   --tag TAG          repeatable; union with --account
-  --parallel N       default config parallel_max (1 when unset); max 32 (values outside 1..=32 exit with usage error)
+  --parallel N       default config parallel_max (1 when unset); max 32 (values outside 1..=32 exit with usage error); caps concurrent account tasks, never intra-account work
   --json             machine output on stdout
   --jsonl            machine output: JSON lines (one-shot commands emit a single envelope line; only `tele listen` emits one record per event)
   --fields FIELDS    project machine-output rows to comma-separated dotted fields (requires --json/--jsonl; unknown fields are usage errors)
@@ -229,6 +229,10 @@ Filters: `--from SENDER` (same target syntax as `--chat`) keeps only that sender
 
 Cache writes (`cache sync`, serve/MCP cache writes) store one batch per transaction on a per-account connection cached by the process. A write batch that fails or is dropped mid-batch (serve/MCP op timeout) rolls its transaction back as it is dropped, so the cached connection is not left inside a transaction. Reads and writes on that connection are ordered per account by an async read-write gate: a write waits for in-flight readers, a read waits for the write batch, and reads may run concurrently with each other. A read that runs during a write batch therefore waits for it to finish or roll back instead of observing uncommitted rows.
 
+- Account names are validated before a cache path is built: only `[A-Za-z0-9._-]` (and not `all`, `.`, `..`, or a Windows device name) can address a cache file. A crafted `config.toml` account key cannot place `{name}.cache.db` outside the app-data `cache/` directory; an invalid name is a Usage error (exit 1) instead.
+- Each connection sets `PRAGMA busy_timeout = 5000`, so a writer contending with another process (or a concurrent `VACUUM` on the same file) waits up to 5 seconds for the lock instead of failing immediately with `database is locked`.
+- A cold open creates the cache file only when it is missing and never truncates an existing one, so concurrent cold opens of the same account leave the first writer's database intact.
+
 ## `contact add`
 
 `tele contact add --user U [--phone P --first F --last L]` adds U to the account's contact list. `--phone` must be a full international number (`+` prefix, at least 5 digits); anything else fails with a Usage error before connect.
@@ -322,7 +326,7 @@ Copy-pasteable bot loop (`/start` → inspect buttons → click → watch edited
 
 ```pwsh
 tele msg send --chat @BOT --text "/start" --json | python -m json.tool
-tele msg get --chat @BOT --id 123 --json | python -m json.tool   # see reply_markup rows[].type markers
+tele msg get --chat @BOT --id 123 --json | python -m json.tool   # see reply_markup rows[][].type markers
 tele msg click --chat @BOT --id 123 --button-index 1 --json
 tele msg click --chat @BOT --id 123 --button-data "force_sub:refresh" --json   # match decoded callback data exactly
 # watch edited bot message (progress bar):
@@ -333,8 +337,10 @@ tele msg get --chat @BOT --id 123 --watch --timeout-secs 60 --json
 
 ```bash
 tele msg get --chat @BOT --id 123 --json | jq .results[0].data.messages[0].text
-tele msg get --chat @BOT --id 123 --json | jq '.results[0].data.messages[0].reply_markup.rows[].buttons[]'
+tele msg get --chat @BOT --id 123 --json | jq '.results[0].data.messages[0].reply_markup.rows[][].text'
 ```
+
+`reply_markup.rows` is an array of rows, and each row is an array of button objects: `.rows[0][0]` is the first button of the first row, and `.rows[][].text` flattens every button label. There is no `rows[].buttons` key.
 
 Notes:
 
@@ -467,6 +473,7 @@ tele serve --account NAME [--account NAME ...] [--events NewMessage,MessageEdite
 Process model:
 
 - One or more accounts: selection resolves to at least one and at most 32 sessions, otherwise the process exits 1 before anything connects. Each account session is locked exclusively (OS-level per-account lock); other tele processes cannot open the same sessions while serve runs.
+- `--parallel N` caps concurrent connect/reconnect attempts (default `parallel_max`); once connected, accounts serve concurrently, so the cap never serializes steady-state traffic.
 - Exclusive ownership: the standard OS-level per-account session lock applies. While `tele serve` holds the sessions, no other tele process can open them, and the reverse holds too ("session <name> is in use by another process").
 - Frames are single-line JSON objects terminated by `\n`; writers must flush per line.
 - EOF on stdin shuts down cleanly: queued jobs drain, pending responses are flushed to stdout, the client disconnects, and the exit code is 0. Shutdown has a single 10-second budget measured from EOF detection, shared by the dispatcher wait, the drain, the post-abort `StreamDown` sweep, and the final stdout flush (each phase gets whatever remains). A main loop already parked in a stdout write when stdin closes can delay EOF detection by up to the 30-second write-stall budget. Ids still queued or in flight when the budget expires answer with a `StreamDown` error envelope; under sustained stdout backpressure one may be dropped server-side (its correlation id then never appears).
