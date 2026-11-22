@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-22
+
 ### Fixed
 
 - Phone-target lookups no longer delete an existing contact. Resolving a `+phone` target imported the number and then deleted the first user the call returned, calling it a temporary-import cleanup — but `contacts.importedContacts` returns the contacts the call ADDED separately from the users it resolved, and a number that was already saved left the import list empty while the resolved user was still the saved contact. Any command taking a `+phone` target could therefore silently remove that contact from the account. The cleanup is now gated on the import having actually created the contact.
