@@ -331,14 +331,11 @@ fn main() -> std::process::ExitCode {
                 tokio::select! {
                     code = run_command(cli.command, &flags) => code,
                     _ = tokio::signal::ctrl_c() => {
-                        if output::machine_mode(flags.json, flags.jsonl) {
-                            let error_json = serde_json::json!({"type": "Interrupted", "message": "interrupted by SIGINT"});
-                            let envelope = output::Envelope::failed(flags.dry_run, &flags.command, error_json);
-                            if let Ok(v) = serde_json::to_value(&envelope) {
-                                let _ = output::print_json(&v);
-                            }
+                        let mut stdout = std::io::stdout();
+                        match emit_interrupt_envelope(&mut stdout, machine_mode, dry_run, &flags.command) {
+                            Err(e) if e.is_broken_pipe() => error::EXIT_OK,
+                            _ => error::EXIT_INTERRUPTED,
                         }
-                        error::EXIT_INTERRUPTED
                     }
                 }
             })
@@ -412,24 +409,25 @@ fn clap_exit_code(e: &clap::Error) -> u8 {
 }
 
 fn clap_error_exit(e: clap::Error) -> std::process::ExitCode {
-    let rendered = clap_render_for(&e).unwrap_or_else(|| e.render().to_string());
-    let is_help_kind = clap_render_for(&e).is_none();
-    if is_help_kind {
-        if e.use_stderr() {
-            // Bare `tele` prints its help body to stderr and exits 1. It is
-            // help, not a diagnostic, so it must bypass the scrubber.
-            let _ = write!(std::io::stderr(), "{}", e.render());
-            bug_report_footer();
-        } else {
-            // Help and version output are not errors: let clap print them so
-            // wrapping and ANSI styling stay byte-identical to --help.
-            let _ = e.print();
+    match clap_render_for(&e) {
+        None => {
+            if e.use_stderr() {
+                // Bare `tele` prints its help body to stderr and exits 1. It is
+                // help, not a diagnostic, so it must bypass the scrubber.
+                let _ = write!(std::io::stderr(), "{}", e.render());
+                bug_report_footer();
+            } else {
+                // Help and version output are not errors: let clap print them so
+                // wrapping and ANSI styling stay byte-identical to --help.
+                let _ = e.print();
+            }
         }
-    } else {
-        let _ = write!(std::io::stderr(), "{rendered}");
-        bug_report_footer();
+        Some(rendered) => {
+            let _ = write!(std::io::stderr(), "{rendered}");
+            bug_report_footer();
+        }
     }
-    if std::env::args_os().any(|a| a == "--json" || a == "--jsonl") && e.use_stderr() {
+    if e.use_stderr() && argv_requests_machine_output() {
         let hint = error::scrub(argv_command_hint().unwrap_or_default());
         emit_usage_error(
             UsageCtx {
@@ -437,10 +435,30 @@ fn clap_error_exit(e: clap::Error) -> std::process::ExitCode {
                 dry_run: false,
             },
             &hint,
-            &output::strip_ansi(&rendered),
+            &clap_error_envelope_message(&e),
         );
     }
     std::process::ExitCode::from(clap_exit_code(&e))
+}
+
+fn argv_requests_machine_output() -> bool {
+    argv_requests_machine_output_from(std::env::args_os())
+}
+
+fn argv_requests_machine_output_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter().any(|arg| {
+        let s = arg.to_string_lossy();
+        s == "--json" || s.starts_with("--json=") || s == "--jsonl" || s.starts_with("--jsonl=")
+    })
+}
+
+const HELP_KIND_MACHINE_MESSAGE: &str = "subcommand required; run tele --help for usage";
+
+fn clap_error_envelope_message(e: &clap::Error) -> String {
+    match clap_render_for(e) {
+        Some(rendered) => output::strip_ansi(&rendered),
+        None => HELP_KIND_MACHINE_MESSAGE.to_string(),
+    }
 }
 
 const EXIT_CODE_MIN: i32 = 0;
@@ -592,6 +610,33 @@ fn argv_command_hint_from(args: impl IntoIterator<Item = std::ffi::OsString>) ->
     } else {
         Some(parts.join(" "))
     }
+}
+
+const STREAMING_COMMANDS: &[&str] = &["listen", "serve"];
+
+// Streaming commands own stdout with event/frame rows; a one-shot interrupt
+// envelope would splice a foreign shape into that stream.
+fn is_streaming_command(command: &str) -> bool {
+    STREAMING_COMMANDS.iter().any(|c| {
+        command == *c
+            || command
+                .strip_prefix(c)
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
+fn emit_interrupt_envelope(
+    w: &mut impl std::io::Write,
+    machine: bool,
+    dry_run: bool,
+    command: &str,
+) -> error::TeleResult<()> {
+    if !machine || is_streaming_command(command) {
+        return Ok(());
+    }
+    let error_json = serde_json::json!({"type": "Interrupted", "message": "interrupted by SIGINT"});
+    let envelope = output::Envelope::failed(dry_run, command, error_json);
+    output::print_json_to(w, &serde_json::to_value(&envelope)?)
 }
 
 async fn run_command(command: Command, flags: &GlobalFlags) -> i32 {
@@ -929,5 +974,121 @@ mod tests {
         assert!(detail.contains("--change-phone"), "detail: {detail}");
         let (command, m) = parsed(&["tele", "account", "login", "--name", "w", "--method", "qr"]);
         assert!(super::no_input_violation(&command, &m).is_none());
+    }
+
+    #[test]
+    fn streaming_command_match_requires_a_whole_name() {
+        for command in ["listen", "serve", "listen extra"] {
+            assert!(super::is_streaming_command(command), "{command}");
+        }
+        for command in ["", "listeners", "served", "msg send", "account list"] {
+            assert!(!super::is_streaming_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn interrupt_envelope_is_skipped_for_streaming_commands() {
+        let _lock = crate::output::lock_fields_for_test();
+        crate::output::clear_output_fields();
+        let mut buf: Vec<u8> = Vec::new();
+        for command in ["listen", "serve"] {
+            super::emit_interrupt_envelope(&mut buf, true, false, command).unwrap();
+        }
+        assert!(
+            buf.is_empty(),
+            "streaming stdout must stay event-shaped: {}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
+    #[test]
+    fn interrupt_envelope_is_skipped_without_machine_mode() {
+        let _lock = crate::output::lock_fields_for_test();
+        crate::output::clear_output_fields();
+        let mut buf: Vec<u8> = Vec::new();
+        super::emit_interrupt_envelope(&mut buf, false, false, "msg send").unwrap();
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn interrupt_envelope_is_one_shot_shaped() {
+        let _lock = crate::output::lock_fields_for_test();
+        crate::output::clear_output_fields();
+        let mut buf: Vec<u8> = Vec::new();
+        super::emit_interrupt_envelope(&mut buf, true, true, "msg send").unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let value: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(value["ok"], serde_json::json!(false));
+        assert_eq!(value["command"], serde_json::json!("msg send"));
+        assert_eq!(value["dry_run"], serde_json::json!(true));
+        assert_eq!(value["error"]["type"], serde_json::json!("Interrupted"));
+        assert_eq!(
+            value["error"]["message"],
+            serde_json::json!("interrupted by SIGINT")
+        );
+    }
+
+    #[test]
+    fn interrupt_envelope_broken_pipe_maps_to_success() {
+        let err =
+            super::emit_interrupt_envelope(&mut BrokenStdout, true, false, "msg send").unwrap_err();
+        assert!(err.is_broken_pipe());
+        assert_eq!(err.exit_code(), crate::error::EXIT_OK);
+    }
+
+    #[test]
+    fn machine_flag_scan_sees_equals_form() {
+        let scan = |argv: &[&str]| {
+            super::argv_requests_machine_output_from(
+                argv.iter().map(|s| std::ffi::OsString::from(*s)),
+            )
+        };
+        assert!(scan(&["tele", "--json", "msg", "send"]));
+        assert!(scan(&["tele", "--json=true", "msg", "send"]));
+        assert!(scan(&["tele", "--jsonl", "listen"]));
+        assert!(scan(&["tele", "--jsonl=true", "listen"]));
+        assert!(!scan(&["tele", "msg", "send"]));
+        assert!(!scan(&["tele", "--json-file", "msg", "send"]));
+    }
+
+    #[test]
+    fn help_kind_machine_message_omits_help_body() {
+        let err = super::Cli::command()
+            .try_get_matches_from(["tele"])
+            .expect_err("bare tele must ask for a subcommand");
+        assert!(super::clap_render_for(&err).is_none());
+        let message = super::clap_error_envelope_message(&err);
+        assert_eq!(message, super::HELP_KIND_MACHINE_MESSAGE);
+        assert!(!message.contains("Usage: tele"), "{message}");
+    }
+
+    #[test]
+    fn real_clap_errors_keep_stripped_scrubbed_message() {
+        let err = super::Cli::command()
+            .try_get_matches_from([
+                "tele",
+                "msg",
+                "send",
+                "--chat",
+                "+15551234567/42",
+                "--text",
+                "hi",
+            ])
+            .expect_err("deep-link chat must fail clap parsing");
+        let message = super::clap_error_envelope_message(&err);
+        assert!(message.contains("invalid value"), "{message}");
+        assert!(!message.contains('\u{1b}'), "{message}");
+        assert!(!message.contains("15551234567"), "{message}");
+    }
+
+    struct BrokenStdout;
+
+    impl std::io::Write for BrokenStdout {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

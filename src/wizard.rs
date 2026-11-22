@@ -137,7 +137,7 @@ fn write_env_values(
     for key in keys {
         text.push_str(&format!("{key}={}\n", render_env_value(&map[key])));
     }
-    crate::fs_util::write_file_private(&path, text.as_bytes())
+    crate::fs_util::write_file_atomic_private(&path, text.as_bytes())
         .map_err(|e| TeleError::Config(format!("failed to write {}: {e}", path.display())))?;
     Ok(true)
 }

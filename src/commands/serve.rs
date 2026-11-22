@@ -1173,12 +1173,20 @@ pub(crate) fn apply_confirm_gate(
         if let Some(obj) = probe.as_object_mut() {
             obj.insert("dry_run".to_string(), serde_json::Value::Bool(true));
         }
-        let would = match planner(op, probe) {
-            Ok(Plan::DryRun(data)) => data,
-            _ => serde_json::json!({}),
+        // A planner rejection (bad params) would otherwise hand the driver an
+        // empty `would` and cost a round-trip to learn why; carry the reason
+        // alongside the unchanged preview payload.
+        let (would, would_error) = match planner(op, probe) {
+            Ok(Plan::DryRun(data)) => (data, None),
+            Ok(Plan::Execute(_)) => (serde_json::json!({}), None),
+            Err(error) => (serde_json::json!({}), Some(error)),
         };
         strip_confirm(raw);
-        return Err(confirm_required_error(op, would));
+        let mut envelope = confirm_required_error(op, would);
+        if let Some(error) = would_error {
+            envelope["would_error"] = error;
+        }
+        return Err(envelope);
     }
     strip_confirm(raw);
     Ok(())
@@ -1196,10 +1204,15 @@ fn try_send_to_lane(
     mutations: &tokio::sync::mpsc::Sender<Job>,
     reads: &[tokio::sync::mpsc::Sender<Job>],
     read_counter: &std::sync::atomic::AtomicUsize,
+    pending: &DispatcherPending,
 ) -> LaneSend {
+    let id = job.id;
     match lane {
         Lane::Mutate => match mutations.try_send(job) {
-            Ok(()) => LaneSend::Queued,
+            Ok(()) => {
+                mark_answered(pending, id);
+                LaneSend::Queued
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => LaneSend::QueueFull(job),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => LaneSend::Closed,
         },
@@ -1210,12 +1223,18 @@ fn try_send_to_lane(
             let idx = read_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 % reads.len().max(1);
             match reads[idx].try_send(job) {
-                Ok(()) => LaneSend::Queued,
+                Ok(()) => {
+                    mark_answered(pending, id);
+                    LaneSend::Queued
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
                     if reads.len() > 1 {
                         let sibling = (idx + 1) % reads.len();
                         match reads[sibling].try_send(returned) {
-                            Ok(()) => LaneSend::Queued,
+                            Ok(()) => {
+                                mark_answered(pending, id);
+                                LaneSend::Queued
+                            }
                             Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
                                 LaneSend::QueueFull(job)
                             }
@@ -1352,12 +1371,14 @@ async fn dispatch_action(
                     completed: false,
                 },
             };
-            // From here the guard (or the QueueFull envelope) owns the
-            // answer, and the transition is synchronous, so an abort cannot
-            // land between the hand-off and the Answered mark.
-            let send_result = try_send_to_lane(job, route.lane, mutations, reads, read_counter);
+            // The lane hand-off marks the id Answered before returning: the
+            // queued Job's guard owns the answer, and an abort after the
+            // hand-off must not leave the id for the EOF sweep to answer a
+            // second time.
+            let send_result =
+                try_send_to_lane(job, route.lane, mutations, reads, read_counter, pending);
             match send_result {
-                LaneSend::Queued => mark_answered(pending, id),
+                LaneSend::Queued => {}
                 LaneSend::QueueFull(mut job) => {
                     let id = job.guard.id;
                     let op = job.guard.op;
@@ -1698,6 +1719,10 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     }
 
     let config_path = flags.config_path.clone();
+    let cfg = crate::config::load_config(config_path.as_deref())?;
+    let connect_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        crate::executor::effective_parallel(flags.parallel, cfg.parallel_max)? as usize,
+    ));
     let creds = crate::config::credentials().map_err(|e| TeleError::Config(e.to_string()))?;
     let writer = spawn_jsonl_writer();
 
@@ -1745,6 +1770,7 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
             creds.clone(),
             config_path.clone(),
             std::sync::Arc::clone(&pool),
+            std::sync::Arc::clone(&connect_slots),
             resync_rxs.remove(name).expect("resync receiver"),
             tick_tx.clone(),
         ));
@@ -2036,7 +2062,9 @@ pub async fn run(args: &ServeArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                     gap["reason"] = serde_json::json!("consumer_stalled");
                     gap["dropped"] = serde_json::json!(dropped);
                     apply_seq(&mut gap, &mut seq);
-                    let _ = writer.emit(&gap).await;
+                    if let Err(e) = writer.emit(&gap).await {
+                        output::log_line("warn", &format!("serve: dropped Gap row: {e}"));
+                    }
                 }
                 apply_seq(&mut ev, &mut seq);
                 let mut emitted = false;
@@ -2078,6 +2106,7 @@ async fn account_task(
     creds: crate::config::Credentials,
     config_path: Option<std::path::PathBuf>,
     pool: std::sync::Arc<ServePool>,
+    connect_slots: std::sync::Arc<tokio::sync::Semaphore>,
     resync_rx: tokio::sync::mpsc::Receiver<()>,
     ticks: tokio::sync::mpsc::Sender<AccountTick>,
 ) {
@@ -2103,6 +2132,13 @@ async fn account_task(
     loop {
         pool.unpublish(&name);
         let mut guard = loop {
+            // ADR-008: --parallel caps simultaneous connects across accounts.
+            // The permit covers connect + authorize only; holding it across
+            // the stream loop would pin a slot for the whole session.
+            let connect_permit = std::sync::Arc::clone(&connect_slots)
+                .acquire_owned()
+                .await
+                .expect("serve connect semaphore is never closed");
             match crate::client::ClientGuard::connect_with_limiter(
                 &name,
                 creds.api_id,
@@ -2111,8 +2147,18 @@ async fn account_task(
             )
             .await
             {
-                Ok(guard) => break guard,
+                Ok(guard) => {
+                    let authorized = crate::client::authorize(&guard.client).await;
+                    drop(connect_permit);
+                    if let Err(e) = authorized {
+                        guard.close().await;
+                        let _ = ticks.send(AccountTick::Fatal { err: e }).await;
+                        return;
+                    }
+                    break guard;
+                }
                 Err(e) => {
+                    drop(connect_permit);
                     if let Err(fatal) = handle_stream_failure(
                         &name,
                         TeleError::from(e),
@@ -2128,11 +2174,6 @@ async fn account_task(
                 }
             }
         };
-        if let Err(e) = crate::client::authorize(&guard.client).await {
-            guard.close().await;
-            let _ = ticks.send(AccountTick::Fatal { err: e }).await;
-            return;
-        }
         let me = match guard.client.get_me().await {
             Ok(me) => me,
             Err(e) => {
@@ -2323,6 +2364,9 @@ async fn account_task(
                 }
             }
         }
+        // close() can take up to 3s; unpublishing first stops the pool from
+        // advertising shares that are already being torn down.
+        pool.unpublish(&name);
         guard.close().await;
     }
 }
@@ -3968,6 +4012,10 @@ mod tests {
             other => panic!("expected dry run plan, got {other:?}"),
         };
         assert_eq!(err["would"], dry_via_planner);
+        assert!(
+            err.get("would_error").is_none(),
+            "a computed preview must not carry a planner error: {err}"
+        );
         assert_eq!(
             err["would"]["would"],
             "delete all messages in chat @game for yourself (channels always delete for everyone)"
@@ -3998,6 +4046,30 @@ mod tests {
             &mut raw,
         );
         assert!(gate.is_err(), "confirm:false must not satisfy the gate");
+    }
+
+    #[test]
+    fn destructive_without_confirm_carries_the_planner_error_when_the_preview_fails() {
+        let mut raw = serde_json::json!({"chat": "@game"});
+        let err = apply_confirm_gate(
+            "msg delete",
+            true,
+            route_for("msg delete").planner,
+            &mut raw,
+        )
+        .unwrap_err();
+        assert_eq!(err["type"], "ConfirmRequired");
+        assert_eq!(
+            err["would"],
+            serde_json::json!({}),
+            "the preview payload keeps its documented empty-object shape"
+        );
+        assert_eq!(err["would_error"]["type"], "UsageError");
+        let message = err["would_error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("--ids required"),
+            "the driver must learn why the preview is empty: {err}"
+        );
     }
 
     #[test]
@@ -4335,6 +4407,16 @@ mod tests {
         let reads = vec![read_a, read_b];
         let mutations = tokio::sync::mpsc::channel::<Job>(4).0;
         let read_counter = std::sync::atomic::AtomicUsize::new(0);
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        for id in [0_u64, 1] {
+            pending_lock(&pending).insert(
+                id,
+                PendingEntry {
+                    op: "dialog list".to_string(),
+                    state: PendingState::Claimed,
+                },
+            );
+        }
         let queued = |id: u64| {
             try_send_to_lane(
                 scripted_job(id, 0, None),
@@ -4342,10 +4424,18 @@ mod tests {
                 &mutations,
                 &reads,
                 &read_counter,
+                &pending,
             )
         };
         assert!(matches!(queued(0), LaneSend::Queued));
         assert!(matches!(queued(1), LaneSend::Queued));
+        for id in [0_u64, 1] {
+            assert_eq!(
+                pending_lock(&pending).get(&id).map(|entry| entry.state),
+                Some(PendingState::Answered),
+                "a queued job's guard owns its answer, so the lane hand-off must mark id {id} Answered before returning"
+            );
+        }
         assert!(
             rx_a.try_recv().is_ok() && rx_b.try_recv().is_ok(),
             "round robin must spread the first two jobs across both workers"
@@ -4510,6 +4600,7 @@ mod tests {
         let reads = vec![primary, sibling];
         let mutations = tokio::sync::mpsc::channel::<Job>(4).0;
         let read_counter = std::sync::atomic::AtomicUsize::new(0);
+        let pending: DispatcherPending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
         while reads[0].try_send(scripted_job(1, 0, None)).is_ok() {}
         match try_send_to_lane(
             scripted_job(44, 0, None),
@@ -4517,6 +4608,7 @@ mod tests {
             &mutations,
             &reads,
             &read_counter,
+            &pending,
         ) {
             LaneSend::QueueFull(job) => {
                 assert_eq!(job.id, 44, "the returned job must be the rejected one");

@@ -751,6 +751,20 @@ pub(crate) fn dedupe_key(
     Some((chat_id.unwrap_or(0), msg_id, point.pts))
 }
 
+/// One delete update carries a whole batch of ids, so it is deduped as one
+/// update keyed on its pts — never per message — or a catch_up replay of the
+/// same update would emit every id in the batch a second time.
+fn deletion_is_duplicate(
+    dedupe: &mut ListenDedupe,
+    raw: &tl::enums::Update,
+    channel_id: Option<i64>,
+) -> bool {
+    match dedupe_key(channel_id, 0, raw) {
+        Some(key) => dedupe.check(key),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 use super::serve::pts_from_state;
 
@@ -779,6 +793,18 @@ fn until_bounds(
             Ok((deadline, Some(dt)))
         }
     }
+}
+
+/// Runs one connect attempt under the shared `--parallel` permit and releases
+/// it when the attempt ends. The reconnect backoff and FloodWait sleeps that
+/// follow a failure must not run inside the permit: at `--parallel 1` a single
+/// failing account would starve every other account for up to an hour.
+async fn with_connect_permit<T>(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    attempt: impl std::future::Future<Output = T>,
+) -> T {
+    let _permit = Arc::clone(semaphore).acquire_owned().await;
+    attempt.await
 }
 
 pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
@@ -887,45 +913,38 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                         // flushed by the inner loop before it broke.
                         break;
                     }
-                    let mut guard = {
-                        let _permit = Arc::clone(&semaphore).acquire_owned().await;
-                        match ClientGuard::connect_with_limiter(
-                            &name,
-                            creds.api_id,
-                            config_path.as_deref(),
-                            std::sync::Arc::clone(&rate_limiter),
-                        )
-                        .await
-                        {
-                            Ok(guard) => {
-                                if let Err(e) = client::authorize(&guard.client).await {
-                                    let ctx =
-                                        StreamFailureCtx::before_connect(deadline, Some(&stopper));
-                                    handle_stream_failure(
-                                        &name,
-                                        e,
-                                        &mut failures,
-                                        ctx,
-                                        MAX_RECONNECT_ATTEMPTS,
-                                    )
-                                    .await?;
-                                    continue;
+                    let connected: Result<ClientGuard, TeleError> = with_connect_permit(
+                        &semaphore,
+                        async {
+                            match ClientGuard::connect_with_limiter(
+                                &name,
+                                creds.api_id,
+                                config_path.as_deref(),
+                                std::sync::Arc::clone(&rate_limiter),
+                            )
+                            .await
+                            {
+                                Ok(guard) => {
+                                    client::authorize(&guard.client).await.map(|()| guard)
                                 }
-                                guard
+                                Err(e) => Err(TeleError::from(e)),
                             }
-                            Err(e) => {
-                                let ctx =
-                                    StreamFailureCtx::before_connect(deadline, Some(&stopper));
-                                handle_stream_failure(
-                                    &name,
-                                    TeleError::from(e),
-                                    &mut failures,
-                                    ctx,
-                                    MAX_RECONNECT_ATTEMPTS,
-                                )
-                                .await?;
-                                continue;
-                            }
+                        },
+                    )
+                    .await;
+                    let mut guard = match connected {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            let ctx = StreamFailureCtx::before_connect(deadline, Some(&stopper));
+                            handle_stream_failure(
+                                &name,
+                                e,
+                                &mut failures,
+                                ctx,
+                                MAX_RECONNECT_ATTEMPTS,
+                            )
+                            .await?;
+                            continue;
                         }
                     };
                     if stopper.stop_requested() || stopper.time_up() {
@@ -1369,6 +1388,14 @@ pub async fn run(args: &ListenArgs, flags: &GlobalFlags) -> TeleResult<i32> {
                                 let Some(matched) = matched else {
                                     continue;
                                 };
+                                // A delete update carries a whole batch, so the
+                                // key is per update (msg_id 0, chat, pts), not
+                                // per message: a catch_up replay of the same
+                                // update must not emit the batch twice.
+                                if deletion_is_duplicate(&mut dedupe, update.raw(), d.channel_id())
+                                {
+                                    continue;
+                                }
                                                                 if emit_or_stop(&writer, &stopper, &name, &mut album, event_row(
                                     "MessageDeleted",
                                     &name,
@@ -1658,12 +1685,13 @@ fn spawn_listen_writer() -> ListenWriter {
 }
 
 fn stream_row_line_with_dropped(value: &serde_json::Value, dropped: u32) -> TeleResult<String> {
-    let mut projected = crate::output::apply_output_fields(value)?;
+    let mut row = value.clone();
     if dropped > 0 {
-        if let serde_json::Value::Object(map) = &mut projected {
+        if let serde_json::Value::Object(map) = &mut row {
             map.insert("dropped".to_string(), serde_json::Value::from(dropped));
         }
     }
+    let projected = crate::output::apply_output_fields(&row)?;
     Ok(serde_json::to_string(&projected)?)
 }
 
@@ -3831,5 +3859,76 @@ mod stopper_tests {
             .collect();
         assert_eq!(rows.len(), 1, "a row past --until must not be flushed");
         assert_eq!(rows[0]["n"], 1);
+    }
+
+    #[tokio::test]
+    async fn the_connect_permit_is_released_when_the_attempt_ends() {
+        // Regression: the permit was held across the reconnect backoff and
+        // FloodWait sleeps, so at --parallel 1 one failing account starved
+        // every other account for up to an hour.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let held_inside =
+            super::with_connect_permit(&semaphore, async { semaphore.available_permits() }).await;
+        assert_eq!(held_inside, 0, "the attempt must run under the permit");
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "the permit must be back before the caller starts its backoff sleep"
+        );
+    }
+
+    #[test]
+    fn a_stamped_drop_count_survives_the_output_fields_projection() {
+        // Regression: `dropped` was added after the projection ran, so
+        // `--fields dropped` always failed as an unknown field.
+        let _lock = quiet_fields();
+        let _fields = crate::output::FieldsTestGuard::set("dropped");
+        let line = super::stream_row_line_with_dropped(
+            &serde_json::json!({"event": "NewMessage", "id": 1}),
+            2,
+        )
+        .expect("the stamped drop count must be projectable");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"dropped": 2})
+        );
+    }
+
+    #[test]
+    fn a_replayed_delete_update_is_deduped_by_its_pts() {
+        // Regression: the MessageDeleted branch never consulted the dedupe, so
+        // a catch_up replay after a reconnect emitted the batch twice.
+        let mut dedupe = super::ListenDedupe::new(super::LISTEN_DEDUPE_CAP);
+        let batch = tl::enums::Update::DeleteMessages(tl::types::UpdateDeleteMessages {
+            messages: vec![7, 8],
+            pts: 42,
+            pts_count: 2,
+        });
+        assert!(
+            !super::deletion_is_duplicate(&mut dedupe, &batch, None),
+            "the first delivery must be emitted"
+        );
+        assert!(
+            super::deletion_is_duplicate(&mut dedupe, &batch, None),
+            "the catch_up replay must be dropped"
+        );
+
+        let channel_batch =
+            tl::enums::Update::DeleteChannelMessages(tl::types::UpdateDeleteChannelMessages {
+                channel_id: 900,
+                messages: vec![1],
+                pts: 5,
+                pts_count: 1,
+            });
+        assert!(!super::deletion_is_duplicate(
+            &mut dedupe,
+            &channel_batch,
+            Some(900)
+        ));
+        assert!(super::deletion_is_duplicate(
+            &mut dedupe,
+            &channel_batch,
+            Some(900)
+        ));
     }
 }

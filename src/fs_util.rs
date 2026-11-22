@@ -23,6 +23,18 @@ fn tmp_dir_name(stem: &std::ffi::OsStr) -> std::ffi::OsString {
     tmp_dir_name_at(stem, rand)
 }
 
+fn tmp_file_path(path: &Path) -> std::path::PathBuf {
+    static TMP_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let rand: u16 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u16)
+        .unwrap_or(0);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".tmp-{}-{rand}-{seq}", std::process::id()));
+    std::path::PathBuf::from(name)
+}
+
 pub fn create_dir_private(path: &Path) -> std::io::Result<()> {
     if path.exists() {
         if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
@@ -96,6 +108,73 @@ pub fn create_dir_private(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Create `path` when missing without touching the permissions or ACL of a
+/// directory that already exists: callers pass a parent they do not own (a
+/// user-supplied `--config`/`--out` directory) and must not narrow it.
+pub fn ensure_dir_private(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::other(format!(
+                    "refusing to follow symlink at {}",
+                    path.display()
+                )));
+            }
+            if meta.is_dir() {
+                return Ok(());
+            }
+            Err(std::io::Error::other(format!(
+                "cannot use {} as a directory: it exists and is not a directory",
+                path.display()
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                restrict(path, 0o700)?;
+                #[cfg(windows)]
+                set_user_only_dacl(path, true)?;
+                Ok(())
+            }
+            // A concurrent creator owns the permissions of the directory it
+            // made; tightening it here would be the same overreach this helper
+            // exists to avoid.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = std::fs::symlink_metadata(path)?;
+                if meta.file_type().is_symlink() {
+                    return Err(std::io::Error::other(format!(
+                        "refusing to follow symlink at {}",
+                        path.display()
+                    )));
+                }
+                if meta.is_dir() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "cannot use {} as a directory: it exists and is not a directory",
+                        path.display()
+                    )))
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "cannot create directory {}: no parent directory",
+                            path.display()
+                        ))
+                    })?;
+                ensure_dir_private(parent)?;
+                ensure_dir_private(path)
+            }
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(unix)]
 pub fn write_file_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -144,12 +223,49 @@ pub fn write_file_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
+/// Replace `path` through a private temp file: write, fsync, then rename, so a
+/// crash or power loss cannot leave a truncated file under the real name.
+pub fn write_file_atomic_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp_path = tmp_file_path(path);
+    let result = (|| {
+        let mut file = create_file_private(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        restrict_file_private(&tmp_path)?;
+        std::fs::rename(&tmp_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 #[cfg(unix)]
 pub fn create_file_private(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true).mode(0o600);
-    opts.open(path)
+    opts.create_new(true).write(true).mode(0o600);
+    match opts.open(path) {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+                return Err(std::io::Error::other(format!(
+                    "refusing to follow symlink at {}",
+                    path.display()
+                )));
+            }
+            // O_NOFOLLOW closes the window between the symlink check and the
+            // open; truncation is deliberately absent so a file another
+            // process just created is not emptied under it.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(windows)]
@@ -170,10 +286,7 @@ pub fn create_file_private(path: &Path) -> std::io::Result<std::fs::File> {
                     path.display()
                 )));
             }
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(path)?;
+            let f = std::fs::OpenOptions::new().write(true).open(path)?;
             set_user_only_dacl(path, false)?;
             Ok(f)
         }
@@ -578,7 +691,21 @@ fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
     let os = path.into_os_string();
     let bytes = os.as_encoded_bytes();
     let prefix = br"\\?\";
-    if bytes.starts_with(prefix) {
+    let unc_prefix = br"\\?\UNC\";
+    if bytes.len() >= unc_prefix.len() && bytes[..unc_prefix.len()].eq_ignore_ascii_case(unc_prefix)
+    {
+        let stripped = &bytes[unc_prefix.len()..];
+        let mut rebuilt = Vec::with_capacity(stripped.len() + 2);
+        rebuilt.extend_from_slice(br"\\");
+        rebuilt.extend_from_slice(stripped);
+        // SAFETY: both halves are split at ASCII boundaries (the prefix is
+        // ASCII and `\\` is ASCII), so the remainder is still valid platform
+        // encoding and `\\server\share` reconstructs the UNC path minus the
+        // verbatim prefix.
+        std::path::PathBuf::from(unsafe {
+            std::ffi::OsString::from_encoded_bytes_unchecked(rebuilt)
+        })
+    } else if bytes.starts_with(prefix) {
         let stripped = &bytes[prefix.len()..];
         // SAFETY: the split is at `prefix.len()` (4), an ASCII boundary of
         // the original OS bytes, so the remainder is still valid platform
@@ -793,6 +920,155 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dir_private_leaves_existing_dir_permissions_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_path("ensure-existing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = permission_write_count(&dir);
+        ensure_dir_private(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "a caller-supplied parent directory must keep its mode"
+        );
+        assert_eq!(
+            permission_write_count(&dir),
+            before,
+            "no permission write may target an existing parent"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dir_private_creates_missing_nested_dir_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp_path("ensure-new");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("a").join("b");
+        ensure_dir_private(&dir).unwrap();
+        for created in [&base, &base.join("a"), &dir] {
+            let mode = std::fs::metadata(created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be private", created.display());
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn ensure_dir_private_rejects_a_file_in_the_way() {
+        let base = temp_path("ensure-file");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("config.toml");
+        std::fs::write(&file, b"x").unwrap();
+        let err = ensure_dir_private(&file).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dir_private_rejects_symlinked_dir() {
+        let base = temp_path("ensure-link");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = ensure_dir_private(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_file_private_rejects_pre_placed_symlink() {
+        let base = temp_path("file-link");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = create_file_private(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn create_file_private_does_not_truncate_an_existing_file() {
+        let base = temp_path("file-keep");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("seed");
+        std::fs::write(&file, b"written-by-the-winner").unwrap();
+        drop(create_file_private(&file).unwrap());
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"written-by-the-winner",
+            "losing the create race must not empty the winner's file"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn write_file_atomic_private_replaces_content_and_leaves_no_temp() {
+        let base = temp_path("atomic-write");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join(".env");
+        std::fs::write(&file, b"old-and-longer-content").unwrap();
+        write_file_atomic_private(&file, b"new").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        let leftovers: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn tmp_file_names_are_unique_within_a_process() {
+        let path = std::path::Path::new("config.toml");
+        let names: Vec<std::path::PathBuf> = (0..1000).map(|_| tmp_file_path(path)).collect();
+        let distinct: std::collections::HashSet<&std::path::PathBuf> = names.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            names.len(),
+            "every temp name must be distinct"
+        );
+        assert!(
+            names[0]
+                .to_string_lossy()
+                .contains(&format!(".tmp-{}", std::process::id())),
+            "temp name must stay beside the target: {:?}",
+            names[0]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_restores_unc_share() {
+        let path = std::path::PathBuf::from(r"\\?\UNC\server\share\dir\file.txt");
+        assert_eq!(
+            strip_verbatim_prefix(path),
+            std::path::PathBuf::from(r"\\server\share\dir\file.txt")
+        );
     }
 
     #[test]

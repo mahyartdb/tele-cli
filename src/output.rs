@@ -362,16 +362,32 @@ pub fn print_line(line: &str) -> crate::error::TeleResult<()> {
 /// `strip_ansi("plain") == "plain"` are covered by unit tests in this module.
 pub fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
+    let mut chars = s.chars();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for n in chars.by_ref() {
-                if n.is_ascii_alphabetic() {
-                    break;
+        if c == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
                 }
+                Some(']') => {
+                    let iter = chars.by_ref();
+                    while let Some(n) = iter.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' && iter.next() == Some('\\') {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => break,
             }
-        } else {
+        } else if c == '\n' || c == '\t' || !c.is_control() {
             out.push(c);
         }
     }
@@ -379,7 +395,7 @@ pub fn strip_ansi(s: &str) -> String {
 }
 
 pub fn print_line_to(w: &mut impl std::io::Write, line: &str) -> crate::error::TeleResult<()> {
-    writeln!(w, "{line}")?;
+    writeln!(w, "{}", strip_ansi(line))?;
     w.flush()?;
     Ok(())
 }
@@ -615,6 +631,26 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[31merror\x1b[0m"), "error");
         assert_eq!(strip_ansi("plain"), "plain");
         assert_eq!(strip_ansi("\x1b[1;32mok\x1b[0m tail"), "ok tail");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_clipboard_payload_and_controls() {
+        let injected = "title\x1b]52;c;cGF5bG9hZA==\x07tail\r\x08\x00\n\tend";
+        assert_eq!(strip_ansi(injected), "titletail\n\tend");
+        assert_eq!(strip_ansi("a\x1b[2Jb"), "ab");
+        assert_eq!(strip_ansi("x\x1b]0;label\x1b\\y"), "xy");
+    }
+
+    #[test]
+    fn print_line_to_sanitizes_terminal_controls() {
+        let mut buf: Vec<u8> = Vec::new();
+        print_line_to(&mut buf, "ok\x1b]52;c;cGF5bG9hZA==\x07bad").unwrap();
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC must be stripped: {rendered:?}"
+        );
+        assert_eq!(rendered, "okbad\n");
     }
 
     #[test]

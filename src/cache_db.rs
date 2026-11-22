@@ -7,6 +7,7 @@ pub fn cache_dir() -> TeleResult<PathBuf> {
 }
 
 pub fn cache_path(account: &str) -> TeleResult<PathBuf> {
+    crate::session::validate_name(account).map_err(TeleError::Usage)?;
     cache_dir().map(|d| d.join(format!("{account}.cache.db")))
 }
 
@@ -82,6 +83,11 @@ static DB_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// tests to prove a blocked task really contended on the gate.
 static GATE_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Serialises the seed step inside this process. `create_file_private` opens
+/// an existing path with truncate on some platforms, so two cold opens must
+/// not both conclude the file is missing.
+static SEED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 async fn open_db(account: &str) -> TeleResult<libsql::Connection> {
     {
         let cache = CONNECTIONS
@@ -117,11 +123,21 @@ async fn open_db_uncached(account: &str) -> TeleResult<libsql::Connection> {
     let path = cache_path(account)?;
     let seed_path = path.clone();
     tokio::task::spawn_blocking(move || -> TeleResult<()> {
+        let _seed = SEED_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match std::fs::symlink_metadata(&seed_path) {
             Ok(meta) if meta.file_type().is_symlink() => Err(TeleError::Other(format!(
                 "refusing to open symlinked cache db at {}",
                 seed_path.display()
             ))),
+            Ok(meta) if !meta.is_file() => Err(TeleError::Other(format!(
+                "refusing to open cache db at {}: not a regular file",
+                seed_path.display()
+            ))),
+            // An existing file is never handed to the truncating creator: a
+            // concurrent cold open may have created it and started writing,
+            // and truncating here would erase the winner's schema.
             Ok(_) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 crate::fs_util::create_file_private(&seed_path)
@@ -131,7 +147,20 @@ async fn open_db_uncached(account: &str) -> TeleResult<libsql::Connection> {
                             "cannot create cache db {}: {e}",
                             seed_path.display()
                         ))
-                    })
+                    })?;
+                let meta = std::fs::symlink_metadata(&seed_path).map_err(|e| {
+                    TeleError::Other(format!(
+                        "cannot stat cache db {} after create: {e}",
+                        seed_path.display()
+                    ))
+                })?;
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(TeleError::Other(format!(
+                        "refusing to open cache db at {}: replaced during create",
+                        seed_path.display()
+                    )));
+                }
+                Ok(())
             }
             Err(e) => Err(TeleError::Other(format!(
                 "cannot stat cache db {}: {e}",
@@ -154,6 +183,12 @@ async fn open_db_uncached(account: &str) -> TeleResult<libsql::Connection> {
     conn.execute_batch("PRAGMA recursive_triggers = ON;")
         .await
         .map_err(|e| TeleError::Other(format!("cannot set pragma: {e}")))?;
+    // A second process (or a concurrent VACUUM on the same file) can hold the
+    // write lock for longer than SQLite's immediate busy handler retries, and
+    // the default wait turns that into an instant `database is locked`.
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")
+        .await
+        .map_err(|e| TeleError::Other(format!("cannot set cache busy timeout: {e}")))?;
     // Curve 3: a chat-scoped FTS search fetches every match by rowid before it
     // can filter or sort, and at 100k rows the default 2 MiB page cache thrashes
     // on that walk (40 ms vs 29 ms median with this value; plan unchanged).
@@ -1132,6 +1167,63 @@ mod tests {
         assert_eq!(window_ids, vec![3], "limit applies after the date sort");
         std::env::remove_var("TELE_APP_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_db_sets_a_busy_timeout_for_writer_contention() {
+        // Without a busy handler the second writer fails instantly with
+        // `database is locked` instead of waiting for the first to commit.
+        let _dir = TestAppDir::new("busy");
+        let account = test_account("busy");
+        let conn = open_db(&account).await.unwrap();
+        let mut rows = conn.query("PRAGMA busy_timeout", ()).await.unwrap();
+        let row = rows.next().await.unwrap().expect("busy_timeout row");
+        let timeout = match row.get::<libsql::Value>(0).unwrap() {
+            libsql::Value::Integer(v) => v,
+            other => panic!("busy_timeout must be an integer, got {other:?}"),
+        };
+        assert_eq!(timeout, 5000, "writers must wait 5s for the lock");
+    }
+
+    #[test]
+    fn cache_path_rejects_names_that_escape_the_cache_dir() {
+        let _dir = TestAppDir::new("validate");
+        for bad in ["..\\..\\evil", "../../evil", "", "all", "..", "a/b", "a b"] {
+            let err = cache_path(bad).unwrap_err();
+            assert!(
+                matches!(err, TeleError::Usage(_)),
+                "{bad:?} must be rejected as a usage error"
+            );
+        }
+        let path = cache_path("work").unwrap();
+        assert!(path.starts_with(cache_dir().unwrap()));
+        assert!(path.ends_with("work.cache.db"));
+    }
+
+    #[tokio::test]
+    async fn open_db_does_not_truncate_an_existing_cache_file() {
+        let _dir = TestAppDir::new("seed");
+        let account = test_account("seed");
+        store_messages(&account, &[atomic_message(1, "survives")])
+            .await
+            .unwrap();
+        let conn = open_db_uncached(&account).await.unwrap();
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM messages", ())
+            .await
+            .unwrap();
+        let count = match rows
+            .next()
+            .await
+            .unwrap()
+            .expect("count row")
+            .get::<libsql::Value>(0)
+            .unwrap()
+        {
+            libsql::Value::Integer(v) => v,
+            other => panic!("count must be an integer, got {other:?}"),
+        };
+        assert_eq!(count, 1, "a cold open must not truncate the existing db");
     }
 
     #[tokio::test]

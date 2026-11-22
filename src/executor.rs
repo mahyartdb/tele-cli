@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,30 +60,36 @@ pub async fn run_fanout(
     let handler = Arc::new(handler);
     let budgeted = !is_unbudgeted_command(&flags.command);
     let budget = Duration::from_secs(ACCOUNT_TIMEOUT_SECS);
-    let mut handles: Vec<(String, tokio::task::JoinHandle<TeleResult<AccountOutcome>>)> =
-        Vec::new();
+    let mut tasks: tokio::task::JoinSet<(String, TeleResult<AccountOutcome>)> =
+        tokio::task::JoinSet::new();
+    let mut names_by_id: HashMap<tokio::task::Id, String> = HashMap::new();
     for name in names {
         let semaphore = Arc::clone(&semaphore);
         let handler = Arc::clone(&handler);
-        handles.push((
-            name.clone(),
-            tokio::task::spawn(async move {
-                let permit = semaphore.acquire_owned().await;
-                let future = handler(name.clone());
-                if budgeted {
-                    run_one_budgeted(name, permit, future, budget).await
-                } else {
-                    run_one(name, permit, future).await
-                }
-            }),
-        ));
+        let task_name = name.clone();
+        let account_name = name.clone();
+        let handle = tasks.spawn(async move {
+            let permit = semaphore.acquire_owned().await;
+            let future = handler(account_name.clone());
+            let result = if budgeted {
+                run_one_budgeted(account_name, permit, future, budget).await
+            } else {
+                run_one(account_name, permit, future).await
+            };
+            (task_name, result)
+        });
+        names_by_id.insert(handle.id(), name);
     }
-    let outcomes = collect_outcomes(&mut handles).await;
-    for o in &outcomes {
-        if let Some(line) = outcome_error_line(o) {
+    let mut outcomes: Vec<AccountOutcome> = Vec::new();
+    // JoinSet yields whichever account finishes first, so a slow account does
+    // not hold back the error line of a fast failing sibling.
+    while let Some(outcome) = next_outcome(&mut tasks, &mut names_by_id).await {
+        if let Some(line) = outcome_error_line(&outcome) {
             log_line("error", &line);
         }
+        outcomes.push(outcome);
     }
+    sort_outcomes(&mut outcomes);
     Ok(crate::output::Envelope::new(
         outcomes,
         flags.dry_run,
@@ -91,8 +97,26 @@ pub async fn run_fanout(
     ))
 }
 
+async fn next_outcome(
+    tasks: &mut tokio::task::JoinSet<(String, TeleResult<AccountOutcome>)>,
+    names_by_id: &mut HashMap<tokio::task::Id, String>,
+) -> Option<AccountOutcome> {
+    match tasks.join_next_with_id().await? {
+        Ok((id, (name, result))) => {
+            names_by_id.remove(&id);
+            Some(fold_result(name, result))
+        }
+        Err(e) => {
+            let name = names_by_id.remove(&e.id()).unwrap_or_default();
+            Some(join_error_outcome(name, e))
+        }
+    }
+}
+
+#[cfg(test)]
 struct AbortOnDrop<'a>(&'a mut Vec<(String, tokio::task::JoinHandle<TeleResult<AccountOutcome>>)>);
 
+#[cfg(test)]
 impl Drop for AbortOnDrop<'_> {
     fn drop(&mut self) {
         for (_, handle) in self.0.iter() {
@@ -165,6 +189,7 @@ async fn run_one_budgeted(
     }
 }
 
+#[cfg(test)]
 async fn collect_outcomes(
     handles: &mut Vec<(String, tokio::task::JoinHandle<TeleResult<AccountOutcome>>)>,
 ) -> Vec<AccountOutcome> {
@@ -190,13 +215,20 @@ fn join_error_outcome(name: String, e: tokio::task::JoinError) -> AccountOutcome
     failed_outcome(name, TeleError::TaskPanic(msg))
 }
 
+fn fold_result(name: String, result: TeleResult<AccountOutcome>) -> AccountOutcome {
+    match result {
+        Ok(outcome) => outcome,
+        Err(e) => failed_outcome(name, e),
+    }
+}
+
+#[cfg(test)]
 fn fold_join(
     name: &str,
     joined: Result<TeleResult<AccountOutcome>, tokio::task::JoinError>,
 ) -> AccountOutcome {
     match joined {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(e)) => failed_outcome(name.to_string(), e),
+        Ok(result) => fold_result(name.to_string(), result),
         Err(e) => join_error_outcome(name.to_string(), e),
     }
 }
@@ -205,6 +237,7 @@ fn sort_outcomes(outcomes: &mut [AccountOutcome]) {
     outcomes.sort_by(|a, b| a.account.cmp(&b.account));
 }
 
+#[cfg(test)]
 async fn collect_outcomes_unbudgeted(
     handles: &mut Vec<(String, tokio::task::JoinHandle<TeleResult<AccountOutcome>>)>,
 ) -> Vec<AccountOutcome> {
@@ -955,6 +988,59 @@ mod tests {
         let names: Vec<&str> = outcomes.iter().map(|o| o.account.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
         assert!(outcomes.iter().all(|o| o.ok));
+    }
+
+    #[tokio::test]
+    async fn next_outcome_yields_whichever_account_finishes_first() {
+        let mut tasks: tokio::task::JoinSet<(String, TeleResult<AccountOutcome>)> =
+            tokio::task::JoinSet::new();
+        let mut names_by_id = std::collections::HashMap::new();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let slow = tasks.spawn(async move {
+            let _ = wait.await;
+            (
+                "b".to_string(),
+                run_one("b".to_string(), permit().await, async { ok_data() }).await,
+            )
+        });
+        names_by_id.insert(slow.id(), "b".to_string());
+        let fast = tasks.spawn(async move {
+            (
+                "a".to_string(),
+                run_one("a".to_string(), permit().await, async { ok_data() }).await,
+            )
+        });
+        names_by_id.insert(fast.id(), "a".to_string());
+        let first = next_outcome(&mut tasks, &mut names_by_id).await.unwrap();
+        assert_eq!(
+            first.account, "a",
+            "a finished account must not wait behind a slow sibling"
+        );
+        assert_eq!(tasks.len(), 1);
+        let _ = release.send(());
+        let second = next_outcome(&mut tasks, &mut names_by_id).await.unwrap();
+        assert_eq!(second.account, "b");
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn next_outcome_names_a_panicking_account() {
+        let mut tasks: tokio::task::JoinSet<(String, TeleResult<AccountOutcome>)> =
+            tokio::task::JoinSet::new();
+        let mut names_by_id = std::collections::HashMap::new();
+        let handle = tasks.spawn(async {
+            panic!("boom");
+            #[allow(unreachable_code)]
+            (
+                "a".to_string(),
+                Err::<AccountOutcome, TeleError>(TeleError::Other(String::new())),
+            )
+        });
+        names_by_id.insert(handle.id(), "a".to_string());
+        let outcome = next_outcome(&mut tasks, &mut names_by_id).await.unwrap();
+        assert_eq!(outcome.account, "a");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error.unwrap()["type"], "TaskPanicError");
     }
 
     #[tokio::test]

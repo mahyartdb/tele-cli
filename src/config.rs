@@ -76,50 +76,57 @@ pub(crate) fn migration_failure_message(
     err: impl std::fmt::Display,
 ) -> String {
     format!(
-        "could not migrate app data directory: {err}; continuing with {} (legacy {} left in place)",
-        new.display(),
-        old.display()
+        "could not migrate app data directory {} to {}: {err}; close any running tele process (and anything else holding files in that directory) and retry, or move the legacy directory manually",
+        old.display(),
+        new.display()
     )
 }
 
+/// Startup migration hook. A failure is fatal: continuing would create an
+/// empty `tele` directory beside the un-migrated `telecli` one, and every
+/// later run would then skip the migration and see no accounts.
 pub fn migrate_app_data_dir() {
+    if let Err(e) = migrate_app_data_dir_checked() {
+        crate::output::log_line("error", &e.message());
+        std::process::exit(e.exit_code());
+    }
+}
+
+fn migrate_app_data_dir_checked() -> TeleResult<()> {
     let mut get = |k: &str| std::env::var(k);
     if env_nonempty(&mut get, "TELE_APP_DIR").is_some() {
-        return;
+        return Ok(());
     }
     let Ok(new) = app_data_dir_named(APP_DIR_NAME, &mut get) else {
-        return;
+        return Ok(());
     };
-    if new.exists() {
-        return;
-    }
     let Ok(old) = app_data_dir_named(LEGACY_APP_DIR_NAME, &mut get) else {
-        return;
+        return Ok(());
     };
-    if !old.exists() {
-        return;
+    if migrate_pair(&old, &new)? {
+        crate::output::log_line(
+            "info",
+            &format!("migrated app data directory to {}", new.display()),
+        );
+    }
+    Ok(())
+}
+
+fn migrate_pair(old: &std::path::Path, new: &std::path::Path) -> TeleResult<bool> {
+    if new.exists() || !old.exists() {
+        return Ok(false);
     }
     if let Some(parent) = new.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::rename(&old, &new) {
-        Ok(()) => crate::output::log_line(
-            "info",
-            &format!("migrated app data directory to {}", new.display()),
-        ),
-        Err(e) => crate::output::log_line("warn", &migration_failure_message(&old, &new, e)),
-    }
+    std::fs::rename(old, new)
+        .map_err(|e| TeleError::Config(migration_failure_message(old, new, e)))?;
+    Ok(true)
 }
 
 #[cfg(test)]
 pub(crate) fn migrate_dir_pair_for_tests(old: &std::path::Path, new: &std::path::Path) -> bool {
-    if new.exists() || !old.exists() {
-        return false;
-    }
-    if let Some(parent) = new.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::rename(old, new).is_ok()
+    migrate_pair(old, new).unwrap_or(false)
 }
 
 fn app_data_dir_from_env(
@@ -370,12 +377,12 @@ pub fn credentials() -> anyhow::Result<Credentials> {
     }
     // Tightening runs only on a cache miss, so a process pays for it once per
     // .env state instead of once per call. A failure still fails closed before
-    // any credential is parsed.
+    // any credential is parsed. A missing .env is not created here: callers
+    // that use process env credentials would otherwise leave an empty file
+    // that the next run reads instead of the environment.
     if stamp.exists {
         crate::fs_util::restrict_file_private(&path)
             .map_err(|e| credentials_tighten_error(&path, &e))?;
-    } else {
-        let _ = crate::fs_util::create_file_private(&path);
     }
     let mut env = load_env(&path);
     overlay_process_env(&mut env, std::env::vars_os());
@@ -689,7 +696,7 @@ fn preserve_unknown_account_keys(
 pub fn write_config(path: &std::path::Path, cfg: &AppConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            crate::fs_util::create_dir_private(parent)?;
+            crate::fs_util::ensure_dir_private(parent)?;
         }
     }
     let text = if path.exists() {
@@ -720,24 +727,7 @@ pub fn write_config(path: &std::path::Path, cfg: &AppConfig) -> anyhow::Result<(
     } else {
         toml_edit::ser::to_string_pretty(cfg)?
     };
-    let mut tmp_name = path.as_os_str().to_os_string();
-    tmp_name.push(format!(".tmp-{}", std::process::id()));
-    let tmp_path = std::path::PathBuf::from(tmp_name);
-    // fsync the temp file so a crash/power-loss cannot leave config.toml
-    // pointing at zero-length or partial content after the rename.
-    let result = crate::fs_util::write_file_private(&tmp_path, text.as_bytes())
-        .and_then(|()| {
-            std::fs::File::options()
-                .write(true)
-                .open(&tmp_path)?
-                .sync_all()
-        })
-        .and_then(|()| crate::fs_util::restrict_file_private(&tmp_path))
-        .and_then(|()| std::fs::rename(&tmp_path, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-    result?;
+    crate::fs_util::write_file_atomic_private(path, text.as_bytes())?;
     CONFIG_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -768,7 +758,7 @@ fn acquire_config_lock(cfg_path: &std::path::Path) -> TeleResult<ConfigLockGuard
     let lock_path = config_lock_path(cfg_path);
     if let Some(parent) = lock_path.parent() {
         if !parent.as_os_str().is_empty() {
-            crate::fs_util::create_dir_private(parent).map_err(|e| {
+            crate::fs_util::ensure_dir_private(parent).map_err(|e| {
                 TeleError::Config(format!(
                     "cannot prepare config directory {}: {e}",
                     parent.display()
@@ -830,7 +820,15 @@ pub fn update_config(
 ) -> TeleResult<()> {
     let cfg_path = match path {
         Some(p) => p.to_path_buf(),
-        None => app_data_dir_checked()?.join("config.toml"),
+        None => {
+            // The default location is ours, so it keeps the private-dir
+            // tightening; a caller-supplied --config parent is not touched by
+            // write_config.
+            ensure_app_data_dir().map_err(|e| {
+                TeleError::Config(format!("cannot prepare app data directory: {e}"))
+            })?;
+            app_data_dir_checked()?.join("config.toml")
+        }
     };
     // The lock covers the load as well as the write: a caller that renames a
     // snapshot read before the lock over the file loses whatever another
@@ -856,7 +854,7 @@ pub fn update_config(
         ));
     }
     write_config(&cfg_path, &cfg)
-        .map_err(|e| TeleError::Other(format!("failed to write config: {e:#}")))?;
+        .map_err(|e| TeleError::Config(format!("failed to write config: {e:#}")))?;
     Ok(())
 }
 
