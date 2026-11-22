@@ -192,12 +192,6 @@ pub(crate) async fn download_core(
         ));
     }
     let temp = download_temp_path(&path);
-    tokio::task::spawn_blocking({
-        let temp = temp.clone();
-        move || create_download_temp(&temp)
-    })
-    .await
-    .map_err(|e| TeleError::Other(e.to_string()))??;
     stream_media_to_file(shares, &msg, &temp, chunk_size_kb).await?;
     tokio::task::spawn_blocking({
         let temp = temp.clone();
@@ -236,13 +230,17 @@ async fn stream_media_to_file(
             let media = msg
                 .media()
                 .ok_or_else(|| TeleError::Invocation("message has no media".to_string(), None))?;
+            let file = tokio::task::spawn_blocking({
+                let temp = temp.to_path_buf();
+                move || create_download_temp(&temp)
+            })
+            .await
+            .map_err(|e| TeleError::Other(e.to_string()))??;
             let mut iter = shares
                 .client
                 .iter_download(&media)
                 .chunk_size((kb * 1024) as i32);
-            let mut file = tokio::fs::File::create(temp)
-                .await
-                .map_err(|e| TeleError::Other(e.to_string()))?;
+            let mut file = tokio::fs::File::from_std(file);
             use tokio::io::AsyncWriteExt;
             loop {
                 match iter.next().await {
@@ -264,20 +262,52 @@ async fn stream_media_to_file(
                 .map_err(|e| TeleError::Other(e.to_string()))?;
         }
         None => {
-            let ok = msg.download_media(temp).await.map_err(|e| {
-                let _ = std::fs::remove_file(temp);
-                tele_invocation(e)
-            })?;
+            let dir = download_temp_dir(temp);
+            tokio::task::spawn_blocking({
+                let dir = dir.clone();
+                move || crate::fs_util::create_dir_private(&dir)
+            })
+            .await
+            .map_err(|e| TeleError::Other(e.to_string()))??;
+            if !std::fs::metadata(&dir).map(|m| m.is_dir()).unwrap_or(false) {
+                return Err(TeleError::Other(format!(
+                    "download temp dir is not a directory: {}",
+                    dir.display()
+                )));
+            }
+            let inner = dir.join("payload");
+            let ok = match msg.download_media(&inner).await {
+                Ok(ok) => ok,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(tele_invocation(e));
+                }
+            };
             if !ok {
-                let _ = std::fs::remove_file(temp);
+                let _ = std::fs::remove_dir_all(&dir);
                 return Err(TeleError::Invocation(
                     "message has no media".to_string(),
                     None,
                 ));
             }
+            let moved = std::fs::rename(&inner, temp);
+            let _ = std::fs::remove_dir_all(&dir);
+            moved.map_err(|e| {
+                TeleError::Other(format!(
+                    "cannot move download temp into place at {}: {e}",
+                    temp.display()
+                ))
+            })?;
         }
     }
     Ok(())
+}
+
+fn download_temp_dir(temp: &std::path::Path) -> std::path::PathBuf {
+    let name = temp.file_name().unwrap_or_default().to_string_lossy();
+    temp.parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!("{name}.dir"))
 }
 
 struct BulkDownloaded {
@@ -301,12 +331,6 @@ async fn bulk_download_one(
         return Ok(None);
     }
     let temp = download_temp_path(&path);
-    tokio::task::spawn_blocking({
-        let temp = temp.clone();
-        move || create_download_temp(&temp)
-    })
-    .await
-    .map_err(|e| TeleError::Other(e.to_string()))??;
     stream_media_to_file(shares, msg, &temp, chunk_size_kb).await?;
     tokio::task::spawn_blocking({
         let temp = temp.clone();
@@ -375,8 +399,29 @@ pub(crate) async fn save_checkpoint(
         "chat_id": chat_id,
         "last_message_id": last_message_id,
         "max_seen_id": max_seen_id.max(last_message_id),
-    });
-    let _ = tokio::fs::write(path, payload.to_string()).await;
+    })
+    .to_string();
+    let path = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || write_checkpoint(&path, &payload)).await;
+}
+
+fn write_checkpoint(path: &std::path::Path, payload: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = crate::fs_util::create_file_private(path)?;
+    file.set_len(0)?;
+    file.write_all(payload.as_bytes())
 }
 
 pub(crate) async fn download_bulk_core(
@@ -550,6 +595,11 @@ pub(crate) fn sanitize_download_name(name: &str) -> String {
     let trimmed = out.trim_end_matches([' ', '.']);
     if trimmed.is_empty() {
         "document.bin".to_string()
+    } else if trimmed.starts_with('.')
+        || trimmed.eq_ignore_ascii_case("authorized_keys")
+        || super::validate::is_sensitive_basename(&trimmed.to_lowercase())
+    {
+        format!("_{trimmed}")
     } else if super::validate::validate_filename(trimmed).is_err() {
         let stem = trimmed.split('.').next().unwrap_or(trimmed);
         let lower_stem = stem.to_ascii_lowercase();
@@ -634,12 +684,11 @@ pub(crate) fn refuse_existing_download_target(path: &std::path::Path) -> TeleRes
     Ok(())
 }
 
-pub(crate) fn create_download_temp(temp: &std::path::Path) -> TeleResult<()> {
+pub(crate) fn create_download_temp(temp: &std::path::Path) -> TeleResult<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temp)
-        .map(|_| ())
         .map_err(|e| TeleError::Other(format!("cannot create temp file {}: {e}", temp.display())))
 }
 
@@ -656,5 +705,60 @@ pub(crate) fn commit_download(
                 final_path.display()
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_base(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("telecli-dl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn sanitize_download_name_breaks_dotfiles_and_sensitive_names() {
+        assert_eq!(sanitize_download_name(".bashrc"), "_.bashrc");
+        assert_eq!(sanitize_download_name(".env"), "_.env");
+        assert_eq!(sanitize_download_name("id_rsa"), "_id_rsa");
+        assert_eq!(
+            sanitize_download_name("authorized_keys"),
+            "_authorized_keys"
+        );
+        assert_eq!(
+            sanitize_download_name("AUTHORIZED_KEYS"),
+            "_AUTHORIZED_KEYS"
+        );
+        assert_eq!(sanitize_download_name("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn create_download_temp_returns_a_writable_handle() {
+        use std::io::Write;
+        let base = temp_base("handle");
+        let temp = base.join(".x.part-1");
+        let mut file = create_download_temp(&temp).unwrap();
+        file.write_all(b"payload").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&temp).unwrap(), b"payload");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_checkpoint_refuses_a_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let base = temp_base("checkpoint-link");
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        let link = base.join(".telecli-download-1.json");
+        symlink(&victim, &link).unwrap();
+        save_checkpoint(&link, 1, 5, 5).await;
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

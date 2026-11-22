@@ -117,6 +117,7 @@ fn install(
         return install_dry_run_output(&targets, force, flags);
     }
     let mut written = Vec::new();
+    let mut existing = Vec::new();
     for dir in &dirs {
         let target = dir.join("tele").join("SKILL.md");
         installed_freshness_note(&target);
@@ -125,6 +126,7 @@ fn install(
                 LogLevel::Warn,
                 &format!("exists (use --force to overwrite): {}", target.display()),
             );
+            existing.push(target.display().to_string());
             continue;
         }
         match write_skill(&target, force) {
@@ -135,11 +137,33 @@ fn install(
         }
     }
     if written.is_empty() {
-        return Err(crate::error::TeleError::Other(
-            "no agent skill directory detected; pass --dir PATH".to_string(),
-        ));
+        return Err(empty_install_error(&dirs, &existing));
     }
     finish_install(&written, force, flags)
+}
+
+fn empty_install_error(
+    dirs: &[std::path::PathBuf],
+    existing: &[String],
+) -> crate::error::TeleError {
+    if dirs.is_empty() {
+        return crate::error::TeleError::Other(
+            "no agent skill directory detected; pass --dir PATH".to_string(),
+        );
+    }
+    if existing.is_empty() {
+        return crate::error::TeleError::Other(format!(
+            "skill was not written to any detected directory ({}); see warnings above",
+            dirs.iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    crate::error::TeleError::Usage(format!(
+        "skill already installed at {}; use --force to overwrite",
+        existing.join(", ")
+    ))
 }
 
 fn install_targets_display(targets: &[std::path::PathBuf]) -> Vec<String> {
@@ -284,6 +308,28 @@ mod tests {
                 .contains("/tmp/a/tele/SKILL.md"),
             "would: {value}"
         );
+    }
+
+    #[test]
+    fn empty_install_error_names_existing_skills_and_force() {
+        let dirs = vec![std::path::PathBuf::from("/tmp/skills")];
+        let existing = vec!["/tmp/skills/tele/SKILL.md".to_string()];
+        let err = empty_install_error(&dirs, &existing);
+        assert!(matches!(err, crate::error::TeleError::Usage(_)));
+        let msg = err.message();
+        assert!(
+            msg.contains("already installed at /tmp/skills/tele/SKILL.md"),
+            "{msg}"
+        );
+        assert!(msg.contains("--force"), "{msg}");
+        assert!(!msg.contains("no agent skill directory detected"), "{msg}");
+    }
+
+    #[test]
+    fn empty_install_error_keeps_dir_hint_when_nothing_was_detected() {
+        let err = empty_install_error(&[], &[]);
+        assert!(matches!(err, crate::error::TeleError::Other(_)));
+        assert!(err.message().contains("pass --dir PATH"));
     }
 
     #[test]

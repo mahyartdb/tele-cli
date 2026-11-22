@@ -2,6 +2,8 @@ use clap::{Args, Subcommand};
 use grammers_client::tl;
 use grammers_session::types::PeerId;
 
+use std::time::{Duration, Instant};
+
 use crate::chat_target::ChatTarget;
 use crate::client::{self, ClientGuard};
 use crate::commands::credentials::creds_api_id;
@@ -882,6 +884,36 @@ async fn delete(args: DeleteArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     crate::executor::finish(flags, &envelope)
 }
 
+const HISTORY_DELETE_ROUNDS: usize = 10;
+const HISTORY_DELETE_DEADLINE: Duration = Duration::from_secs(60);
+
+// DeleteHistory answers with the number of messages it could not remove yet
+// (affectedHistory.offset); one call is a partial delete for large histories.
+async fn delete_history_fully(
+    shares: &crate::client::ServeShares,
+    request: &tl::functions::messages::DeleteHistory,
+) -> TeleResult<()> {
+    let deadline = Instant::now() + HISTORY_DELETE_DEADLINE;
+    for _ in 0..HISTORY_DELETE_ROUNDS {
+        shares.rate_limiter.acquire().await;
+        let affected: tl::enums::messages::AffectedHistory = shares
+            .client
+            .invoke(request)
+            .await
+            .map_err(tele_invocation)?;
+        let tl::enums::messages::AffectedHistory::History(history) = affected;
+        if history.offset <= 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    Err(TeleError::Other(format!(
+        "history deletion is incomplete: the server still reports messages to delete after {HISTORY_DELETE_ROUNDS} rounds; re-run the command to continue"
+    )))
+}
+
 pub(crate) async fn dialog_delete_core(
     shares: &crate::client::ServeShares,
     params: DeleteParams,
@@ -896,18 +928,15 @@ pub(crate) async fn dialog_delete_core(
     }
     match delete_route(&peer) {
         DeleteRoute::HistoryClear => {
-            let _: tl::enums::messages::AffectedHistory = shares
-                .client
-                .invoke(&tl::functions::messages::DeleteHistory {
-                    just_clear: false,
-                    revoke: params.revoke,
-                    peer,
-                    max_id: 0,
-                    min_date: None,
-                    max_date: None,
-                })
-                .await
-                .map_err(tele_invocation)?;
+            let request = tl::functions::messages::DeleteHistory {
+                just_clear: false,
+                revoke: params.revoke,
+                peer,
+                max_id: 0,
+                min_date: None,
+                max_date: None,
+            };
+            delete_history_fully(shares, &request).await?;
             Ok(delete_result(&params.chat, false, true))
         }
         DeleteRoute::Leave => {
@@ -1184,6 +1213,22 @@ pub(crate) async fn dialog_folder_delete_core(
     params: FolderDeleteParams,
 ) -> TeleResult<serde_json::Value> {
     shares.rate_limiter.acquire().await;
+    let filters: tl::enums::messages::DialogFilters = shares
+        .client
+        .invoke(&tl::functions::messages::GetDialogFilters {})
+        .await
+        .map_err(tele_invocation)?;
+    let tl::enums::messages::DialogFilters::Filters(f) = filters;
+    let exists = f.filters.iter().any(|filter| match filter {
+        tl::enums::DialogFilter::Filter(df) => df.id == params.id,
+        _ => false,
+    });
+    if !exists {
+        return Err(TeleError::Usage(format!(
+            "chat folder {} not found; run tele dialog folders to list ids",
+            params.id
+        )));
+    }
     let _: bool = shares
         .client
         .invoke(&tl::functions::messages::UpdateDialogFilter {

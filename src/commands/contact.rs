@@ -1,4 +1,5 @@
 use clap::{Args, Subcommand};
+use grammers_client::peer::Peer;
 use grammers_client::tl;
 
 use crate::client::{self, ClientGuard};
@@ -567,6 +568,21 @@ pub(crate) fn redact_list_phone(phone: &str, redact_phones: bool) -> String {
     }
 }
 
+fn resolution_is_not_found(e: &TeleError) -> bool {
+    match e {
+        TeleError::Rpc(_, 400, name, _) => matches!(
+            name.as_str(),
+            "USERNAME_NOT_FOUND"
+                | "USERNAME_INVALID"
+                | "PEER_ID_INVALID"
+                | "INVALID_PEER_ID"
+                | "USER_ID_INVALID"
+        ),
+        TeleError::Invocation(message, _) => message.starts_with("PEER_ID_INVALID"),
+        _ => false,
+    }
+}
+
 pub(crate) async fn add_core(
     shares: &crate::client::ServeShares,
     params: AddParams,
@@ -577,7 +593,10 @@ pub(crate) async fn add_core(
     let peer =
         match entities::resolve_peer(&shares.client, shares.session.as_ref(), &user_target).await {
             Ok(peer) => peer,
-            Err(_) if phone_explicitly_supplied(&user_target, normalized_phone.as_deref()) => {
+            Err(e)
+                if resolution_is_not_found(&e)
+                    && phone_explicitly_supplied(&user_target, normalized_phone.as_deref()) =>
+            {
                 return import_phone_contact(
                     shares,
                     &user_target,
@@ -633,6 +652,31 @@ pub(crate) async fn add_core(
         "mutual": state.mutual}))
 }
 
+fn reject_non_user_target(peer: &Peer, op: &str) -> TeleResult<()> {
+    if matches!(peer, Peer::Group(_) | Peer::Channel(_)) {
+        return Err(TeleError::Usage(format!(
+            "contact {op} targets a user; got a chat or channel"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_self_target(peer: &Peer, op: &str) -> TeleResult<()> {
+    if matches!(peer, Peer::User(user) if user.is_self()) {
+        return Err(TeleError::Usage(format!(
+            "contact {op} cannot target your own account"
+        )));
+    }
+    Ok(())
+}
+
+fn contact_list_has_user(users: &[tl::enums::User], user_id: i64) -> bool {
+    users.iter().any(|user| match user {
+        tl::enums::User::User(u) => u.id == user_id,
+        tl::enums::User::Empty(u) => u.id == user_id,
+    })
+}
+
 pub(crate) async fn remove_core(
     shares: &crate::client::ServeShares,
     params: RemoveParams,
@@ -641,15 +685,34 @@ pub(crate) async fn remove_core(
     let user_target = params.user.clone();
     let peer =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &user_target).await?;
-    if matches!(
-        peer,
-        grammers_client::peer::Peer::Group(_) | grammers_client::peer::Peer::Channel(_)
-    ) {
-        return Err(TeleError::Usage(
-            "contact remove targets a user; got a chat or channel".to_string(),
-        ));
-    }
+    reject_non_user_target(&peer, "remove")?;
     let user_input = entities::input_user(&peer).await.map_err(tele_invocation)?;
+    let target_id = match &user_input {
+        tl::enums::InputUser::User(user) => user.user_id,
+        _ => {
+            return Err(TeleError::Usage(format!(
+                "contact remove: {user_target} did not resolve to a user id"
+            )))
+        }
+    };
+    let contacts: tl::enums::contacts::Contacts = shares
+        .client
+        .invoke(&tl::functions::contacts::GetContacts { hash: 0 })
+        .await
+        .map_err(tele_invocation)?;
+    let users = match contacts {
+        tl::enums::contacts::Contacts::Contacts(contacts) => contacts.users,
+        tl::enums::contacts::Contacts::NotModified => {
+            return Err(TeleError::Other(
+                "contacts not modified: server returned NotModified for hash 0".to_string(),
+            ))
+        }
+    };
+    if !contact_list_has_user(&users, target_id) {
+        return Err(TeleError::Usage(format!(
+            "contact remove: {user_target} is not in your contacts"
+        )));
+    }
     let _: tl::enums::Updates = shares
         .client
         .invoke(&tl::functions::contacts::DeleteContacts {
@@ -668,6 +731,8 @@ pub(crate) async fn block_core(
     let user_target = params.user.clone();
     let peer =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &user_target).await?;
+    reject_non_user_target(&peer, "block")?;
+    reject_self_target(&peer, "block")?;
     let input = entities::input_peer(&peer).await.map_err(tele_invocation)?;
     let _: bool = shares
         .client
@@ -688,6 +753,8 @@ pub(crate) async fn unblock_core(
     let user_target = params.user.clone();
     let peer =
         entities::resolve_peer(&shares.client, shares.session.as_ref(), &user_target).await?;
+    reject_non_user_target(&peer, "unblock")?;
+    reject_self_target(&peer, "unblock")?;
     let input = entities::input_peer(&peer).await.map_err(tele_invocation)?;
     let _: bool = shares
         .client
@@ -912,6 +979,45 @@ mod tests {
         assert_eq!(sent_display_name("Jane", "Doe"), "Jane Doe");
         assert_eq!(sent_display_name("Jane", ""), "Jane");
         assert_eq!(sent_display_name("", ""), "");
+    }
+
+    #[test]
+    fn resolution_is_not_found_only_for_missing_peer_errors() {
+        let rpc = |code: i32, name: &str| {
+            TeleError::Rpc(
+                format!("rpc error {code}: {name}"),
+                code,
+                name.to_string(),
+                None,
+            )
+        };
+        assert!(resolution_is_not_found(&rpc(400, "USERNAME_NOT_FOUND")));
+        assert!(resolution_is_not_found(&rpc(400, "USERNAME_INVALID")));
+        assert!(resolution_is_not_found(&rpc(400, "PEER_ID_INVALID")));
+        assert!(resolution_is_not_found(&TeleError::Invocation(
+            format!("PEER_ID_INVALID ({})", crate::error::PEER_UNKNOWN_HINT),
+            None
+        )));
+        assert!(!resolution_is_not_found(&rpc(420, "FLOOD_WAIT")));
+        assert!(!resolution_is_not_found(&rpc(401, "AUTH_KEY_UNREGISTERED")));
+        assert!(!resolution_is_not_found(&rpc(
+            400,
+            "phone number not found: hidden"
+        )));
+        assert!(!resolution_is_not_found(&TeleError::Usage(
+            "invalid target".to_string()
+        )));
+    }
+
+    #[test]
+    fn contact_list_lookup_checks_full_and_empty_users() {
+        let users = vec![
+            tl::enums::User::Empty(tl::types::UserEmpty { id: 7 }),
+            tl::enums::User::Empty(tl::types::UserEmpty { id: 9 }),
+        ];
+        assert!(contact_list_has_user(&users, 9));
+        assert!(!contact_list_has_user(&users, 8));
+        assert!(!contact_list_has_user(&[], 9));
     }
 
     #[test]

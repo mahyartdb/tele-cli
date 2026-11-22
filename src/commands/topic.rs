@@ -1,6 +1,8 @@
 use clap::{Args, Subcommand};
 use grammers_client::tl;
 
+use std::time::{Duration, Instant};
+
 use crate::chat_target::ChatTarget;
 use crate::client::{self, ClientGuard};
 use crate::commands::credentials::creds_api_id;
@@ -275,6 +277,36 @@ pub(crate) async fn topic_delete_core(
     topic_action_core(shares, params, ActionKind::Delete).await
 }
 
+const TOPIC_DELETE_ROUNDS: usize = 10;
+const TOPIC_DELETE_DEADLINE: Duration = Duration::from_secs(60);
+
+// DeleteTopicHistory has no offset parameter; the returned offset says how
+// many messages remain, so the identical request is retried until it drains.
+async fn delete_topic_history_fully(
+    shares: &crate::client::ServeShares,
+    request: &tl::functions::messages::DeleteTopicHistory,
+) -> TeleResult<()> {
+    let deadline = Instant::now() + TOPIC_DELETE_DEADLINE;
+    for _ in 0..TOPIC_DELETE_ROUNDS {
+        shares.rate_limiter.acquire().await;
+        let affected: tl::enums::messages::AffectedHistory = shares
+            .client
+            .invoke(request)
+            .await
+            .map_err(tele_invocation)?;
+        let tl::enums::messages::AffectedHistory::History(history) = affected;
+        if history.offset <= 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    Err(TeleError::Other(format!(
+        "topic deletion is incomplete: the server still reports messages to delete after {TOPIC_DELETE_ROUNDS} rounds; re-run the command to continue"
+    )))
+}
+
 async fn topic_action_core(
     shares: &crate::client::ServeShares,
     params: LifecycleParams,
@@ -305,14 +337,11 @@ async fn topic_action_core(
                 .map_err(tele_invocation)?;
         }
         ActionKind::Delete => {
-            let _: tl::enums::messages::AffectedHistory = shares
-                .client
-                .invoke(&tl::functions::messages::DeleteTopicHistory {
-                    peer,
-                    top_msg_id: topic_id,
-                })
-                .await
-                .map_err(tele_invocation)?;
+            let request = tl::functions::messages::DeleteTopicHistory {
+                peer,
+                top_msg_id: topic_id,
+            };
+            delete_topic_history_fully(shares, &request).await?;
         }
         ActionKind::Pin => {
             let _: tl::enums::Updates = shares

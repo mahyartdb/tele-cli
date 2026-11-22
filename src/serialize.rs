@@ -20,6 +20,9 @@ pub fn peer_id_key(peer_id: PeerId) -> serde_json::Value {
         None => out.insert("id".into(), serde_json::Value::Null),
     };
     out.insert("kind".into(), serde_json::json!(peer_id_kind(peer_id)));
+    // The contract promises `username` on every peer/sender object; an id-only
+    // fallback cannot resolve one, so the key stays present as null.
+    out.insert("username".into(), serde_json::Value::Null);
     let name = peer_id
         .bare_id()
         .map(|id| id.to_string())
@@ -98,14 +101,14 @@ pub fn message_permalink(chat: &Peer, msg_id: i32) -> Option<String> {
 
 pub(crate) fn upgrade_peer_identity(row: &mut serde_json::Value, resolved_peer: &Peer) {
     let full = peer_key(resolved_peer);
-    let needs_peer = row.get("peer").is_none_or(|v| v.get("username").is_none());
+    // Null username marks an id-only fallback as well as a resolved peer that
+    // has no username; replacing either with the resolved peer is idempotent.
+    let unresolved = |v: &serde_json::Value| v.get("username").is_none_or(|u| u.is_null());
+    let needs_peer = row.get("peer").is_none_or(unresolved);
     if needs_peer {
         row["peer"] = full.clone();
     }
-    if row
-        .get("sender")
-        .is_none_or(|v| v.get("username").is_none())
-    {
+    if row.get("sender").is_none_or(unresolved) {
         let sender_id = row.get("sender").and_then(|s| s.get("id")).cloned();
         let peer_id = row.get("peer").and_then(|p| p.get("id")).cloned();
         if sender_id.is_some() && sender_id == peer_id {
@@ -1629,6 +1632,14 @@ mod tests {
         assert_eq!(key["id"], 8552872518_i64);
         assert_eq!(key["kind"], "user");
         assert_eq!(key["name"], "8552872518");
+        assert!(
+            key.get("username").is_some(),
+            "every peer/sender object must carry the username key"
+        );
+        assert!(
+            key["username"].is_null(),
+            "id-only fallbacks cannot resolve a username"
+        );
     }
 
     #[test]
@@ -1683,6 +1694,23 @@ mod tests {
         assert_eq!(row["peer"]["id"], 12345);
         assert_eq!(row["sender"]["id"], 777);
         assert_eq!(row["sender"]["kind"], "user");
+    }
+
+    #[test]
+    fn upgrade_peer_identity_replaces_a_username_null_fallback() {
+        let client = offline_client();
+        let peer_id = grammers_session::types::PeerId::channel(12345).unwrap();
+        let peer = make_channel_peer(&client, 12345);
+        let mut row = serde_json::json!({"peer": null, "sender": null});
+        ensure_outer_peer_sender(&mut row, Some(peer_id), None);
+        assert_eq!(row["peer"]["name"], "12345");
+        assert!(row["peer"]["username"].is_null());
+        upgrade_peer_identity(&mut row, &peer);
+        assert_eq!(
+            row["peer"]["name"], "test",
+            "a username:null fallback must still upgrade to the resolved peer"
+        );
+        assert_eq!(row["peer"]["kind"], "channel");
     }
 
     #[test]

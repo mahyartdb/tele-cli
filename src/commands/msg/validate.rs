@@ -60,6 +60,14 @@ pub(crate) fn validate_upload_path_inner(path: &str, dry_run: bool) -> TeleResul
     }
     let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
     validate_filename(base)?;
+    if std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(TeleError::Usage(format!(
+            "refusing to upload symlink {base}: upload the target file directly"
+        )));
+    }
     let app_data = crate::config::app_data_dir_checked()?;
     let app_dir = canonical_guard_path(&app_data.to_string_lossy());
     let canonical = canonical_guard_path(path);
@@ -68,10 +76,23 @@ pub(crate) fn validate_upload_path_inner(path: &str, dry_run: bool) -> TeleResul
             "refusing to upload a file from the telecli app data directory".to_string(),
         ));
     }
+    if let Some(target_base) = canonical.file_name() {
+        let target_lower = target_base.to_string_lossy().to_lowercase();
+        if is_sensitive_basename(&target_lower) {
+            return Err(TeleError::Usage(format!(
+                "refusing to upload sensitive file {target_lower}"
+            )));
+        }
+    }
     let lower = base.to_lowercase();
     if is_sensitive_basename(&lower) {
         return Err(TeleError::Usage(format!(
             "refusing to upload sensitive file {base}"
+        )));
+    }
+    if hardlinks_sensitive_app_data_file(&canonical, &app_data) {
+        return Err(TeleError::Usage(format!(
+            "refusing to upload {base}: it is the same file as a sensitive file in the telecli app data directory"
         )));
     }
     if !dry_run {
@@ -125,6 +146,82 @@ pub fn is_sensitive_basename(lower: &str) -> bool {
         || lower.contains("credentials")
         || lower.contains("id_rsa")
         || lower.contains("id_ed25519")
+}
+
+fn hardlinks_sensitive_app_data_file(
+    canonical: &std::path::Path,
+    app_data: &std::path::Path,
+) -> bool {
+    if !std::fs::metadata(canonical)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let mut dirs = vec![app_data.to_path_buf()];
+    let sessions = app_data.join("sessions");
+    if sessions.is_dir() {
+        dirs.push(sessions);
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !is_sensitive_basename(&name) {
+                continue;
+            }
+            let candidate = entry.path();
+            if std::fs::symlink_metadata(&candidate)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if same_file_identity(canonical, &candidate) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn same_file_identity(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        fn file_id(p: &std::path::Path) -> Option<(u32, u64)> {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            };
+            let f = std::fs::File::open(p).ok()?;
+            let handle = HANDLE(f.as_raw_handle());
+            // SAFETY: `info` is a plain output struct zeroed before the call and
+            // filled by the API; `f` keeps the handle valid for the call.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            unsafe { GetFileInformationByHandle(handle, &mut info) }.ok()?;
+            let index = ((info.nFileIndexHigh as u64) << 32) | u64::from(info.nFileIndexLow);
+            Some((info.dwVolumeSerialNumber, index))
+        }
+        match (file_id(a), file_id(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
 }
 
 pub(crate) fn validate_export_out(out: &str) -> TeleResult<()> {
@@ -213,4 +310,48 @@ fn is_valid_mention_id(id: &str) -> bool {
     !id.is_empty()
         && id.chars().all(|c| c.is_ascii_digit())
         && matches!(id.parse::<i64>(), Ok(v) if v > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_upload_path_rejects_symlink_to_benign_target() {
+        use std::os::unix::fs::symlink;
+        let dir =
+            std::env::temp_dir().join(format!("telecli-validate-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("notes.txt");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.join("report.pdf");
+        symlink(&target, &link).unwrap();
+        let err = validate_upload_path_inner(&link.to_string_lossy(), true).unwrap_err();
+        assert!(err.message().contains("symlink"), "{err}");
+        assert!(validate_upload_path_inner(&target.to_string_lossy(), true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_upload_path_rejects_hardlink_to_sensitive_app_data_file() {
+        let _guard = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base =
+            std::env::temp_dir().join(format!("telecli-validate-hardlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let app = base.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let secret = app.join(".env");
+        std::fs::write(&secret, b"TOKEN=1").unwrap();
+        std::env::set_var("TELE_APP_DIR", &app);
+        let outside = base.join("innocent.txt");
+        std::fs::hard_link(&secret, &outside).unwrap();
+        let err = validate_upload_path_inner(&outside.to_string_lossy(), true).unwrap_err();
+        assert!(err.message().contains("same file"), "{err}");
+        std::env::remove_var("TELE_APP_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

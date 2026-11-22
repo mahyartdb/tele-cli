@@ -2848,7 +2848,7 @@ pub(crate) async fn search_core(
                         shares.rate_limiter.acquire_for_items(served).await;
                         if search_row_kept(&msg, from_id, since, until) {
                             push_message_row(&mut rows, &msg)?;
-                        } else if scanned > budget {
+                        } else if scanned >= budget {
                             truncated = true;
                             break;
                         }
@@ -2866,10 +2866,16 @@ pub(crate) async fn search_core(
             iter = iter.filter(f);
         }
         if let Some(s) = since {
-            iter = iter.min_date(&s.into());
+            let lower = s
+                .checked_sub_signed(chrono::Duration::seconds(1))
+                .unwrap_or(s);
+            iter = iter.min_date(&lower.into());
         }
         if let Some(u) = until {
-            iter = iter.max_date(&u.into());
+            let upper = u
+                .checked_add_signed(chrono::Duration::seconds(1))
+                .unwrap_or(u);
+            iter = iter.max_date(&upper.into());
         }
         // Server-side own-messages filter when the user asked for "me": the
         // sentinel peer resolves locally and avoids scanning the whole history.
@@ -2880,6 +2886,9 @@ pub(crate) async fn search_core(
                 served += 1;
                 scanned += 1;
                 shares.rate_limiter.acquire_for_items(served).await;
+                if !search_row_kept(&msg, None, since, until) {
+                    continue;
+                }
                 push_message_row(&mut rows, &msg)?;
             }
         } else if let Some(want) = from_id {
@@ -2890,9 +2899,9 @@ pub(crate) async fn search_core(
                         served += 1;
                         scanned += 1;
                         shares.rate_limiter.acquire_for_items(served).await;
-                        if search_sender_matches(&msg, want) {
+                        if search_row_kept(&msg, Some(want), since, until) {
                             push_message_row(&mut rows, &msg)?;
-                        } else if scanned > budget {
+                        } else if scanned >= budget {
                             truncated = true;
                             break;
                         }
@@ -2906,6 +2915,9 @@ pub(crate) async fn search_core(
                 served += 1;
                 scanned += 1;
                 shares.rate_limiter.acquire_for_items(served).await;
+                if !search_row_kept(&msg, None, since, until) {
+                    continue;
+                }
                 push_message_row(&mut rows, &msg)?;
             }
         }
@@ -2982,6 +2994,34 @@ fn export_payload(rows: &[serde_json::Value], format: &str) -> String {
         body.push('\n');
     }
     body
+}
+
+// O_NOFOLLOW closes the gap between the symlink check and the open: without
+// it a link placed in that window makes the export write through to its target.
+fn create_export_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        // Tighten through the open handle: chmod by path could hit a link
+        // swapped in after the open.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let file = crate::fs_util::create_file_private(path)?;
+        // create_file_private no longer truncates an existing file, and an
+        // export overwrites its --out target.
+        file.set_len(0)?;
+        Ok(file)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3091,17 +3131,25 @@ pub(crate) async fn export_core(
                 .filter(|p| !p.as_os_str().is_empty())
                 .map(|p| p.to_path_buf());
             if let Some(dir) = dir {
-                tokio::task::spawn_blocking(move || crate::fs_util::create_dir_private(&dir))
+                tokio::task::spawn_blocking(move || crate::fs_util::ensure_dir_private(&dir))
                     .await
                     .map_err(|e| TeleError::Other(format!("export dir task failed: {e}")))??;
             }
             let write_path = path.clone();
             tokio::task::spawn_blocking(move || {
                 use std::io::Write;
-                let mut file = crate::fs_util::create_file_private(&write_path)?;
+                if std::fs::symlink_metadata(&write_path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    return Err(std::io::Error::other(format!(
+                        "refusing to write export through symlink at {}",
+                        write_path.display()
+                    )));
+                }
+                let mut file = create_export_file(&write_path)?;
                 file.write_all(body.as_bytes())?;
-                file.sync_all()?;
-                crate::fs_util::restrict_file_private(&write_path)
+                file.sync_all()
             })
             .await
             .map_err(|e| TeleError::Other(format!("export write task failed: {e}")))??;
