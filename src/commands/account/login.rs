@@ -575,7 +575,9 @@ pub(crate) fn ensure_account_config_entry(
         Some(p) => p.to_path_buf(),
         None => config::app_data_dir_checked()?.join("config.toml"),
     };
+    let sessions_dir = session::session_dir();
     config::update_config(Some(&path), |cfg| {
+        reject_name_collision(cfg, &sessions_dir, name)?;
         cfg.accounts
             .entry(name.to_string())
             .or_insert_with(config::AccountConfig::default);

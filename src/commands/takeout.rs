@@ -279,7 +279,7 @@ fn export_state(dir: &std::path::Path) -> String {
 
 fn export_error_message(dir: &std::path::Path) -> String {
     format!(
-        "takeout export failed; export dir {}: {}; server-side takeout session kept alive for resume: re-run `tele takeout export` to resume automatically from the saved per-dialog checkpoints (completed dialogs are skipped, messages.jsonl is appended, not truncated), or `tele takeout finish --abandon` to drop the stale session and clear the local takeout.json so `tele takeout start` works again",
+        "takeout export failed; export dir {}: {}; server-side takeout session kept alive for resume: re-run `tele takeout export` to resume automatically from the saved per-dialog checkpoints (completed dialogs are skipped, messages.jsonl is appended; an incomplete final line from the interrupted run is discarded), or `tele takeout finish --abandon` to drop the stale session and clear the local takeout.json so `tele takeout start` works again",
         dir.to_string_lossy(),
         export_state(dir),
     )
@@ -334,6 +334,49 @@ enum ResumeCursor {
     Fresh,
     From(i32),
     Skip,
+}
+
+/// Whether a fetched message page ends this dialog's export loop.
+#[derive(Debug, PartialEq, Eq)]
+enum PageEnd {
+    /// `--message-limit` reached mid-dialog: keep the partial checkpoint so
+    /// a re-export with a higher limit resumes instead of being silently
+    /// skipped by a false DONE checkpoint.
+    Truncated,
+    /// Server reported the last chunk and the limit did not truncate the
+    /// page mid-write: the dialog is fully exported.
+    Done,
+    /// More pages to fetch.
+    Next,
+}
+
+fn page_end(count: u32, limit: u32, last_chunk: bool) -> PageEnd {
+    if count >= limit {
+        PageEnd::Truncated
+    } else if last_chunk {
+        PageEnd::Done
+    } else {
+        PageEnd::Next
+    }
+}
+
+struct DialogAnchor {
+    top_message: i32,
+    last_message_date: Option<i32>,
+}
+
+fn dialog_top_message(dlg: &tl::enums::Dialog) -> i32 {
+    match dlg {
+        tl::enums::Dialog::Dialog(d) => d.top_message,
+        tl::enums::Dialog::Folder(f) => f.top_message,
+    }
+}
+
+fn next_dialog_cursor(anchors: &[DialogAnchor]) -> (i32, i32) {
+    match anchors.last() {
+        Some(anchor) => (anchor.top_message, anchor.last_message_date.unwrap_or(0)),
+        None => (0, 0),
+    }
 }
 
 fn resume_cursor(checkpoints: &HashMap<String, i64>, dialog_key: &str) -> ResumeCursor {
@@ -424,6 +467,37 @@ async fn export(args: ExportArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     crate::executor::finish(flags, &envelope)
 }
 
+fn truncate_torn_jsonl_tail(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    const CHUNK: u64 = 64 * 1024;
+    let mut buf = vec![0u8; CHUNK as usize];
+    let mut end = len;
+    let mut keep = 0;
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let n = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf[..n])?;
+        if let Some(pos) = buf[..n].iter().rposition(|b| *b == b'\n') {
+            keep = start + pos as u64 + 1;
+            break;
+        }
+        end = start;
+    }
+    if keep < len {
+        file.set_len(keep)?;
+    }
+    Ok(())
+}
+
 async fn run_export(
     guard: &ClientGuard,
     dir: &std::path::Path,
@@ -479,6 +553,7 @@ async fn run_export(
             crate::fs_util::create_file_private(&messages_path)?;
         } else {
             crate::fs_util::restrict_file_private(&messages_path)?;
+            truncate_torn_jsonl_tail(&messages_path)?;
         }
         std::fs::OpenOptions::new()
             .create(true)
@@ -667,19 +742,17 @@ async fn run_export(
                     human_progress,
                     &dialog_page_message(dialog_index, total_dialogs, &chat_name, count),
                 );
-                if count >= limit && !m_last_chunk {
-                    // The dialog was truncated by --message-limit, NOT
-                    // finished: keep the partial checkpoint (the oldest
-                    // written id, recorded above) so a future re-export with
-                    // a higher limit resumes instead of being silently
-                    // skipped by a false DONE checkpoint.
-                    persist_checkpoints(dir, takeout_id, &checkpoints)?;
-                    break;
-                }
-                if m_last_chunk {
-                    checkpoints.insert(dialog_key.clone(), CHECKPOINT_DONE);
-                    persist_checkpoints(dir, takeout_id, &checkpoints)?;
-                    break;
+                match page_end(count, limit, m_last_chunk) {
+                    PageEnd::Truncated => {
+                        persist_checkpoints(dir, takeout_id, &checkpoints)?;
+                        break;
+                    }
+                    PageEnd::Done => {
+                        checkpoints.insert(dialog_key.clone(), CHECKPOINT_DONE);
+                        persist_checkpoints(dir, takeout_id, &checkpoints)?;
+                        break;
+                    }
+                    PageEnd::Next => {}
                 }
                 let last = msgs
                     .last()
@@ -692,14 +765,14 @@ async fn run_export(
             break;
         }
         exclude_pinned = true;
-        if let Some((_, _, Some(last_message))) = entries
+        let anchors: Vec<DialogAnchor> = entries
             .iter()
-            .rev()
-            .find(|(_, _, last_message)| last_message.is_some())
-        {
-            offset_date = raw_message_date(last_message);
-            offset_id = last_message.id();
-        }
+            .map(|(dlg, _, last_message)| DialogAnchor {
+                top_message: dialog_top_message(dlg),
+                last_message_date: last_message.as_ref().map(raw_message_date),
+            })
+            .collect();
+        (offset_id, offset_date) = next_dialog_cursor(&anchors);
         let last_peer_ref = crate::entities::peer_ref(&entries[entries.len() - 1].1)
             .await
             .map_err(tele_invocation)?;
@@ -1133,6 +1206,72 @@ mod tests {
     }
 
     #[test]
+    fn limit_reached_inside_last_chunk_stays_truncated_not_done() {
+        // 150-message dialog, limit 105: page 2 is the last chunk (50 msgs)
+        // and the inner loop stops at the limit. Truncation must win over
+        // last-chunk, or the dialog is checkpointed DONE and the 45
+        // unwritten messages are silently lost on resume.
+        assert_eq!(page_end(105, 105, true), PageEnd::Truncated);
+        assert_eq!(page_end(105, 105, false), PageEnd::Truncated);
+        // Limit satisfied exactly at a page boundary before the last chunk.
+        assert_eq!(page_end(100, 100, false), PageEnd::Truncated);
+        // Last chunk reached without hitting the limit: really done.
+        assert_eq!(page_end(150, 200, true), PageEnd::Done);
+        // Short non-empty final page under the limit: really done.
+        assert_eq!(page_end(105, 200, true), PageEnd::Done);
+    }
+
+    #[test]
+    fn dialog_cursor_anchors_all_fields_to_the_last_dialog() {
+        let anchors = [
+            DialogAnchor {
+                top_message: 500,
+                last_message_date: Some(1_700_000_000),
+            },
+            DialogAnchor {
+                top_message: 90,
+                last_message_date: None,
+            },
+        ];
+        assert_eq!(next_dialog_cursor(&anchors), (90, 0));
+        let anchored = [DialogAnchor {
+            top_message: 90,
+            last_message_date: Some(1_600_000_000),
+        }];
+        assert_eq!(next_dialog_cursor(&anchored), (90, 1_600_000_000));
+        assert_eq!(next_dialog_cursor(&[]), (0, 0));
+    }
+
+    #[test]
+    fn torn_jsonl_tail_is_truncated_to_the_last_complete_line() {
+        let dir = temp_dir("jsonl-tail");
+        let path = dir.join("messages.jsonl");
+        std::fs::write(&path, b"{\"id\":1}\n{\"id\":2}\n{\"id\":3").unwrap();
+        truncate_torn_jsonl_tail(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"id\":1}\n{\"id\":2}\n");
+
+        std::fs::write(&path, b"{\"id\":1}\n").unwrap();
+        truncate_torn_jsonl_tail(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"id\":1}\n");
+
+        std::fs::write(&path, b"{\"id\":1}").unwrap();
+        truncate_torn_jsonl_tail(&path).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+
+        std::fs::write(&path, b"").unwrap();
+        truncate_torn_jsonl_tail(&path).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+
+        let mut big = vec![b'x'; 100 * 1024];
+        big.push(b'\n');
+        big.extend(vec![b'y'; 100 * 1024]);
+        std::fs::write(&path, &big).unwrap();
+        truncate_torn_jsonl_tail(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), &big[..100 * 1024 + 1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn progress_only_enabled_in_human_tty_mode() {
         assert!(progress_enabled(false, true));
         assert!(!progress_enabled(true, true), "machine mode stays silent");
@@ -1291,7 +1430,7 @@ mod tests {
         assert!(msg.contains("`tele takeout start`"), "msg: {msg}");
         assert!(msg.contains("resume automatically"), "msg: {msg}");
         assert!(msg.contains("per-dialog checkpoints"), "msg: {msg}");
-        assert!(msg.contains("appended, not truncated"), "msg: {msg}");
+        assert!(msg.contains("incomplete final line"), "msg: {msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

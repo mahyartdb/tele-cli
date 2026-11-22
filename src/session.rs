@@ -71,6 +71,31 @@ pub fn list_session_names() -> Vec<String> {
     names
 }
 
+pub fn name_collides_existing(
+    cfg: &crate::config::AppConfig,
+    dir: &Path,
+    name: &str,
+) -> Option<String> {
+    if let Some(existing) = cfg
+        .accounts
+        .keys()
+        .find(|existing| existing.as_str() != name && existing.eq_ignore_ascii_case(name))
+    {
+        return Some(existing.clone());
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let Some(base) = file_name.strip_suffix(".session") else {
+            continue;
+        };
+        if base != name && base.eq_ignore_ascii_case(name) && validate_name(base).is_ok() {
+            return Some(base.to_string());
+        }
+    }
+    None
+}
+
 const SESSION_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
 fn sidecar_path(name: &str, suffix: &str) -> PathBuf {
@@ -139,7 +164,7 @@ fn restrict_session_files(name: &str) -> anyhow::Result<()> {
 }
 
 fn sweep_session_artifacts(name: &str) -> anyhow::Result<()> {
-    let mut targets = vec![session_path(name)];
+    let mut targets = vec![session_path(name), default_export_dest(name)];
     for suffix in SESSION_SIDECAR_SUFFIXES {
         targets.push(sidecar_path(name, suffix));
     }
@@ -296,6 +321,32 @@ pub async fn open_session(name: &str) -> anyhow::Result<LockedSession> {
         session,
         lock: SessionLock::new(lock),
     })
+}
+
+pub(crate) async fn session_has_login(name: &str) -> anyhow::Result<bool> {
+    let path = session_path(name);
+    if !path.try_exists()? || std::fs::metadata(&path)?.len() == 0 {
+        return Ok(false);
+    }
+    let db = libsql::Builder::new_local(&path)
+        .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .build()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to open session {}: {e}", path.display()))?;
+    let conn = db
+        .connect()
+        .map_err(|e| anyhow::anyhow!("failed to connect to session {}: {e}", path.display()))?;
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM peer_info WHERE (subtype & 1) != 0 LIMIT 1",
+            (),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read session {}: {e}", path.display()))?;
+    rows.next()
+        .await
+        .map(|row| row.is_some())
+        .map_err(|e| anyhow::anyhow!("failed to read session {}: {e}", path.display()))
 }
 
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\x00";
@@ -1229,6 +1280,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn name_collision_rejects_case_variants_but_not_the_same_name() {
+        let dir = test_dir("name-collision");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.accounts.insert("Work".to_string(), Default::default());
+        assert_eq!(
+            name_collides_existing(&cfg, &dir, "work").as_deref(),
+            Some("Work")
+        );
+        assert_eq!(name_collides_existing(&cfg, &dir, "Work"), None);
+        std::fs::write(dir.join("Home.session"), b"x").unwrap();
+        assert_eq!(
+            name_collides_existing(&cfg, &dir, "home").as_deref(),
+            Some("Home")
+        );
+        std::fs::write(dir.join("team.session"), b"x").unwrap();
+        assert_eq!(name_collides_existing(&cfg, &dir, "team"), None);
+        assert_eq!(
+            name_collides_existing(&cfg, &dir, "TEAM").as_deref(),
+            Some("team")
+        );
+        assert_eq!(name_collides_existing(&cfg, &dir, "other"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn session_dir_for_test(base: &std::path::Path) -> PathBuf {
         base.join("sessions")
     }
@@ -1320,6 +1398,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn session_has_login_requires_a_cached_self_peer() {
+        let _app = TestAppDir::new("session-has-login");
+        let created = open_session("work").await.unwrap();
+        drop(created);
+        assert!(!session_has_login("work").await.unwrap());
+        assert!(!session_has_login("ghost").await.unwrap());
+        std::fs::write(session_path("empty"), b"").unwrap();
+        assert!(!session_has_login("empty").await.unwrap());
+
+        let reopened = open_session("work").await.unwrap();
+        reopened
+            .session
+            .cache_peer(&PeerInfo::User {
+                id: 42,
+                auth: None,
+                bot: Some(false),
+                is_self: Some(true),
+            })
+            .await
+            .unwrap();
+        drop(reopened);
+        assert!(session_has_login("work").await.unwrap());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn open_session_restricts_sqlite_sidecars() {
@@ -1379,8 +1482,13 @@ mod tests {
         seed_test_env(&dir);
         let held = open_session("work").await.unwrap();
         drop(held);
+        std::fs::write(default_export_dest("work"), b"exported").unwrap();
         remove_session("work").await.unwrap();
         assert!(!session_path("work").exists());
+        assert!(
+            !default_export_dest("work").exists(),
+            "a default session export must be swept with the session"
+        );
         assert!(
             lock_path("work").exists(),
             "removal must leave the lock file in place so concurrent acquirers keep contending on the same inode"

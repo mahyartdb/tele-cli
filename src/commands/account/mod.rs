@@ -275,10 +275,21 @@ async fn list(flags: &GlobalFlags) -> TeleResult<i32> {
             .get(&name)
             .map(|a| a.tags.join(","))
             .unwrap_or_default();
+        let session_state = match session::session_has_login(&name).await {
+            Ok(true) => "present",
+            Ok(false) => "empty",
+            Err(e) => {
+                log_line(
+                    "warn",
+                    &format!("could not inspect session for {name}: {e:#}"),
+                );
+                "present"
+            }
+        };
         rows.push(serde_json::json!({
             "name": name,
             "tags": tags,
-            "session": "present",
+            "session": session_state,
         }));
     }
     if output::machine_mode(flags.json, flags.jsonl) {
@@ -395,10 +406,30 @@ pub(crate) fn default_config_path(
         None => Ok(config::app_data_dir_checked()?.join("config.toml")),
     }
 }
+
+pub(crate) fn reject_name_collision(
+    cfg: &config::AppConfig,
+    dir: &std::path::Path,
+    name: &str,
+) -> TeleResult<()> {
+    match session::name_collides_existing(cfg, dir, name) {
+        Some(existing) => Err(TeleError::Usage(format!(
+            "account name {name} differs only by case from existing account {existing}; choose a different name"
+        ))),
+        None => Ok(()),
+    }
+}
+
 async fn add(args: &AddArgs, flags: &GlobalFlags) -> TeleResult<i32> {
     session::validate_name(&args.name).map_err(TeleError::Usage)?;
     let path = default_config_path(&flags.config_path)?;
+    let sessions_dir = session::session_dir();
     if flags.dry_run {
+        reject_name_collision(
+            &config::load_config(Some(&path))?,
+            &sessions_dir,
+            &args.name,
+        )?;
         log_line(
             "info",
             &format!(
@@ -424,6 +455,7 @@ async fn add(args: &AddArgs, flags: &GlobalFlags) -> TeleResult<i32> {
         );
     }
     config::update_config(Some(&path), |cfg| {
+        reject_name_collision(cfg, &sessions_dir, &args.name)?;
         let entry = cfg
             .accounts
             .entry(args.name.clone())
