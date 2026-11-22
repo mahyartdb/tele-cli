@@ -2345,6 +2345,43 @@ fn matrix_rows_parse() {
     );
 }
 
+fn cargo_home_from(cargo_home: Option<String>, userprofile: Option<String>) -> Option<PathBuf> {
+    cargo_home
+        .map(PathBuf::from)
+        .or_else(|| userprofile.map(|h| PathBuf::from(h).join(".cargo")))
+}
+
+#[test]
+fn cargo_home_env_is_used_verbatim() {
+    let home = PathBuf::from("custom").join("cargo-home");
+    assert_eq!(
+        cargo_home_from(Some(home.to_string_lossy().into_owned()), None),
+        Some(home)
+    );
+}
+
+#[test]
+fn userprofile_fallback_appends_dot_cargo() {
+    let profile = PathBuf::from("users").join("runner");
+    assert_eq!(
+        cargo_home_from(None, Some(profile.to_string_lossy().into_owned())),
+        Some(profile.join(".cargo"))
+    );
+}
+
+#[test]
+fn cargo_home_env_wins_over_userprofile() {
+    let home = PathBuf::from("custom").join("cargo-home");
+    let profile = PathBuf::from("users").join("runner");
+    assert_eq!(
+        cargo_home_from(
+            Some(home.to_string_lossy().into_owned()),
+            Some(profile.to_string_lossy().into_owned())
+        ),
+        Some(home)
+    );
+}
+
 fn find_upstream_api_tl(registry_src: &Path, version: &str) -> Option<PathBuf> {
     let prefix = format!("grammers-tl-types-{version}");
     for entry in std::fs::read_dir(registry_src).ok()? {
@@ -2412,12 +2449,13 @@ fn vendored_tl_api_matches_grammers_tl_types() {
             unreachable!()
         }
     };
-    let cargo_home = std::env::var("CARGO_HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(|h| PathBuf::from(h).join(".cargo"));
+    let cargo_home = cargo_home_from(
+        std::env::var("CARGO_HOME").ok(),
+        std::env::var("USERPROFILE").ok(),
+    );
     let cargo_home = match cargo_home {
-        Ok(p) => p,
-        Err(_) => {
+        Some(p) => p,
+        None => {
             if skip("CARGO_HOME not set — re-vendor tl/api.tl after a grammers bump".to_string())
             {
                 return;
