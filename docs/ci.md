@@ -1,10 +1,10 @@
 # CI
 
-`.github/workflows/ci.yml` runs on every push to `master`/`main` and on every pull request that targets either branch. Green CI is the precondition for merging and for a release; the release workflow (`.github/workflows/release.yml`) does not repeat these checks.
+`.github/workflows/ci.yml` runs on every push to `main` and on every pull request that targets it. Green CI is the precondition for merging and for a release; the release workflow (`.github/workflows/release.yml`) does not repeat these checks.
 
 ## What runs and when
 
-- **Triggers:** `push` to `master` or `main`, `pull_request` into `master` or `main`. A push to a feature branch runs nothing; open the PR.
+- **Triggers:** `push` to `main`, `pull_request` into `main`. A push to a feature branch runs nothing; open the PR.
 - **Concurrency:** group `ci-<workflow>-<ref>`, `cancel-in-progress: true`. A new push to the same branch cancels the older run. Different PRs never cancel each other.
 - **Permissions:** `contents: read` for the whole workflow. No job needs more. Checkouts set `persist-credentials: false`, so the token is not left in `.git/config` for later steps.
 - **Failure isolation:** every matrix uses `fail-fast: false`. One failing OS does not hide a passing one.

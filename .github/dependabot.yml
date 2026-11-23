@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Cargo dependencies: grouped so a routine bump is one reviewable PR; the
+  # grammers stack is pinned separately because libsql is locked to
+  # =0.9.30 by grammers-session (see the features-audit comment in
+  # Cargo.toml) and a transitive bump must be tested for session compat.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # libsql is pinned by grammers-session 0.10 sqlite-storage; Dependabot
+      # version bumps must not silently lift the lock (RUSTSEC waivers in
+      # deny.toml also depend on this graph).
+      - dependency-name: "libsql"
+      - dependency-name: "grammers-*"
+
+  # GitHub Actions: SHA-pinned refs get bumped by Dependabot the standard
+  # way (new SHA + version comment); every bump runs the full CI matrix.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
