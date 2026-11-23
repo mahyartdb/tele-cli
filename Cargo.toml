@@ -38,7 +38,7 @@ log = "0.4"
 num-bigint = "0.5"
 pbkdf2 = { version = "0.13", default-features = false }
 rmcp = { version = "3.10", default-features = false, features = ["server", "transport-io"] }
-qrcode = "0.14"
+qrcode = "0.15"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 secrecy = "0.10"
