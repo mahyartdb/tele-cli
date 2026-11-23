@@ -35,7 +35,7 @@ hmac = { version = "0.13", default-features = false }
 # libsql pinned to =0.9.30 — required by grammers-session 0.10 sqlite-storage; do not bump without testing session compat
 libsql = { version = "=0.9.30", default-features = false, features = ["core"] }
 log = "0.4"
-num-bigint = "0.4"
+num-bigint = "0.5"
 pbkdf2 = { version = "0.13", default-features = false }
 rmcp = { version = "3.10", default-features = false, features = ["server", "transport-io"] }
 qrcode = "0.14"
