@@ -21,7 +21,7 @@ path = "src/main.rs"
 # because they need them (anyhow/std, clap/derive+std, chrono/serde,
 # serde/std); trimming further risks build breaks for no measured gain.
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
